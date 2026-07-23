@@ -26,3 +26,8 @@ sha2 = "0.11.0"
 toml = "1.1.3"
 win32job = "2.0.3"
 zip = "8.6.0"
+
+[build-dependencies]
+# 把 assets/icon.ico 嵌进 exe 资源(File Explorer/任务栏在程序没运行时显示的图标就来自
+# 这里);运行时窗口本身的图标是另一码事,由 main.rs 的 ViewportBuilder::with_icon 单独设置。
+winresource = "0.1.31"

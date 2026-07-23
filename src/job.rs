@@ -49,6 +49,22 @@ pub enum JobStatus {
     Cancelled,
 }
 
+impl JobStatus {
+    /// 这个任务是不是已经到了不会再变的终态(不会再收到新的 JobUpdate)。用于窗口标题的
+    /// "第 N/M 个"进度统计——数一批里有多少个任务已经跑完(不管成功/跳过/失败/取消),
+    /// 不是只数成功的。
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobStatus::Done(_)
+                | JobStatus::DoneWithWarning(..)
+                | JobStatus::Skipped(_)
+                | JobStatus::Failed(..)
+                | JobStatus::Cancelled
+        )
+    }
+}
+
 /// 一次处理成功结束后,值得回显给用户看的信息——之前 `JobStatus::Done` 是个无字段变体,
 /// 这些数据在到达终点前就被扔掉了,用户只能看到一个"完成",没有任何自查线索(用了哪个
 /// 语言/哪个翻译模型?这次是不是复用了旧结果?字幕是不是空的?)。这个结构体不是给程序
@@ -371,5 +387,17 @@ mod tests {
     fn format_failed_lines_warning_truncates_with_suffix_when_more_than_five() {
         let msg = format_failed_lines_warning(&[0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(msg, "有 7 行翻译失败,已保留原文(第 1、2、3、4、5 条等)");
+    }
+
+    #[test]
+    fn is_terminal_covers_every_ending_status_but_not_pending_or_running() {
+        let report = JobReport::default();
+        assert!(!JobStatus::Pending.is_terminal());
+        assert!(!JobStatus::Running(Stage::Transcribe, "x".to_string(), None).is_terminal());
+        assert!(JobStatus::Done(report.clone()).is_terminal());
+        assert!(JobStatus::DoneWithWarning("w".to_string(), report).is_terminal());
+        assert!(JobStatus::Skipped("s".to_string()).is_terminal());
+        assert!(JobStatus::Failed(Stage::Transcribe, "f".to_string(), None).is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
     }
 }

@@ -33,11 +33,20 @@ fn main() -> eframe::Result<()> {
     // 模型目录覆盖值是进程级状态(见 paths.rs),用配置里读到的值设置一次;用户在界面里
     // 改存放位置时会再调用一次,让后续路径解析立刻用上新值。
     paths::set_models_dir_override(config.models_dir_override.clone().map(PathBuf::from));
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([config.window_w, config.window_h])
+        .with_min_inner_size([560.0, 420.0])
+        .with_drag_and_drop(true);
+    // 窗口图标(任务栏/标题栏,程序运行中看到的那个)——exe 文件本身的图标由 build.rs 通过
+    // winresource 单独嵌入,这里是运行时窗口的图标,两处都要设置才能在所有场景下看到一致
+    // 的图标而不是默认灰色齿轮。解码失败(比如以后换图标时不小心存成了非法 PNG)不该阻断
+    // 启动,跳过设置图标、其余照常运行即可。
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(e) => eprintln!("加载窗口图标失败(不影响功能): {e}"),
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([config.window_w, config.window_h])
-            .with_min_inner_size([560.0, 420.0])
-            .with_drag_and_drop(true),
+        viewport,
         // 显式用 glow(见 Cargo.toml 里 eframe 的 feature 说明),不依赖 Renderer 的
         // Default 实现——Cargo.toml 已经把 wgpu 从编译产物里拿掉,这里写明白只是让
         // 意图在代码里也看得见,不用去翻依赖配置才知道用的是哪个后端。
@@ -45,13 +54,20 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "字幕生成器 subgen",
+        &window_title(),
         options,
         Box::new(|cc| {
             setup_chinese_fonts(&cc.egui_ctx);
             Ok(Box::new(SubgenApp::new(config)))
         }),
     )
+}
+
+/// 不带批次进度的基础窗口标题(带版本号——用户反馈问题时能直接说清自己用的是哪一版,
+/// 不用再额外去翻文件属性)。处理中会在这基础上加"[N/M]"后缀(见 poll_worker),批次
+/// 结束后标题恢复成这个基础版本。
+fn window_title() -> String {
+    format!("字幕生成器 subgen v{}", env!("CARGO_PKG_VERSION"))
 }
 
 /// 单实例保护:双开 subgen 会共用同一个 `tmp/` 目录、抢同一个翻译引擎端口(见 translate.rs
@@ -207,6 +223,12 @@ struct SubgenApp {
     /// 处理中拖入文件时给出的提示,连同显示到期时间一起存着,到点了在下一帧渲染前自动清掉
     /// (不需要用户手动关闭这条提示)。
     transient_notice: Option<(String, std::time::Instant)>,
+    /// 当前批次里(界面列表原始下标)包含哪些任务,用来算窗口标题上的"第 N/M 个"——用户
+    /// 切到别的窗口干活时,任务栏悬停就能看到大致进度,不用切回来才知道跑到哪了。
+    batch_indices: Vec<usize>,
+    /// 上一次写进标题的进度,值没变就不重复调用 send_viewport_cmd(避免每帧都发一次
+    /// 相同的标题更新)。
+    last_title_progress: Option<(usize, usize)>,
 }
 
 impl SubgenApp {
@@ -230,6 +252,8 @@ impl SubgenApp {
             close_confirm_open: false,
             allow_close: false,
             transient_notice: None,
+            batch_indices: Vec::new(),
+            last_title_progress: None,
         }
     }
 
@@ -453,6 +477,8 @@ impl SubgenApp {
         self.cancelling = false;
         self.gpu_warning_shown = false;
         self.worker_cancel = Arc::new(AtomicBool::new(false));
+        self.batch_indices = indices.clone();
+        self.last_title_progress = None;
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
 
@@ -561,10 +587,30 @@ impl SubgenApp {
         if gpu_missing {
             self.gpu_warning_shown = true;
         }
+        // 标题带上"第 N/M 个"——用户切到别的窗口干活时,任务栏悬停就能看到大致进度,
+        // 不用切回来才知道跑到哪了。只在进度真的变化时才发 Title 命令,不是每帧都发。
+        if self.processing && !self.batch_indices.is_empty() {
+            let total = self.batch_indices.len();
+            let terminal_count = self
+                .batch_indices
+                .iter()
+                .filter(|&&i| self.jobs.get(i).is_some_and(|j| j.status.is_terminal()))
+                .count();
+            let current = (terminal_count + 1).min(total);
+            if self.last_title_progress != Some((current, total)) {
+                self.last_title_progress = Some((current, total));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                    "{} [{current}/{total}]",
+                    window_title()
+                )));
+            }
+        }
         if batch_done {
             self.processing = false;
             self.cancelling = false;
             self.worker_rx = None;
+            self.last_title_progress = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title()));
         }
         if self.worker_rx.is_some() {
             ctx.request_repaint();
