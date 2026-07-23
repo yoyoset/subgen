@@ -186,6 +186,10 @@ struct SubgenApp {
     worker_rx: Option<mpsc::Receiver<WorkerEvent>>,
     worker_cancel: Arc<AtomicBool>,
     processing: bool,
+    /// 用户点了"取消"、但批次还没真正停下来(worker 线程要等当前这一步跑完才会检查取消
+    /// 标志)。只用来驱动界面反馈——按钮立刻变灰显示"正在取消…"、当前任务状态行附加提示,
+    /// 不然用户会因为点击后界面毫无变化而怀疑按钮没反应,进而连点或直接关窗强退。
+    cancelling: bool,
     gpu_warning_shown: bool,
     log_lines: Vec<String>,
     migrate_rx: Option<mpsc::Receiver<setup::MigrateEvent>>,
@@ -207,6 +211,7 @@ impl SubgenApp {
             worker_rx: None,
             worker_cancel: Arc::new(AtomicBool::new(false)),
             processing: false,
+            cancelling: false,
             gpu_warning_shown: false,
             log_lines: Vec::new(),
             migrate_rx: None,
@@ -433,6 +438,7 @@ impl SubgenApp {
         }
 
         self.processing = true;
+        self.cancelling = false;
         self.gpu_warning_shown = false;
         self.worker_cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -545,6 +551,7 @@ impl SubgenApp {
         }
         if batch_done {
             self.processing = false;
+            self.cancelling = false;
             self.worker_rx = None;
         }
         if self.worker_rx.is_some() {
@@ -909,11 +916,19 @@ impl SubgenApp {
                 {
                     self.start_processing();
                 }
+                // 取消按钮点击后立即变灰、文案改成"正在取消…"——worker 线程要等当前这一步
+                // (比如正在跑的 whisper-cli 子进程)结束才会真正检查取消标志,这中间有肉眼
+                // 可见的延迟。不给即时反馈的话,用户会以为点击没生效,进而连点甚至直接关窗。
+                let cancel_label = if self.cancelling { "正在取消…" } else { "取消" };
                 if ui
-                    .add_enabled(self.processing, egui::Button::new("取消"))
+                    .add_enabled(
+                        self.processing && !self.cancelling,
+                        egui::Button::new(cancel_label),
+                    )
                     .clicked()
                 {
                     self.worker_cancel.store(true, Ordering::Relaxed);
+                    self.cancelling = true;
                 }
             });
             if self.gpu_warning_shown {
@@ -954,7 +969,7 @@ impl SubgenApp {
                             });
                         });
                         // 第二行:详细状态文案,单独占一行,不用再和文件名/步骤条抢空间。
-                        let (text, color) = job_status_line(job);
+                        let (text, color) = job_status_line(job, self.cancelling);
                         ui.colored_label(color, text);
                     });
                     ui.separator();
@@ -1023,17 +1038,22 @@ fn render_stage_stepper(ui: &mut egui::Ui, status: &JobStatus, translate_enabled
     });
 }
 
-/// 生成任务行第二行的详细状态文案 + 配色。
-fn job_status_line(job: &Job) -> (String, egui::Color32) {
+/// 生成任务行第二行的详细状态文案 + 配色。`cancelling` 为 true 时(用户点了取消、批次还没
+/// 真正停下来),正在跑的那一条任务额外附一句"正在取消,等当前步骤结束"——不然用户点完
+/// 取消后看到这一行还在正常显示进度百分比,会以为取消没生效。
+fn job_status_line(job: &Job, cancelling: bool) -> (String, egui::Color32) {
     match &job.status {
         JobStatus::Pending => ("等待中".to_string(), egui::Color32::GRAY),
         JobStatus::Running(_, text, pct) => {
             let elapsed = job.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             let elapsed_str = format_elapsed(elapsed);
-            let text = match pct {
+            let mut text = match pct {
                 Some(pct) => format!("{text} {pct:.0}%(已运行 {elapsed_str})"),
                 None => format!("{text}(已运行 {elapsed_str})"),
             };
+            if cancelling {
+                text.push_str("(正在取消,等当前步骤结束)");
+            }
             (text, egui::Color32::LIGHT_GRAY)
         }
         JobStatus::Done => ("完成".to_string(), egui::Color32::from_rgb(60, 170, 60)),

@@ -147,9 +147,9 @@ pub fn process_video(
     }
 
     if cancel.load(Ordering::Relaxed) {
-        if !wav_reused {
-            let _ = std::fs::remove_file(&wav_path);
-        }
+        // 不删 wav——它是这一步的完整产物,不是半成品。取消不该比崩溃损失更大:崩溃后
+        // 断点续跑能直接复用已提取的音轨,主动取消却把它删掉、下次还要重新提取一遍,
+        // 是反直觉的(用户点"取消"通常是想暂停/改主意,不是想作废已经做完的部分)。
         return Err((Stage::ExtractAudio, "已取消".to_string()));
     }
 
@@ -274,7 +274,9 @@ pub fn process_video(
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&wav_path);
+            // wav 不删:它是完整产物,断点续跑用得上(见上面提取音轨那一步的取消分支)。
+            // 半成品 srt 要删:whisper-cli 被杀掉时输出文件可能只写了一半,留着会被
+            // srt_looks_complete 误判成"能解析出块所以算完整"而被断点续跑错误复用。
             let srt_partial = srt_out_prefix.with_extension("srt");
             let _ = std::fs::remove_file(&srt_partial);
             return Err((Stage::Transcribe, "已取消".to_string()));
