@@ -122,6 +122,7 @@ pub fn process_video(
     let unique = cache_key(video_path, model_key, language);
     let wav_path = paths::tmp_dir().join(format!("{unique}.wav"));
     let srt_out_prefix = paths::tmp_dir().join(&unique); // whisper -of 不带扩展名,会自动加 .srt
+    let generated_srt = generated_srt_path(&unique);
     let log_file = paths::logs_dir().join(format!("{unique}.log"));
 
     // ---- 1. 提取音轨(支持复用已有的临时 wav,force=true 时强制当作不存在) ----
@@ -185,7 +186,6 @@ pub fn process_video(
     }
 
     // ---- 2. 语音识别(支持复用已有的 srt,force=true 时强制当作不存在) ----
-    let generated_srt = srt_out_prefix.with_extension("srt");
     if !force && generated_srt.is_file() && srt_looks_complete(&generated_srt) {
         progress_cb(
             Stage::Transcribe,
@@ -314,7 +314,7 @@ pub fn process_video(
             // wav 不删:它是完整产物,断点续跑用得上(见上面提取音轨那一步的取消分支)。
             // 半成品 srt 要删:whisper-cli 被杀掉时输出文件可能只写了一半,留着会被
             // srt_looks_complete 误判成"能解析出块所以算完整"而被断点续跑错误复用。
-            let srt_partial = srt_out_prefix.with_extension("srt");
+            let srt_partial = generated_srt_path(&unique);
             let _ = std::fs::remove_file(&srt_partial);
             return Err(no_log(Stage::Transcribe, "已取消"));
         }
@@ -590,6 +590,20 @@ fn cache_key(video_path: &Path, model_key: &str, language: &str) -> String {
     )
 }
 
+/// whisper-cli 最终写出的识别结果路径,在 tmp/ 下,文件名是 `{unique}.srt`。
+///
+/// 真实踩过的坑:不能写成 `paths::tmp_dir().join(unique).with_extension("srt")`。网上下载
+/// 的剧集文件名本身就一堆点(比如 "Deadliest.Catch.S22E05.720p.HEVC.x265-MeGusta[EZTVx.to]"),
+/// `unique` 是拿这段文件名拼出来的(见 `cache_key` 里的 `stem`),`PathBuf::with_extension`
+/// 只看"文件名里最后一个点之后的部分"当"扩展名"替换,会把文件名从那个点之后整段吃掉换成
+/// "srt",算出一个和 whisper-cli 实际写入的文件完全不同的路径——真机用真实的剧集文件名跑过
+/// 一次,`generated_srt.is_file()` 因此永远是 false,whisper-cli 明明成功了,界面却报错
+/// "识别流程结束但未生成字幕文件"。whisper-cli 自己对 `-of` 参数只是纯字符串拼接 + ".srt"
+/// (不经过 Path 的"扩展名"语义),这里必须用同样的拼接方式才能算出一致的路径。
+fn generated_srt_path(unique: &str) -> PathBuf {
+    paths::tmp_dir().join(format!("{unique}.srt"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +629,23 @@ mod tests {
             base,
             cache_key(path, "large-v3", "auto"),
             "同样的路径/模型/语言应该稳定算出同一个 key(断点续跑靠这个复用产物)"
+        );
+    }
+
+    /// 真实踩过的坑:剧集下载文件名(如 "Deadliest.Catch.S22E05.720p.HEVC.x265-MeGusta
+    /// [EZTVx.to]")本身就有很多点,`cache_key` 拼出的 `unique` 会原样带着这些点。用
+    /// `PathBuf::with_extension("srt")` 算最终路径会被这些内部的点误伤(只看"最后一个点
+    /// 之后"当扩展名整段替换掉),`generated_srt_path` 改用纯字符串拼接就不会有这个问题——
+    /// 这里直接验证这一点:结果文件名必须是 "{完整的 unique}.srt",一个字符都不能丢。
+    #[test]
+    fn generated_srt_path_preserves_dots_in_original_filename() {
+        let path = Path::new(r"F:\videos\Deadliest.Catch.S22E05.720p.HEVC.x265-MeGusta[EZTVx.to].mkv");
+        let unique = cache_key(path, "large-v3", "auto");
+        let generated = generated_srt_path(&unique);
+        assert_eq!(
+            generated.file_name().and_then(|n| n.to_str()),
+            Some(format!("{unique}.srt").as_str()),
+            "文件名内部的点不该被当成扩展名分隔符吃掉: {generated:?}"
         );
     }
 
