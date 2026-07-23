@@ -198,6 +198,15 @@ struct SubgenApp {
     pending_models_dir: Option<PathBuf>,
     /// 更改模型目录时的校验错误(目录不可写等),显示在"更改..."按钮旁边,下次操作前清空。
     models_dir_error: Option<String>,
+    /// 处理中用户点了窗口的关闭按钮,弹出"确定退出吗"确认弹窗时为 true。
+    close_confirm_open: bool,
+    /// 用户在确认弹窗里点了"确定退出"——下一次(或本次)收到关闭请求时不再拦截,真正放行。
+    /// 没有这个标志,程序发出的 ViewportCommand::Close 如果也会产生一次 close_requested()
+    /// 事件,会被同一段"处理中就拦截"的逻辑再次误拦,变成怎么点都关不掉。
+    allow_close: bool,
+    /// 处理中拖入文件时给出的提示,连同显示到期时间一起存着,到点了在下一帧渲染前自动清掉
+    /// (不需要用户手动关闭这条提示)。
+    transient_notice: Option<(String, std::time::Instant)>,
 }
 
 impl SubgenApp {
@@ -218,6 +227,9 @@ impl SubgenApp {
             migrate_cancel: Arc::new(AtomicBool::new(false)),
             pending_models_dir: None,
             models_dir_error: None,
+            close_confirm_open: false,
+            allow_close: false,
+            transient_notice: None,
         }
     }
 
@@ -581,6 +593,39 @@ impl eframe::App for SubgenApp {
             self.config.window_h = screen.height();
         }
 
+        // 处理中点窗口右上角的 ×:直接放行等于把还在跑的批次悄悄腰斩,已经花掉的处理时间
+        // 全部作废——这是整个界面里唯一一个"一次误点损失一小时"的操作,必须拦一下。
+        // close_requested() 只在被点击的那一帧为 true(不是持续状态),拦截方式是当帧回发
+        // CancelClose 抵消掉这次关闭请求,同时弹出确认框;非处理中或已经点过"确定退出"
+        // (allow_close)时不拦截,让它正常关闭。
+        if !self.allow_close
+            && self.processing
+            && ctx.input(|i| i.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_confirm_open = true;
+        }
+        if self.close_confirm_open {
+            egui::Window::new("确定要退出吗?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label("正在处理中,退出将中止全部任务,已经处理完的文件不受影响。");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("继续处理").clicked() {
+                            self.close_confirm_open = false;
+                        }
+                        if ui.button("确定退出").clicked() {
+                            self.close_confirm_open = false;
+                            self.allow_close = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                });
+        }
+
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -588,8 +633,25 @@ impl eframe::App for SubgenApp {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        if !dropped.is_empty() && !self.processing {
-            self.add_files(dropped);
+        if !dropped.is_empty() {
+            if self.processing {
+                // 静默吞掉拖进来的文件是这里最差的处理方式——用户会以为自己操作失败了、
+                // 反复重试。处理中不支持追加排队(明确不做,见项目计划),但至少要让用户
+                // 知道"我看到你拖文件了,只是现在不能加"。
+                self.transient_notice = Some((
+                    "正在处理中,请等本批完成后再添加文件".to_string(),
+                    std::time::Instant::now(),
+                ));
+            } else {
+                self.add_files(dropped);
+            }
+        }
+        if let Some((_, shown_at)) = &self.transient_notice {
+            if shown_at.elapsed().as_secs_f32() > 3.0 {
+                self.transient_notice = None;
+            } else {
+                ctx.request_repaint(); // 保证过期后能被下一帧检查到、及时消失,不用等下次交互触发重绘
+            }
         }
 
         match &self.setup_phase {
@@ -787,6 +849,11 @@ impl SubgenApp {
     fn show_main_ui(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("controls").show(ui, |ui| {
             ui.add_space(6.0);
+            // 处理中这一整块设置(模型/语言/覆盖策略/翻译开关及其子选项)全部禁用——之前
+            // 界面上看着能改,改了也确实存进了 config,但当前这一批任务完全不会用上新设置,
+            // 用户会以为"改了=生效了",跑完发现结果和界面显示的设置对不上,是很隐蔽的
+            // "设置是摆设"体验。禁用后 hover 会有一层浅灰遮罩,直观地表明"现在不能碰"。
+            ui.add_enabled_ui(!self.processing, |ui| {
             ui.horizontal(|ui| {
                 ui.label("模型:");
                 let mut model_changed = false;
@@ -895,6 +962,7 @@ impl SubgenApp {
                     self.setup_phase = SetupPhase::Checking;
                 }
             });
+            }); // add_enabled_ui(!self.processing) 到此结束
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 // 常驻显示 + 可改,不止首次下载那一次机会——用了一段时间之后想搬家也应该
@@ -927,7 +995,12 @@ impl SubgenApp {
                         self.add_files(files);
                     }
                 }
-                if ui.button("清空列表").clicked() && !self.processing {
+                // 处理中直接置灰禁用,而不是"按钮外观正常、点了却静默无效"——那种写法
+                // 会让用户以为按钮坏了,反复点击也得不到任何反馈。
+                if ui
+                    .add_enabled(!self.processing, egui::Button::new("清空列表"))
+                    .clicked()
+                {
                     self.jobs.clear();
                 }
                 ui.add_space(16.0);
@@ -959,6 +1032,9 @@ impl SubgenApp {
                     egui::Color32::from_rgb(230, 150, 20),
                     "⚠ 检测到处理过程未使用 GPU,速度会非常慢。请检查显卡驱动 / CUDA 环境。",
                 );
+            }
+            if let Some((text, _)) = &self.transient_notice {
+                ui.colored_label(egui::Color32::from_rgb(230, 150, 20), text);
             }
             ui.add_space(6.0);
         });
