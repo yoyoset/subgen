@@ -141,7 +141,7 @@ src/
 - [x] ~~任务列表长文件名和状态文案会互相覆盖显示~~ 界面重做:文件名/状态各占一行,文件名超长会省略号截断(hover 可看完整),流水线阶段用步骤条单独展示
 - [x] ~~大文件下载中断后只能从头重新下载~~ 已支持断点续传(HTTP Range),已用真机对 HuggingFace 和 GitHub Release 两个真实 CDN 实测验证(`curl -L -H "Range: bytes=1000-"` 跟随 302 重定向后仍能拿到 206 Partial Content),`.part` 临时文件在下载中断后不再被删除,详见上文"下载支持断点续传"
 - [x] ~~HuggingFace/GitHub 在国内网络环境下经常连不上,没有备用线路~~ 已支持官方源多次失败后自动切换镜像(hf-mirror.com / gh-proxy.com),已用真机验证 gh-proxy.com 对 GitHub Release 资产的 Range 请求同样能正确返回 206,详见上文"官方源连不上时自动切镜像"
-- [ ] 翻译阶段没有 GPU 使用检测(语音识别阶段有,`used_gpu` 靠解析 whisper-cli 日志里的 `using CUDA0 backend`;llama-server 的日志目前只是排空、没解析,所以翻译如果意外掉到纯 CPU 不会有界面提示,只会感觉很慢)
+- [x] ~~翻译阶段没有 GPU 使用检测(语音识别阶段有,`used_gpu` 靠解析 whisper-cli 日志里的 `using CUDA0 backend`;llama-server 的日志之前只是排空、没解析)~~ 已支持,`translate::LlamaServer` 解析 stderr 里的 `offloaded N/M layers to GPU`(格式字符串来自 llama.cpp b10079 源码实测确认,不是猜测的),N=0 时判定为没用上 GPU、复用识别阶段已有的警告通路,界面警告文案会区分具体是"识别"还是"翻译"阶段没用上;顺带给翻译请求加了 `cache_prompt: true`,同批次内每次请求的 system prompt 相同,能复用 KV 缓存
 - [ ] Sakura 的批量编号翻译提示词和官方单段落格式有出入(见上文",翻译走批量 + 编号对齐"一条),没有和逐行调用做过量化的翻译质量对比,只保证了格式对齐可靠、不阻断任务
 - [ ] 暂无打包成单文件安装包/自动更新机制,`cargo build --release` 出的就是最终产物
 - [ ] 全片末尾约 68 秒偶尔观察到大小写/标点丢失(`-mc 0` 的副作用,规模很小),暂未处理

@@ -7,7 +7,7 @@ use std::sync::{mpsc::Sender, Arc};
 
 /// 流水线的三个阶段,有天然的先后顺序——界面上画步骤条时,"当前处于哪个阶段"本身就隐含了
 /// "更早的阶段都已经完成或复用完了",不需要单独维护每个阶段各自的完成状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     ExtractAudio,
     Transcribe,
@@ -112,7 +112,9 @@ impl Job {
 
 pub enum WorkerEvent {
     JobUpdate { index: usize, status: JobStatus },
-    GpuMissing,
+    /// 带上是哪个阶段没用上 GPU(识别 or 翻译)——两个阶段各自独立检测,警告文案要能
+    /// 说清具体是哪一步慢,不是笼统一句"没用上 GPU"。
+    GpuMissing(Stage),
     BatchDone,
 }
 
@@ -196,7 +198,7 @@ pub fn run_batch(
             // used_gpu 是 Option<bool>:None 表示这次复用了之前已经识别好的结果、没有真实
             // 观测(见 engine.rs 的断点续跑逻辑),这种情况不该被当成"没用上 GPU"报警告。
             if result.used_gpu == Some(false) {
-                let _ = tx.send(WorkerEvent::GpuMissing);
+                let _ = tx.send(WorkerEvent::GpuMissing(Stage::Transcribe));
             }
 
             let placed = match crate::engine::place_sidecar_srt(video_path, &result.srt_path, overwrite)
@@ -290,7 +292,16 @@ pub fn run_batch(
                         ),
                     });
                     match crate::translate::LlamaServer::start(model_def, &cancel) {
-                        Ok(s) => server = Some(s),
+                        Ok(s) => {
+                            // 复用识别阶段已有的 GpuMissing 警告通路(main.rs 的
+                            // gpu_warning_stages)——翻译阶段之前完全没有 GPU 检测,静默
+                            // 掉到纯 CPU 时用户只会感觉"翻译很慢",没有任何提示指向真正
+                            // 原因。见 translate.rs 的 used_gpu 字段和 parse_gpu_offload。
+                            if !s.used_gpu() {
+                                let _ = tx.send(WorkerEvent::GpuMissing(Stage::Translate));
+                            }
+                            server = Some(s);
+                        }
                         Err(e) if e == "已取消" => {
                             let _ = tx.send(WorkerEvent::JobUpdate {
                                 index,

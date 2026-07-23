@@ -106,6 +106,11 @@ pub struct LlamaServer {
     child: std::process::Child,
     port: u16,
     pub model_key: &'static str,
+    /// 是否观测到模型层被成功卸载到 GPU(见 `parse_gpu_offload` 和 `start` 里 stderr 解析
+    /// 线程)。识别阶段(engine.rs)有 GPU 检测,翻译阶段之前完全没有——llama-server 的
+    /// 日志之前只是排空、不解析,如果翻译意外掉到纯 CPU,用户只会感觉"很慢",没有任何
+    /// 界面提示指向真正原因。
+    used_gpu: Arc<AtomicBool>,
 }
 
 impl LlamaServer {
@@ -144,15 +149,24 @@ impl LlamaServer {
             .map_err(|e| format!("无法启动本地翻译引擎: {e}"))?;
         crate::job_guard::bind_child_to_job(&child);
 
-        // 排空 stdout/stderr(不解析,只为防止管道缓冲区打满导致子进程阻塞写入而卡死)。
+        // 排空 stdout(不解析,只为防止管道缓冲区打满导致子进程阻塞写入而卡死)。
         if let Some(s) = child.stdout.take() {
             std::thread::spawn(move || {
                 for _ in BufReader::new(s).lines().map_while(Result::ok) {}
             });
         }
+        // stderr 里有模型加载时的层卸载信息,解析出"是否用上了 GPU"(见 parse_gpu_offload)。
+        // 模型加载(包含层卸载判定)必然发生在下面的健康检查通过之前,所以 health 检查
+        // 通过时这个值已经是这次启动的最终结果,不存在读取时机早晚的问题。
+        let used_gpu = Arc::new(AtomicBool::new(false));
         if let Some(s) = child.stderr.take() {
+            let used_gpu = used_gpu.clone();
             std::thread::spawn(move || {
-                for _ in BufReader::new(s).lines().map_while(Result::ok) {}
+                for line in BufReader::new(s).lines().map_while(Result::ok) {
+                    if parse_gpu_offload(&line) == Some(true) {
+                        used_gpu.store(true, Ordering::Relaxed);
+                    }
+                }
             });
         }
 
@@ -195,7 +209,12 @@ impl LlamaServer {
             child,
             port: PORT,
             model_key: model.key,
+            used_gpu,
         })
+    }
+
+    pub fn used_gpu(&self) -> bool {
+        self.used_gpu.load(Ordering::Relaxed)
     }
 
     pub fn stop(&mut self) {
@@ -361,6 +380,10 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     temperature: f32,
     max_tokens: u32,
+    /// llama-server 支持的 KV 缓存复用开关。system prompt 在同一批次内的每次请求里都一样
+    /// (见 build_prompt),开启后 llama-server 能复用之前请求已经算过的那部分 KV 缓存,
+    /// 不用每次都从头重新计算,是白捡的速度,不影响翻译结果。
+    cache_prompt: bool,
 }
 
 fn translate_batch_once(
@@ -390,6 +413,7 @@ fn translate_batch_once(
         ],
         temperature: 0.2,
         max_tokens: (texts.len() as u32 * 100 + 200).min(4096),
+        cache_prompt: true,
     };
 
     let client = reqwest::blocking::Client::builder()
@@ -484,9 +508,61 @@ fn split_leading_number(line: &str) -> Option<(usize, &str)> {
     Some((num, after_sep.trim_start()))
 }
 
+/// 解析 llama-server 模型加载时的层卸载日志行,例如
+/// "load_tensors: offloaded 37/37 layers to GPU"。返回 `Some(true)` 表示这一行确实报告
+/// 卸载了至少一层到 GPU(不要求全部——部分卸载也比纯 CPU 快得多,界面警告只关心"完全
+/// 没用上 GPU"这一种情况);匹配不上格式(不是层卸载行,或数字后面不是预期的
+/// "layers to GPU")返回 `None`,调用方应该继续看下一行,不当作"没用 GPU"的证据。
+///
+/// 格式字符串来自 llama.cpp b10079(和本项目绑定的 llama-server 是同一个版本)源码实测
+/// 确认,不是猜测的:`src/llama-model.cpp` 的 `load_tensors` 函数里
+/// `LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, n, total)`。
+/// 这行日志只在 `llama_supports_gpu_offload()` 为 true(编译时带 GPU 后端支持,这个项目
+/// 绑定的预编译包始终满足)时才会打印;真机在完全没有可用 GPU 的情况下这一行到底是打印
+/// "offloaded 0/N" 还是整段跳过,没有在真实无 GPU/驱动异常的机器上验证过——但两种情况
+/// 这个函数的调用方都会得到"没有观测到 used_gpu=true"的结果,界面警告依然会正确触发,
+/// 不影响判断的正确性,只是没有做到"精确复现该场景下的每一行日志"这个更高标准的验证。
+fn parse_gpu_offload(line: &str) -> Option<bool> {
+    let idx = line.find("offloaded ")?;
+    let rest = &line[idx + "offloaded ".len()..];
+    let n_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if n_str.is_empty() || !rest.contains("layers to GPU") {
+        return None;
+    }
+    let n: u32 = n_str.parse().ok()?;
+    Some(n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 格式字符串来自 llama.cpp b10079 源码实测确认(见 parse_gpu_offload 文档注释),
+    /// 这里验证解析逻辑本身,不依赖真实的 llama-server 进程。
+    #[test]
+    fn parse_gpu_offload_detects_full_offload() {
+        let line = "load_tensors: offloaded 37/37 layers to GPU";
+        assert_eq!(parse_gpu_offload(line), Some(true));
+    }
+
+    #[test]
+    fn parse_gpu_offload_detects_partial_offload_as_used() {
+        // 部分卸载也比纯 CPU 快得多,只要不是 0,就该算"用上了 GPU"。
+        let line = "load_tensors: offloaded 10/37 layers to GPU";
+        assert_eq!(parse_gpu_offload(line), Some(true));
+    }
+
+    #[test]
+    fn parse_gpu_offload_detects_zero_offload_as_not_used() {
+        let line = "load_tensors: offloaded 0/37 layers to GPU";
+        assert_eq!(parse_gpu_offload(line), Some(false));
+    }
+
+    #[test]
+    fn parse_gpu_offload_ignores_unrelated_lines() {
+        assert_eq!(parse_gpu_offload("main: server is listening on 127.0.0.1:8712"), None);
+        assert_eq!(parse_gpu_offload("load_tensors: loading model tensors"), None);
+    }
 
     /// 真实踩过的坑:失败行的 `translated` 值就是原文本身(见 translate_batch_with_retry
     /// 的单行兜底),按正常行的逻辑拼接会变成"原文\n原文",双语字幕里同一句话重复两遍。

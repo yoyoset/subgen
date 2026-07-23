@@ -206,7 +206,10 @@ struct SubgenApp {
     /// 标志)。只用来驱动界面反馈——按钮立刻变灰显示"正在取消…"、当前任务状态行附加提示,
     /// 不然用户会因为点击后界面毫无变化而怀疑按钮没反应,进而连点或直接关窗强退。
     cancelling: bool,
-    gpu_warning_shown: bool,
+    /// 本批次里,哪些阶段(识别/翻译)被观测到没用上 GPU——用一个集合而不是单个 bool,
+    /// 是因为识别和翻译是两个独立检测的阶段,警告文案要能说清具体是哪一步慢,不是笼统
+    /// 一句"没用上 GPU"。
+    gpu_warning_stages: std::collections::HashSet<job::Stage>,
     log_lines: Vec<String>,
     migrate_rx: Option<mpsc::Receiver<setup::MigrateEvent>>,
     migrate_cancel: Arc<AtomicBool>,
@@ -243,7 +246,7 @@ impl SubgenApp {
             worker_cancel: Arc::new(AtomicBool::new(false)),
             processing: false,
             cancelling: false,
-            gpu_warning_shown: false,
+            gpu_warning_stages: std::collections::HashSet::new(),
             log_lines: Vec::new(),
             migrate_rx: None,
             migrate_cancel: Arc::new(AtomicBool::new(false)),
@@ -475,7 +478,7 @@ impl SubgenApp {
 
         self.processing = true;
         self.cancelling = false;
-        self.gpu_warning_shown = false;
+        self.gpu_warning_stages.clear();
         self.worker_cancel = Arc::new(AtomicBool::new(false));
         self.batch_indices = indices.clone();
         self.last_title_progress = None;
@@ -567,7 +570,7 @@ impl SubgenApp {
 
     fn poll_worker(&mut self, ctx: &egui::Context) {
         let mut batch_done = false;
-        let mut gpu_missing = false;
+        let mut gpu_missing_stages: Vec<job::Stage> = Vec::new();
         if let Some(rx) = &self.worker_rx {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
@@ -579,14 +582,12 @@ impl SubgenApp {
                             j.status = status;
                         }
                     }
-                    WorkerEvent::GpuMissing => gpu_missing = true,
+                    WorkerEvent::GpuMissing(stage) => gpu_missing_stages.push(stage),
                     WorkerEvent::BatchDone => batch_done = true,
                 }
             }
         }
-        if gpu_missing {
-            self.gpu_warning_shown = true;
-        }
+        self.gpu_warning_stages.extend(gpu_missing_stages);
         // 标题带上"第 N/M 个"——用户切到别的窗口干活时,任务栏悬停就能看到大致进度,
         // 不用切回来才知道跑到哪了。只在进度真的变化时才发 Title 命令,不是每帧都发。
         if self.processing && !self.batch_indices.is_empty() {
@@ -1077,14 +1078,25 @@ impl SubgenApp {
                     self.cancelling = true;
                 }
             });
-            if self.gpu_warning_shown {
+            if !self.gpu_warning_stages.is_empty() {
+                // 按流水线顺序(识别在前、翻译在后)拼出受影响的阶段名,而不是笼统一句
+                // "没用上 GPU"——识别和翻译是分别独立检测的,用户应该知道具体是哪一步慢。
                 // "CUDA 环境"对不知道自己有没有独立显卡的用户是天书,给出的建议要么可执行
                 // (更新驱动),要么直接告诉他们"你可能就是没有这个硬件",别让人对着一句
                 // 看不懂的话不知道下一步该做什么。
+                let mut stages: Vec<job::Stage> = self.gpu_warning_stages.iter().copied().collect();
+                stages.sort_by_key(|s| s.ordinal());
+                let stages_text = stages
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join("和");
                 ui.colored_label(
                     egui::Color32::from_rgb(230, 150, 20),
-                    "⚠ 未能使用显卡加速,处理会慢很多。请到 NVIDIA 官网更新显卡驱动后重试;\
-                     如果这台电脑没有 NVIDIA 显卡,只能使用较慢的模式。",
+                    format!(
+                        "⚠ {stages_text}阶段未能使用显卡加速,处理会慢很多。请到 NVIDIA 官网\
+                         更新显卡驱动后重试;如果这台电脑没有 NVIDIA 显卡,只能使用较慢的模式。"
+                    ),
                 );
             }
             if let Some((text, _)) = &self.transient_notice {
