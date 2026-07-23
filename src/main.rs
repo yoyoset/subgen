@@ -232,6 +232,11 @@ struct SubgenApp {
     /// 上一次写进标题的进度,值没变就不重复调用 send_viewport_cmd(避免每帧都发一次
     /// 相同的标题更新)。
     last_title_progress: Option<(usize, usize)>,
+    /// 当前批次开始处理的时刻,用来在结束时算总耗时(和单个任务的 started_at 是两码事)。
+    batch_started_at: Option<std::time::Instant>,
+    /// 上一批结束时生成的汇总文案("17 个成功、2 个建议核对、1 个失败"这种),下一批开始
+    /// 时清空——批次跑完前用户看到的应该是上一批的结果还是空白,不该是半新不旧的状态。
+    last_summary: Option<String>,
 }
 
 impl SubgenApp {
@@ -257,6 +262,8 @@ impl SubgenApp {
             transient_notice: None,
             batch_indices: Vec::new(),
             last_title_progress: None,
+            batch_started_at: None,
+            last_summary: None,
         }
     }
 
@@ -482,6 +489,8 @@ impl SubgenApp {
         self.worker_cancel = Arc::new(AtomicBool::new(false));
         self.batch_indices = indices.clone();
         self.last_title_progress = None;
+        self.batch_started_at = Some(std::time::Instant::now());
+        self.last_summary = None;
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
 
@@ -612,6 +621,18 @@ impl SubgenApp {
             self.worker_rx = None;
             self.last_title_progress = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title()));
+
+            let elapsed = self
+                .batch_started_at
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            self.last_summary = Some(build_batch_summary(&self.jobs, &self.batch_indices, elapsed));
+            // 用户跑一批 20 集去干别的事了,批次结束时闪一下任务栏——不用非得切回来才知道
+            // 跑完了。Informational 是"标准程度的提醒"而不是 Critical(那个更适合真正
+            // 紧急的场景),批次完成不算紧急,不需要用最抓眼球的那一档。
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
         }
         if self.worker_rx.is_some() {
             ctx.request_repaint();
@@ -1078,6 +1099,9 @@ impl SubgenApp {
                     self.cancelling = true;
                 }
             });
+            if let Some(summary) = &self.last_summary {
+                ui.label(summary);
+            }
             if !self.gpu_warning_stages.is_empty() {
                 // 按流水线顺序(识别在前、翻译在后)拼出受影响的阶段名,而不是笼统一句
                 // "没用上 GPU"——识别和翻译是分别独立检测的,用户应该知道具体是哪一步慢。
@@ -1198,6 +1222,60 @@ fn format_elapsed(total_secs: u64) -> String {
         let s = total_secs % 60;
         format!("{m}分{s}秒")
     }
+}
+
+/// 批次结束时拼一句汇总,比如"本批完成:17 个成功、2 个建议核对、1 个失败(共用时
+/// 23分14秒)"。之前批次跑完只能靠肉眼扫一遍任务列表数有几个失败/警告,20 集里混着看很
+/// 容易漏掉;现在结束时直接给一个数字上的总结。只统计 `batch_indices` 里的任务(这一批
+/// 真正处理过的),不是整个任务列表——列表里可能还有上一批已经成功、这一批没碰过的文件。
+fn build_batch_summary(jobs: &[Job], batch_indices: &[usize], elapsed: std::time::Duration) -> String {
+    let mut done = 0u32;
+    let mut warned = 0u32;
+    let mut failed = 0u32;
+    let mut skipped = 0u32;
+    let mut cancelled = 0u32;
+    for &i in batch_indices {
+        if let Some(status) = jobs.get(i).map(|j| &j.status) {
+            match status {
+                JobStatus::Done(_) => done += 1,
+                JobStatus::DoneWithWarning(..) => warned += 1,
+                JobStatus::Failed(..) => failed += 1,
+                JobStatus::Skipped(_) => skipped += 1,
+                JobStatus::Cancelled => cancelled += 1,
+                JobStatus::Pending | JobStatus::Running(..) => {}
+            }
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if done > 0 {
+        parts.push(format!("{done} 个成功"));
+    }
+    if warned > 0 {
+        parts.push(format!("{warned} 个建议核对"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} 个失败"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} 个跳过"));
+    }
+    if cancelled > 0 {
+        parts.push(format!("{cancelled} 个已取消"));
+    }
+    let counts = if parts.is_empty() {
+        "没有任务被处理".to_string()
+    } else {
+        parts.join("、")
+    };
+
+    let mut summary = format!("本批完成:{counts}(共用时 {})", format_elapsed(elapsed.as_secs()));
+    // 有需要用户看一眼的项时,顺手提示一句去哪找——不重排列表顺序(用户对列表顺序有
+    // 预期,批次跑完突然打乱反而更难找),颜色区分现有机制已经覆盖,只是加一句指引。
+    if warned > 0 || failed > 0 {
+        summary.push_str("(建议核对与失败的项已在列表中用颜色标出)");
+    }
+    summary
 }
 
 /// 把字节数格式化成下载页面看着顺眼的大小单位:≥1GB 显示到 GB(1 位小数),否则显示到
@@ -1366,6 +1444,63 @@ mod tests {
         assert_eq!(format_download_size(885_098), "0.8 MB");
         assert_eq!(format_download_size(1_073_741_824), "1.0 GB");
         assert_eq!(format_download_size(3_095_033_483), "2.9 GB");
+    }
+
+    fn job_with_status(status: JobStatus) -> Job {
+        Job {
+            video_path: PathBuf::from("test.mkv"),
+            status,
+            started_at: None,
+        }
+    }
+
+    #[test]
+    fn build_batch_summary_counts_each_status_and_lists_them_in_order() {
+        let jobs = vec![
+            job_with_status(JobStatus::Done(job::JobReport::default())),
+            job_with_status(JobStatus::Done(job::JobReport::default())),
+            job_with_status(JobStatus::DoneWithWarning(
+                "w".to_string(),
+                job::JobReport::default(),
+            )),
+            job_with_status(JobStatus::Failed(job::Stage::Transcribe, "f".to_string(), None)),
+            job_with_status(JobStatus::Skipped("s".to_string())),
+        ];
+        let batch_indices = vec![0, 1, 2, 3, 4];
+        let summary =
+            build_batch_summary(&jobs, &batch_indices, std::time::Duration::from_secs(74));
+        assert_eq!(
+            summary,
+            "本批完成:2 个成功、1 个建议核对、1 个失败、1 个跳过(共用时 1分14秒)\
+             (建议核对与失败的项已在列表中用颜色标出)"
+        );
+    }
+
+    #[test]
+    fn build_batch_summary_omits_zero_categories_and_hint_when_all_succeeded() {
+        let jobs = vec![
+            job_with_status(JobStatus::Done(job::JobReport::default())),
+            job_with_status(JobStatus::Done(job::JobReport::default())),
+        ];
+        let batch_indices = vec![0, 1];
+        let summary =
+            build_batch_summary(&jobs, &batch_indices, std::time::Duration::from_secs(5));
+        assert_eq!(summary, "本批完成:2 个成功(共用时 5秒)");
+        assert!(!summary.contains("建议核对"), "全部成功时不该出现其它类别: {summary}");
+        assert!(!summary.contains("已在列表中用颜色标出"), "全部成功时不该出现核对提示: {summary}");
+    }
+
+    #[test]
+    fn build_batch_summary_only_counts_jobs_in_this_batch() {
+        // 列表里可能还有上一批已经成功、这一批完全没碰过的文件,不该被算进这一批的汇总。
+        let jobs = vec![
+            job_with_status(JobStatus::Done(job::JobReport::default())), // 上一批的,不在这次 batch_indices 里
+            job_with_status(JobStatus::Failed(job::Stage::ExtractAudio, "f".to_string(), None)),
+        ];
+        let batch_indices = vec![1];
+        let summary =
+            build_batch_summary(&jobs, &batch_indices, std::time::Duration::from_secs(1));
+        assert_eq!(summary, "本批完成:1 个失败(共用时 1秒)(建议核对与失败的项已在列表中用颜色标出)");
     }
 
     fn running_job_with_elapsed(pct: Option<f32>, elapsed_secs: u64) -> Job {
