@@ -42,8 +42,10 @@ pub enum JobStatus {
     /// 失败、语言检测不确定)
     DoneWithWarning(String, JobReport),
     Skipped(String),
-    /// 带上具体是哪个阶段失败的,界面步骤条上能直接标红对应的那一步,不用去猜。
-    Failed(Stage, String),
+    /// 带上具体是哪个阶段失败的(界面步骤条上能直接标红对应的那一步,不用去猜)和完整
+    /// 技术细节所在的日志文件路径(Some 时界面加"查看日志"按钮;None 表示这类失败压根
+    /// 没有子进程日志可看,比如缺组件、取消)。
+    Failed(Stage, String, Option<PathBuf>),
     Cancelled,
 }
 
@@ -159,17 +161,17 @@ pub fn run_batch(
 
             let result = match outcome {
                 Ok(r) => r,
-                Err((_, e)) if e == "已取消" => {
+                Err((_, e, _)) if e == "已取消" => {
                     let _ = tx.send(WorkerEvent::JobUpdate {
                         index,
                         status: JobStatus::Cancelled,
                     });
                     continue;
                 }
-                Err((stage, e)) => {
+                Err((stage, e, log_path)) => {
                     let _ = tx.send(WorkerEvent::JobUpdate {
                         index,
-                        status: JobStatus::Failed(stage, e),
+                        status: JobStatus::Failed(stage, e, log_path),
                     });
                     continue;
                 }
@@ -192,9 +194,11 @@ pub fn run_batch(
                     continue;
                 }
                 Err(crate::engine::PlaceError::Failed(e)) => {
+                    // 文件系统操作(把生成的 srt 从 tmp/ 挪到视频同目录)失败,不涉及子进程,
+                    // 没有对应的日志文件。
                     let _ = tx.send(WorkerEvent::JobUpdate {
                         index,
-                        status: JobStatus::Failed(Stage::Transcribe, e),
+                        status: JobStatus::Failed(Stage::Transcribe, e, None),
                     });
                     continue;
                 }

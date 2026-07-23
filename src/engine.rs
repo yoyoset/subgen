@@ -37,6 +37,17 @@ use std::sync::Arc;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+/// 识别/提取失败时的错误信息:(哪个阶段失败, 给用户看的一行摘要, 完整技术细节所在的日志
+/// 文件路径)。摘要故意不塞退出码/stderr 这类技术细节——那些留在日志文件里,界面只展示
+/// 一行人话,想深挖的用户点"查看日志"按钮直接打开文件,不用对着一屏英文技术输出发呆。
+pub type EngineError = (Stage, String, Option<PathBuf>);
+
+/// 构造一个没有对应日志文件的错误——比如"找不到 whisper-cli.exe"这类还没真正跑起来就
+/// 失败的情况,压根没有子进程日志可看。
+fn no_log(stage: Stage, msg: impl Into<String>) -> EngineError {
+    (stage, msg.into(), None)
+}
+
 /// Windows 进程创建标志:不给子进程分配控制台窗口。
 /// 主程序自己用 `windows_subsystem = "windows"` 关掉了控制台后,子进程(ffmpeg/whisper-cli/
 /// llama-server)反而会被 Windows 单独弹一个新控制台窗口(实测确认过,不加这个标志真的会弹窗)——
@@ -80,27 +91,27 @@ pub fn process_video(
     language: &str,
     cancel: &Arc<AtomicBool>,
     mut progress_cb: impl FnMut(Stage, String, Option<f32>),
-) -> Result<EngineOutcome, (Stage, String)> {
+) -> Result<EngineOutcome, EngineError> {
     if cancel.load(Ordering::Relaxed) {
-        return Err((Stage::ExtractAudio, "已取消".to_string()));
+        return Err(no_log(Stage::ExtractAudio, "已取消"));
     }
 
     let whisper_cli = paths::whisper_cli_exe()
-        .ok_or_else(|| (Stage::ExtractAudio, "找不到 whisper-cli.exe,请先完成组件下载".to_string()))?;
+        .ok_or_else(|| no_log(Stage::ExtractAudio, "找不到 whisper-cli.exe,请先完成组件下载"))?;
     let ffmpeg = paths::ffmpeg_exe()
-        .ok_or_else(|| (Stage::ExtractAudio, "找不到 ffmpeg.exe,请先完成组件下载".to_string()))?;
+        .ok_or_else(|| no_log(Stage::ExtractAudio, "找不到 ffmpeg.exe,请先完成组件下载"))?;
     let model_path = paths::model_path(model_key);
     if !model_path.is_file() {
-        return Err((
+        return Err(no_log(
             Stage::ExtractAudio,
             format!("模型文件不存在: {}", model_path.display()),
         ));
     }
 
     std::fs::create_dir_all(paths::tmp_dir())
-        .map_err(|e| (Stage::ExtractAudio, format!("创建临时目录失败: {e}")))?;
+        .map_err(|e| no_log(Stage::ExtractAudio, format!("创建临时目录失败: {e}")))?;
     std::fs::create_dir_all(paths::logs_dir())
-        .map_err(|e| (Stage::ExtractAudio, format!("创建日志目录失败: {e}")))?;
+        .map_err(|e| no_log(Stage::ExtractAudio, format!("创建日志目录失败: {e}")))?;
 
     let unique = cache_key(video_path, model_key, language);
     let wav_path = paths::tmp_dir().join(format!("{unique}.wav"));
@@ -130,22 +141,25 @@ pub fn process_video(
         ff_cmd.creation_flags(CREATE_NO_WINDOW);
         let ff_child = ff_cmd
             .spawn()
-            .map_err(|e| (Stage::ExtractAudio, format!("无法启动 ffmpeg: {e}")))?;
+            .map_err(|e| no_log(Stage::ExtractAudio, format!("无法启动 ffmpeg: {e}")))?;
         job_guard::bind_child_to_job(&ff_child);
         let ff_output = ff_child
             .wait_with_output()
-            .map_err(|e| (Stage::ExtractAudio, format!("等待 ffmpeg 失败: {e}")))?;
+            .map_err(|e| no_log(Stage::ExtractAudio, format!("等待 ffmpeg 失败: {e}")))?;
 
         if !ff_output.status.success() {
-            let stderr = String::from_utf8_lossy(&ff_output.stderr);
-            let tail: String = stderr.lines().rev().take(15).collect::<Vec<_>>().join("\n");
+            // 完整 stderr 写进日志文件,界面只展示一行人话摘要——ffmpeg 的报错动辄十几行,
+            // 塞进状态栏会撑爆一行的高度,技术细节留给"查看日志"按钮的用户。
+            let ffmpeg_log = paths::logs_dir().join(format!("{unique}_ffmpeg.log"));
+            let _ = std::fs::write(&ffmpeg_log, ff_output.stderr.as_slice());
             return Err((
                 Stage::ExtractAudio,
-                format!("音频提取失败(该文件可能损坏或无音轨):\n{tail}"),
+                "音频提取失败(该文件可能损坏或无音轨)".to_string(),
+                Some(ffmpeg_log),
             ));
         }
         if !wav_path.is_file() {
-            return Err((Stage::ExtractAudio, "音频提取未产生输出文件".to_string()));
+            return Err(no_log(Stage::ExtractAudio, "音频提取未产生输出文件"));
         }
     }
 
@@ -153,7 +167,7 @@ pub fn process_video(
         // 不删 wav——它是这一步的完整产物,不是半成品。取消不该比崩溃损失更大:崩溃后
         // 断点续跑能直接复用已提取的音轨,主动取消却把它删掉、下次还要重新提取一遍,
         // 是反直觉的(用户点"取消"通常是想暂停/改主意,不是想作废已经做完的部分)。
-        return Err((Stage::ExtractAudio, "已取消".to_string()));
+        return Err(no_log(Stage::ExtractAudio, "已取消"));
     }
 
     // ---- 2. 语音识别(支持复用已有的 srt) ----
@@ -213,7 +227,7 @@ pub fn process_video(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| (Stage::Transcribe, format!("无法启动识别引擎: {e}")))?;
+        .map_err(|e| no_log(Stage::Transcribe, format!("无法启动识别引擎: {e}")))?;
     job_guard::bind_child_to_job(&child);
 
     let mut used_gpu = false;
@@ -282,7 +296,7 @@ pub fn process_video(
             // srt_looks_complete 误判成"能解析出块所以算完整"而被断点续跑错误复用。
             let srt_partial = srt_out_prefix.with_extension("srt");
             let _ = std::fs::remove_file(&srt_partial);
-            return Err((Stage::Transcribe, "已取消".to_string()));
+            return Err(no_log(Stage::Transcribe, "已取消"));
         }
 
         if let Ok(Some(_status)) = child.try_wait() {
@@ -296,7 +310,7 @@ pub fn process_video(
 
     let status = child
         .wait()
-        .map_err(|e| (Stage::Transcribe, format!("等待识别进程失败: {e}")))?;
+        .map_err(|e| no_log(Stage::Transcribe, format!("等待识别进程失败: {e}")))?;
 
     let _ = std::fs::remove_file(&wav_path); // 清理临时 wav,不留在磁盘上
 
@@ -308,13 +322,13 @@ pub fn process_video(
     let _ = std::fs::write(&log_file, &log_content);
 
     if !status.success() {
-        let tail: String = full_log.lines().rev().take(15).collect::<Vec<_>>().join("\n");
+        // 完整输出(progress 行、CUDA 探测、原始报错)都在 log_file 里,界面只展示一行
+        // 摘要——之前直接把最后 15 行原始日志拼进状态栏,一屏英文技术输出对用户毫无意义,
+        // 想深挖的用户点"查看日志"按钮打开这个文件就够了。
         return Err((
             Stage::Transcribe,
-            format!(
-                "识别引擎返回错误({exit_desc},详见日志 {}):\n{tail}",
-                log_file.display()
-            ),
+            format!("识别引擎出错({exit_desc})"),
+            Some(log_file.clone()),
         ));
     }
 
@@ -323,10 +337,8 @@ pub fn process_video(
     if !generated_srt.is_file() {
         return Err((
             Stage::Transcribe,
-            format!(
-                "识别流程结束但未生成字幕文件(详见日志 {})",
-                log_file.display()
-            ),
+            "识别流程结束但未生成字幕文件".to_string(),
+            Some(log_file.clone()),
         ));
     }
 

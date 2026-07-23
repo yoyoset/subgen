@@ -348,7 +348,7 @@ impl SubgenApp {
         if let Some(rx) = &self.migrate_rx {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    setup::MigrateEvent::Log(l) => self.log_lines.push(l),
+                    setup::MigrateEvent::Log(l) => push_log(&mut self.log_lines, l),
                     setup::MigrateEvent::Progress {
                         file_label,
                         current_index,
@@ -372,7 +372,7 @@ impl SubgenApp {
                         }
                     }
                     setup::MigrateEvent::FileDone(label) => {
-                        self.log_lines.push(format!("{label} 搬迁完成"));
+                        push_log(&mut self.log_lines, format!("{label} 搬迁完成"));
                     }
                     setup::MigrateEvent::AllDone(issues) => finished = Some(issues),
                 }
@@ -381,7 +381,7 @@ impl SubgenApp {
         if let Some(issues) = finished {
             self.migrate_rx = None;
             for issue in &issues {
-                self.log_lines.push(format!("提示: {issue}"));
+                push_log(&mut self.log_lines, format!("提示: {issue}"));
             }
             // 不管搬迁是否完全顺利(部分文件可能因为取消/出错留在了旧目录),都把生效目录切
             // 到新位置——已经搬过去的文件才是准确的当前状态,剩下的缺口交给现成的
@@ -472,7 +472,7 @@ impl SubgenApp {
         if let Some(rx) = &self.setup_rx {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    SetupEvent::Log(l) => self.log_lines.push(l),
+                    SetupEvent::Log(l) => push_log(&mut self.log_lines, l),
                     SetupEvent::Progress {
                         component,
                         downloaded,
@@ -491,7 +491,7 @@ impl SubgenApp {
                         }
                     }
                     SetupEvent::ComponentReady(label) => {
-                        self.log_lines.push(format!("{label} 安装完成"));
+                        push_log(&mut self.log_lines, format!("{label} 安装完成"));
                         if let SetupPhase::Downloading {
                             current_label,
                             current_index,
@@ -675,13 +675,19 @@ impl eframe::App for SubgenApp {
                     }
                     ui.add_space(12.0);
                     ui.separator();
-                    egui::ScrollArea::vertical()
-                        .max_height(160.0)
-                        .stick_to_bottom(true)
+                    // 默认收起:原始下载日志逐行滚动,信息密度低、看着比较像半成品,
+                    // 大多数用户根本不需要看这个;需要时(比如报障)自己展开就行。
+                    egui::CollapsingHeader::new("详细信息")
+                        .default_open(false)
                         .show(ui, |ui| {
-                            for line in &self.log_lines {
-                                ui.label(line);
-                            }
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for line in &self.log_lines {
+                                        ui.label(line);
+                                    }
+                                });
                         });
                 });
             }
@@ -724,13 +730,17 @@ impl eframe::App for SubgenApp {
                     }
                     ui.add_space(12.0);
                     ui.separator();
-                    egui::ScrollArea::vertical()
-                        .max_height(160.0)
-                        .stick_to_bottom(true)
+                    egui::CollapsingHeader::new("详细信息")
+                        .default_open(false)
                         .show(ui, |ui| {
-                            for line in &self.log_lines {
-                                ui.label(line);
-                            }
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for line in &self.log_lines {
+                                        ui.label(line);
+                                    }
+                                });
                         });
                 });
             }
@@ -969,14 +979,53 @@ impl SubgenApp {
                             });
                         });
                         // 第二行:详细状态文案,单独占一行,不用再和文件名/步骤条抢空间。
-                        let (text, color) = job_status_line(job, self.cancelling);
-                        ui.colored_label(color, text);
+                        // 失败且有对应日志文件时加一个"查看日志"按钮——技术性的报错细节
+                        // (退出码、原始 stderr)留在日志文件里,状态栏只给一行人话摘要,
+                        // 想深挖的用户一键用记事本打开,不用去 logs/ 文件夹里翻文件名。
+                        ui.horizontal(|ui| {
+                            let (text, color) = job_status_line(job, self.cancelling);
+                            ui.colored_label(color, text);
+                            if let JobStatus::Failed(_, _, Some(log_path)) = &job.status {
+                                if ui.small_button("查看日志").clicked() {
+                                    let _ = std::process::Command::new("notepad")
+                                        .arg(log_path)
+                                        .spawn();
+                                }
+                            }
+                        });
                     });
                     ui.separator();
                 }
             });
         });
     }
+}
+
+/// 追加一行日志:既存进界面日志区(`log_lines`),也同步落盘到 `logs/app.log`——`log_lines`
+/// 只在内存里,关窗即丢,用户报障时"把 logs 文件夹发我"这句话要成立,日志就得先落盘。
+/// 时间戳格式和 crash.log(见 install_panic_logger)保持一致,用 unix 时间戳而不是拼日历
+/// 时间,没有额外引入日期时间处理依赖。写盘失败(比如目录还没建出来)静默忽略,这只是个
+/// 附加的排障能力,不该反过来影响主流程。
+///
+/// 写成自由函数、只接收 `&mut Vec<String>` 而不是 `&mut SubgenApp` 方法——调用方常常是
+/// 先 `if let Some(rx) = &self.xxx_rx { while ... }` 借着 `rx` 读事件、循环体里再要记日志,
+/// 如果写成 `&mut self` 方法,会和外层对 `self.xxx_rx` 的借用冲突(借用检查器认为方法调用
+/// 需要整个 `self` 的独占访问权);只借 `log_lines` 这一个字段就没有这个问题。
+fn push_log(log_lines: &mut Vec<String>, line: String) {
+    let _ = std::fs::create_dir_all(paths::logs_dir());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths::logs_dir().join("app.log"))
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "[unix {timestamp}] {line}");
+    }
+    log_lines.push(line);
 }
 
 /// 把秒数格式化成 "12s" 或 "1分23秒" 这种人可读的形式,用于界面上的"已运行"计时。
@@ -1007,7 +1056,7 @@ fn render_stage_stepper(ui: &mut egui::Ui, status: &JobStatus, translate_enabled
 
     let (current_ord, is_failed, is_all_done) = match status {
         JobStatus::Running(stage, _, _) => (Some(stage.ordinal()), false, false),
-        JobStatus::Failed(stage, _) => (Some(stage.ordinal()), true, false),
+        JobStatus::Failed(stage, _, _) => (Some(stage.ordinal()), true, false),
         JobStatus::Done(_) | JobStatus::DoneWithWarning(..) => (None, false, true),
         _ => return,
     };
@@ -1117,7 +1166,7 @@ fn job_status_line(job: &Job, cancelling: bool) -> (String, egui::Color32) {
             egui::Color32::from_rgb(230, 150, 20),
         ),
         JobStatus::Skipped(reason) => (format!("跳过: {reason}"), egui::Color32::GRAY),
-        JobStatus::Failed(stage, reason) => (
+        JobStatus::Failed(stage, reason, _) => (
             format!("{}阶段失败: {reason}", stage.label()),
             egui::Color32::RED,
         ),
@@ -1128,6 +1177,24 @@ fn job_status_line(job: &Job, cancelling: bool) -> (String, egui::Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 用独立的 `Vec<String>` 而不是真的构造一个 `SubgenApp` 来测——`push_log` 就是特意
+    /// 为了不需要整个 `&mut self` 才写成自由函数的,测试也应该只依赖它实际需要的那点状态。
+    #[test]
+    fn push_log_writes_to_app_log_and_in_memory_vec() {
+        let app_log = paths::logs_dir().join("app.log");
+        let _ = std::fs::remove_file(&app_log);
+
+        let mut lines: Vec<String> = Vec::new();
+        push_log(&mut lines, "测试日志行".to_string());
+
+        assert_eq!(lines, vec!["测试日志行".to_string()]);
+        let content = std::fs::read_to_string(&app_log).expect("app.log 应该已经被写出来");
+        assert!(content.contains("测试日志行"), "app.log 应该包含这行日志: {content}");
+        assert!(content.contains("[unix "), "应该带时间戳前缀: {content}");
+
+        let _ = std::fs::remove_file(&app_log);
+    }
 
     #[test]
     fn lang_display_translates_known_codes_and_passes_through_unknown() {
