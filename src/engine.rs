@@ -55,6 +55,12 @@ pub struct EngineOutcome {
     /// whisper 自动检测到的源语言(language="auto" 时来自日志解析;显式指定语言时就是那个值)。
     /// 用于翻译阶段挑选对应的翻译模型(如日语走 Sakura)。
     pub detected_language: Option<String>,
+    /// 音轨是否复用了 `tmp/` 里已有的产物,而不是这次真实提取出来的。
+    pub reused_wav: bool,
+    /// 字幕是否复用了 `tmp/` 里已有的产物,而不是这次真实识别出来的——复用时完全没有
+    /// 真实跑 whisper-cli,调用方(界面)应该让用户知道这次"完成"其实是"沿用了上次的结果",
+    /// 而不是让用户误以为换了模型/语言重新识别过。
+    pub reused_srt: bool,
 }
 
 /// 处理单个视频文件,progress_cb 用于把当前所在阶段/状态文案/百分比回传给调用方(界面线程)。
@@ -62,8 +68,9 @@ pub struct EngineOutcome {
 ///
 /// **支持断点续跑**:提取音轨、语音识别这两步,如果 `tmp/` 里已经有对应哈希的产物且看起来
 /// 完整,会直接复用、跳过重新跑——这样即使上次处理到一半崩溃/被打断,这次重新处理同一个
-/// 文件也不用把已经做完的工作再做一遍。完全自动判断,不需要开关;想强制重新跑,手动删掉
-/// `tmp/` 里对应的 `{文件名}_{哈希}.wav`/`.srt` 即可。
+/// 文件也不用把已经做完的工作再做一遍。哈希由路径 + `model_key` + `language` 一起算出
+/// (见 `cache_key`),换模型或换语言会自然算出不同的哈希、不会误命中旧结果。完全自动判断,
+/// 不需要开关;想强制重新跑,手动删掉 `tmp/` 里对应的 `{文件名}_{哈希}.wav`/`.srt` 即可。
 pub fn process_video(
     video_path: &Path,
     model_key: &str,
@@ -92,12 +99,7 @@ pub fn process_video(
     std::fs::create_dir_all(paths::logs_dir())
         .map_err(|e| (Stage::ExtractAudio, format!("创建日志目录失败: {e}")))?;
 
-    let stem = video_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("audio");
-    // 用哈希后缀避免同名不同目录文件在临时目录里互相覆盖
-    let unique = format!("{stem}_{:x}", simple_hash(&video_path.to_string_lossy()));
+    let unique = cache_key(video_path, model_key, language);
     let wav_path = paths::tmp_dir().join(format!("{unique}.wav"));
     let srt_out_prefix = paths::tmp_dir().join(&unique); // whisper -of 不带扩展名,会自动加 .srt
     let log_file = paths::logs_dir().join(format!("{unique}.log"));
@@ -176,6 +178,8 @@ pub fn process_video(
             used_gpu: None, // 这次没有真实跑 whisper-cli,不知道用没用上 GPU,不该瞎猜
             repetition_collapsed,
             detected_language,
+            reused_wav: wav_reused,
+            reused_srt: true,
         });
     }
 
@@ -343,6 +347,8 @@ pub fn process_video(
         used_gpu: Some(used_gpu),
         repetition_collapsed,
         detected_language,
+        reused_wav: wav_reused,
+        reused_srt: false,
     })
 }
 
@@ -514,9 +520,50 @@ fn simple_hash(s: &str) -> u32 {
     h
 }
 
+/// tmp/logs 里中间产物的文件名前缀,同时也是断点续跑的"是否可以复用"的判断依据。
+/// 哈希输入包含路径 + 模型 + 语言,不是只有路径——不然换个识别模型或手动指定源语言重新
+/// 处理同一个文件时,会直接复用上一次(用旧模型/旧语言)跑出来的 tmp/ 产物,界面上却
+/// 显示"完成",用户会以为新设置生效了,其实什么都没变(真实踩过的坑:换模型重跑无效)。
+/// 把 model_key/language 也纳入哈希,换了任何一个都会算出不同的 key,自然触发重新
+/// 提取/重新识别,不需要额外的"是否要重新计算"判断逻辑。
+fn cache_key(video_path: &Path, model_key: &str, language: &str) -> String {
+    let stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audio");
+    format!(
+        "{stem}_{:x}",
+        simple_hash(&format!("{}|{model_key}|{language}", video_path.to_string_lossy()))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 断点续跑的"命中缓存"判断依赖这个 key,换模型或换语言必须算出不同的 key,否则
+    /// 用户切换设置重新处理同一个文件时会静默复用旧结果——真实踩过的坑:换模型重跑无效,
+    /// 界面显示"完成"但内容和上一次一模一样。
+    #[test]
+    fn cache_key_changes_with_model_or_language() {
+        let path = Path::new(r"F:\videos\Episode.mkv");
+        let base = cache_key(path, "large-v3", "auto");
+        assert_ne!(
+            base,
+            cache_key(path, "medium", "auto"),
+            "换模型应该产生不同的 key"
+        );
+        assert_ne!(
+            base,
+            cache_key(path, "large-v3", "ja"),
+            "换语言应该产生不同的 key"
+        );
+        assert_eq!(
+            base,
+            cache_key(path, "large-v3", "auto"),
+            "同样的路径/模型/语言应该稳定算出同一个 key(断点续跑靠这个复用产物)"
+        );
+    }
 
     /// 复现真实出现过的"复读机"故障形状(同一句话连续出现 983 次)并验证折叠逻辑:
     /// 折叠后应该只剩 1 条(跨度覆盖首尾时间戳),且不影响前后正常的字幕行。
