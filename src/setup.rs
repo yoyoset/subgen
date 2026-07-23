@@ -627,7 +627,36 @@ fn verify_hash_or_warn(
     Ok(())
 }
 
-/// 流式下载到临时文件,边下载边计算 sha256,定期上报进度,支持取消。
+/// 补算 `.part` 里已有内容的哈希(hasher 是流式的,续传不能跳过中间直接从续传点开始算,
+/// 不然最终哈希和完整文件对不上)。返回补算过的 hasher 和已有字节数(也就是续传 Range
+/// 请求的起点)。文件不存在或读取中途出错时返回全新的 hasher 和 0——出错时当作没有可用的
+/// 续传内容更安全,退化成从头下载,不会因为半吊子的部分文件产生错误的哈希结果。
+fn hash_existing(path: &Path) -> (Sha256, u64) {
+    let mut hasher = Sha256::new();
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (Sha256::new(), 0);
+    };
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+                total += n as u64;
+            }
+            Err(_) => return (Sha256::new(), 0),
+        }
+    }
+    (hasher, total)
+}
+
+/// 流式下载到临时文件,边下载边计算 sha256,定期上报进度,支持取消、断点续传、网络抖动重试。
+///
+/// 大文件(几个 GB)在家用网络上中途断开是首次安装失败率最大的来源;之前每次失败都从零
+/// 重新下载,一个 4GB 文件网络稍微抖一下就前功尽弃。现在 `.part` 临时文件在下载中断(不是
+/// 用户主动取消)后不会被删除,下次调用会先读取已有内容补算哈希,再用 HTTP Range 请求从
+/// 断点续传;单次尝试内读流中途出错也不立即失败,原地重试几次而不是让整个下载失败。
 fn download_to_file(
     label: &str,
     url: &str,
@@ -635,31 +664,94 @@ fn download_to_file(
     tx: &Sender<SetupEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<[u8; 32], String> {
-    let _ = tx.send(SetupEvent::Log(format!("开始下载 {label} ...")));
+    const MAX_ATTEMPTS: u32 = 3; // 1 次首发 + 2 次重试
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(1800))
         .build()
         .map_err(|e| format!("创建下载客户端失败: {e}"))?;
-    let mut resp = client
-        .get(url)
+
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("用户取消下载".to_string());
+        }
+        match try_download_once(label, url, tmp_path, &client, tx, cancel) {
+            Ok(digest) => return Ok(digest),
+            Err(e) if e == "用户取消下载" => return Err(e),
+            Err(e) => {
+                last_err = e;
+                if attempt < MAX_ATTEMPTS {
+                    let _ = tx.send(SetupEvent::Log(format!(
+                        "{label} 下载中断,2 秒后重试(第 {attempt}/{MAX_ATTEMPTS} 次尝试): {last_err}"
+                    )));
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        }
+    }
+    Err(format!("下载 {label} 多次重试后仍失败: {last_err}"))
+}
+
+/// 单次下载尝试:可能是从头下载,也可能是从 `tmp_path` 已有内容续传。失败时返回的错误
+/// 交给上层 `download_to_file` 判断要不要重试;`.part` 文件在这个函数内部任何失败路径都
+/// 不会被删除(断点续传的价值就在于保留已下载的部分)。
+fn try_download_once(
+    label: &str,
+    url: &str,
+    tmp_path: &Path,
+    client: &reqwest::blocking::Client,
+    tx: &Sender<SetupEvent>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<[u8; 32], String> {
+    let (mut hasher, resume_from) = if tmp_path.is_file() {
+        hash_existing(tmp_path)
+    } else {
+        (Sha256::new(), 0)
+    };
+
+    let mut request = client.get(url);
+    if resume_from > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+    }
+    let mut resp = request
         .send()
         .map_err(|e| format!("下载 {label} 失败(网络错误): {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("下载 {label} 失败: HTTP {}", resp.status()));
-    }
-    let total = resp.content_length().unwrap_or(0);
 
-    let mut file =
-        std::fs::File::create(tmp_path).map_err(|e| format!("创建临时文件失败: {e}"))?;
-    let mut hasher = Sha256::new();
+    let (mut file, mut downloaded, total) = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+    {
+        let _ = tx.send(SetupEvent::Log(format!(
+            "{label} 从断点续传(已下载 {resume_from} 字节)..."
+        )));
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp_path)
+            .map_err(|e| format!("打开临时文件失败: {e}"))?;
+        let total = resume_from + resp.content_length().unwrap_or(0);
+        (file, resume_from, total)
+    } else if resp.status().is_success() {
+        // 服务器不支持 Range(直接返回 200 全量内容,不是 206)时退化成从头下载,不当错误处理。
+        if resume_from > 0 {
+            let _ = tx.send(SetupEvent::Log(format!(
+                "{label} 服务器不支持断点续传,重新下载..."
+            )));
+        } else {
+            let _ = tx.send(SetupEvent::Log(format!("开始下载 {label} ...")));
+        }
+        hasher = Sha256::new();
+        let file =
+            std::fs::File::create(tmp_path).map_err(|e| format!("创建临时文件失败: {e}"))?;
+        let total = resp.content_length().unwrap_or(0);
+        (file, 0u64, total)
+    } else {
+        return Err(format!("下载 {label} 失败: HTTP {}", resp.status()));
+    };
+
     let mut buf = [0u8; 64 * 1024];
-    let mut downloaded: u64 = 0;
     let mut last_report = std::time::Instant::now();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            drop(file);
-            let _ = std::fs::remove_file(tmp_path);
             return Err("用户取消下载".to_string());
         }
         let n = resp
@@ -851,6 +943,94 @@ mod tests {
             needed,
             Some(estimated_size_bytes(ComponentKey::Model, "large-v3")),
             "只缺语音模型时,需要的空间应该等于该模型的估算大小"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 断点续传正确性的核心保证:拼接续传后的文件哈希,必须和一次性写完整个文件算出的
+    /// 哈希完全一致——不然下载"成功"了,校验却过不了,用户以为文件坏了实际是续传逻辑错了。
+    #[test]
+    fn hash_existing_matches_full_file_hash_after_resumed_write() {
+        let dir = temp_subdir("hash_existing_resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 256) as u8).collect();
+        let mid = content.len() / 2;
+
+        let full = dir.join("full.bin");
+        std::fs::write(&full, &content).unwrap();
+        let (full_hasher, full_len) = hash_existing(&full);
+        assert_eq!(full_len, content.len() as u64);
+
+        // 模拟断点续传:先写前半段(第一次下载中断在这里),再用 append 补写后半段
+        // (续传请求写回来的部分),中间调用 hash_existing 两次,分别验证长度和最终哈希。
+        let resumed = dir.join("resumed.bin");
+        std::fs::write(&resumed, &content[..mid]).unwrap();
+        let (_, len_before_resume) = hash_existing(&resumed);
+        assert_eq!(len_before_resume, mid as u64, "续传前应该报告已有的字节数,作为 Range 起点");
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&resumed).unwrap();
+            f.write_all(&content[mid..]).unwrap();
+        }
+        let (resumed_hasher, len_after_resume) = hash_existing(&resumed);
+        assert_eq!(len_after_resume, content.len() as u64);
+        assert_eq!(
+            resumed_hasher.finalize().as_slice(),
+            full_hasher.finalize().as_slice(),
+            "分两段续传写完的文件,哈希必须和一次性写完的文件完全一致"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hash_existing_returns_zero_length_for_missing_file() {
+        let missing = temp_subdir("hash_existing_missing").join("does_not_exist.bin");
+        let (_, len) = hash_existing(&missing);
+        assert_eq!(len, 0, "文件不存在应该当作没有可续传的内容,退化成从头下载");
+    }
+
+    /// 真实网络端到端验证断点续传:下载 VAD 模型(885KB,是这批组件里最小的,适合当实验
+    /// 对象)前 200KB 后人为截断模拟"下载中断",再调用同一个 download_to_file 续传剩余
+    /// 部分,确认最终哈希和 VAD_SHA256(GitHub/HuggingFace 官方校验值)完全一致——不只是
+    /// 测 hash_existing 这个纯函数本身,而是测真实服务器(HuggingFace CDN,经过一次 302
+    /// 重定向)在 Range 请求下的实际行为是否符合预期。标 #[ignore] 是因为它需要真实网络
+    /// 且会产生真实流量,不该在日常 `cargo test`/CI 里跑,手动 `cargo test -- --ignored`
+    /// 验证。
+    #[test]
+    #[ignore]
+    fn download_to_file_resumes_after_simulated_interruption_against_real_server() {
+        let dir = temp_subdir("resume_e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp_path = dir.join("vad.part");
+
+        let (tx, _rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // 第一次:正常下载到一半就人为掐断(不是真的网络故障,是主动截断已下载的文件来
+        // 模拟"上次只下了一部分"这个断点续跑要处理的真实场景)。
+        let digest1 = download_to_file("VAD(测试)", VAD_URL, &tmp_path, &tx, &cancel)
+            .expect("第一次下载应该成功(用来产出一个完整文件,再截断模拟中断)");
+        let full_len = std::fs::metadata(&tmp_path).unwrap().len();
+        assert_eq!(to_hex(&digest1), VAD_SHA256, "完整下载一次的哈希应该本来就和官方值一致");
+
+        let truncated_len = 200_000u64.min(full_len - 1);
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(&tmp_path).unwrap();
+            file.set_len(truncated_len).unwrap();
+            drop(file);
+        }
+        assert_eq!(std::fs::metadata(&tmp_path).unwrap().len(), truncated_len);
+
+        // 第二次:同一个 .part 路径,应该从 200KB 续传,而不是从头下载。
+        let digest2 = download_to_file("VAD(测试)", VAD_URL, &tmp_path, &tx, &cancel)
+            .expect("续传应该成功");
+        assert_eq!(
+            to_hex(&digest2),
+            VAD_SHA256,
+            "续传拼接后的文件哈希应该和官方校验值一致,证明 Range 续传没有产生数据错位/丢失"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -28,6 +28,8 @@
 | Sakura 7B(日→中翻译模型)| [SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF](https://huggingface.co/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF) | 约 4.25GB | 勾选翻译且选了 Sakura 或"自动" |
 | Qwen3 4B(通用翻译模型)| [unsloth/Qwen3-4B-Instruct-2507-GGUF](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF) | 约 2.4GB | 勾选翻译且选了 Qwen3 或"自动" |
 
+**下载支持断点续传**:大文件(几个 GB)在家用网络上中途断开是首次安装最常见的失败原因,不用担心从零重来——网络中断或程序被关掉后重新下载同一个组件,会自动从上次的进度接着下,不会浪费已经下载的部分(内部原理:边下载边把已收到的内容写进 `.part` 临时文件,重启后先读取这部分内容补算哈希,再用 HTTP Range 请求续传;目标服务器不支持续传时会自动退化成从头下载)。单次连接中途断开也会在原地自动重试几次,不会一遇到网络抖动就整个失败。
+
 如果自动下载失败(网络问题),可以按上表链接手动下载,分别解压/放到 exe 同目录的 `engine/`、`ffmpeg/`、`translator/` 文件夹里(zip 解压进去就行,程序会自动递归找里面的可执行文件,不要求固定的子目录层级),模型文件(语音模型/VAD/翻译模型)直接放进 `models/` 文件夹,不用解压。
 
 如果你本地已经用其他工具(比如 LM Studio、text-generation-webui)通过 HuggingFace 下载过 Sakura 或 Qwen3 的 gguf 文件,首次下载时程序会自动扫描 `HF_HOME`/`HF_HUB_CACHE` 环境变量和 `~/.cache/huggingface` 默认缓存目录,哈希校验通过就直接复制过来,不会重复下载。
@@ -135,6 +137,7 @@ src/
 - [x] ~~主程序意外退出后,whisper-cli/ffmpeg/llama-server 子进程变成孤儿继续跑~~ 已用 Windows Job Object(`KILL_ON_JOB_CLOSE`)绑定子进程生命周期,主程序不管怎么退出子进程都会被系统一起终止,详见上文
 - [x] ~~处理中断后重新跑会把已经提取的音轨/识别的字幕从头再来一遍~~ 已支持断点续跑,`tmp/` 里已有的完整中间产物会自动复用,详见上文
 - [x] ~~任务列表长文件名和状态文案会互相覆盖显示~~ 界面重做:文件名/状态各占一行,文件名超长会省略号截断(hover 可看完整),流水线阶段用步骤条单独展示
+- [x] ~~大文件下载中断后只能从头重新下载~~ 已支持断点续传(HTTP Range),已用真机对 HuggingFace 和 GitHub Release 两个真实 CDN 实测验证(`curl -L -H "Range: bytes=1000-"` 跟随 302 重定向后仍能拿到 206 Partial Content),`.part` 临时文件在下载中断后不再被删除,详见上文"下载支持断点续传"
 - [ ] 翻译阶段没有 GPU 使用检测(语音识别阶段有,`used_gpu` 靠解析 whisper-cli 日志里的 `using CUDA0 backend`;llama-server 的日志目前只是排空、没解析,所以翻译如果意外掉到纯 CPU 不会有界面提示,只会感觉很慢)
 - [ ] Sakura 的批量编号翻译提示词和官方单段落格式有出入(见上文",翻译走批量 + 编号对齐"一条),没有和逐行调用做过量化的翻译质量对比,只保证了格式对齐可靠、不阻断任务
 - [ ] 暂无打包成单文件安装包/自动更新机制,`cargo build --release` 出的就是最终产物
