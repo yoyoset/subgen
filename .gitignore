@@ -1,0 +1,17 @@
+/target
+/dist
+
+# 运行期自动下载/生成的内容,不进仓库(体积大,每台机器首次运行会自动重新下载)
+/engine/
+/ffmpeg/
+/models/
+/tmp/
+/logs/
+/config.toml
+/subgen.lock
+*.part
+_dl_*.zip.part
+
+# IDE
+.vscode/
+.idea/
