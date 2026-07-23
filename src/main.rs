@@ -1072,6 +1072,12 @@ impl SubgenApp {
                         // (退出码、原始 stderr)留在日志文件里,状态栏只给一行人话摘要,
                         // 想深挖的用户一键用记事本打开,不用去 logs/ 文件夹里翻文件名。
                         ui.horizontal(|ui| {
+                            // 正在跑的任务前面加个转圈动画——纯文字状态在长时间不变的等待期
+                            // (比如提取音轨、翻译模型加载)看着和"卡死了"没有视觉区别,
+                            // 一个持续在动的图形元素能立刻打消这个疑虑,不用非得等百分比更新。
+                            if matches!(job.status, JobStatus::Running(..)) {
+                                ui.spinner();
+                            }
                             let (text, color) = job_status_line(job, self.cancelling);
                             ui.colored_label(color, text);
                             if let JobStatus::Failed(_, _, Some(log_path)) = &job.status {
@@ -1239,7 +1245,16 @@ fn job_status_line(job: &Job, cancelling: bool) -> (String, egui::Color32) {
         JobStatus::Running(_, text, pct) => {
             let elapsed = job.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             let elapsed_str = format_elapsed(elapsed);
+            // 百分比太小或刚开始跑时,线性外推出来的剩余时间波动极大(比如 1% 时算出来的
+            // "约剩" 可能离谱到几十分钟),没有参考价值,只在有一定进度基础后才显示。
             let mut text = match pct {
+                Some(pct) if *pct >= 5.0 && elapsed >= 10 => {
+                    let eta_secs = (elapsed as f32 * (100.0 - pct) / pct).round() as u64;
+                    format!(
+                        "{text} {pct:.0}%(已运行 {elapsed_str},约剩 {})",
+                        format_elapsed(eta_secs)
+                    )
+                }
                 Some(pct) => format!("{text} {pct:.0}%(已运行 {elapsed_str})"),
                 None => format!("{text}(已运行 {elapsed_str})"),
             };
@@ -1285,6 +1300,47 @@ mod tests {
         assert_eq!(format_download_size(885_098), "0.8 MB");
         assert_eq!(format_download_size(1_073_741_824), "1.0 GB");
         assert_eq!(format_download_size(3_095_033_483), "2.9 GB");
+    }
+
+    fn running_job_with_elapsed(pct: Option<f32>, elapsed_secs: u64) -> Job {
+        Job {
+            video_path: PathBuf::from("test.mkv"),
+            status: JobStatus::Running(job::Stage::Transcribe, "正在识别语音...".to_string(), pct),
+            started_at: Some(
+                std::time::Instant::now() - std::time::Duration::from_secs(elapsed_secs),
+            ),
+        }
+    }
+
+    #[test]
+    fn job_status_line_shows_eta_once_progress_and_elapsed_pass_thresholds() {
+        // 60 秒跑了 25%,线性外推:剩余 75% 还要 60 * 75/25 = 180 秒 = 3 分 0 秒。
+        let job = running_job_with_elapsed(Some(25.0), 60);
+        let (text, _) = job_status_line(&job, false);
+        assert!(text.contains("约剩 3分0秒"), "应该显示外推出的剩余时间: {text}");
+    }
+
+    #[test]
+    fn job_status_line_hides_eta_when_progress_too_low() {
+        // 1% 时线性外推出来的剩余时间波动极大,没有参考价值,不该显示。
+        let job = running_job_with_elapsed(Some(1.0), 60);
+        let (text, _) = job_status_line(&job, false);
+        assert!(!text.contains("约剩"), "百分比太低时不该显示约剩: {text}");
+    }
+
+    #[test]
+    fn job_status_line_hides_eta_when_just_started() {
+        // 刚开始跑(已运行时间很短)时,即使百分比够高,外推同样不可靠。
+        let job = running_job_with_elapsed(Some(50.0), 3);
+        let (text, _) = job_status_line(&job, false);
+        assert!(!text.contains("约剩"), "刚开始跑时不该显示约剩: {text}");
+    }
+
+    #[test]
+    fn job_status_line_hides_eta_when_no_percent_available() {
+        let job = running_job_with_elapsed(None, 60);
+        let (text, _) = job_status_line(&job, false);
+        assert!(!text.contains("约剩"), "没有百分比时无法外推,不该显示约剩: {text}");
     }
 
     /// 用独立的 `Vec<String>` 而不是真的构造一个 `SubgenApp` 来测——`push_log` 就是特意

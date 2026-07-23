@@ -127,7 +127,13 @@ pub fn process_video(
             None,
         );
     } else {
-        progress_cb(Stage::ExtractAudio, "正在提取音轨...".to_string(), None);
+        // 括号里的预期时长是给用户一个"这一步正常应该多快"的参照——没有这个信息,
+        // 30 秒没动静就容易被当成卡死,尤其这是整个流水线的第一步,第一印象很重要。
+        progress_cb(
+            Stage::ExtractAudio,
+            "正在提取音轨(通常不到一分钟)...".to_string(),
+            None,
+        );
         let mut ff_cmd = Command::new(&ffmpeg);
         ff_cmd
             .arg("-y")
@@ -202,8 +208,14 @@ pub fn process_video(
 
     // 注意:这里传 None 而不是 Some(0.0) —— 真正的百分比要等 whisper-cli 输出第一条
     // progress 回调才有,大文件/复杂音频这条第一次更新可能要等一两分钟,期间界面靠
-    // "已运行 XXs" 计时器(而不是卡在 0% 不动)让用户知道它没有卡死。
-    progress_cb(Stage::Transcribe, "正在识别语音...".to_string(), None);
+    // "已运行 XXs" 计时器 + 这句文案里的预期时长说明(而不是卡在 0% 不动)让用户知道
+    // 它没有卡死。等真的有百分比可显示了(下面 handle_line 里),文案会换回不带这句
+    // 说明的版本——进度条已经在动了,不再需要"可能要等一两分钟"这种预期管理。
+    progress_cb(
+        Stage::Transcribe,
+        "正在识别语音(大文件可能一两分钟后才显示进度)...".to_string(),
+        None,
+    );
 
     let mut cmd = Command::new(&whisper_cli);
     cmd.arg("-m").arg(&model_path);

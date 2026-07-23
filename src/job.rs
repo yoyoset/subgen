@@ -262,11 +262,14 @@ pub fn run_batch(
                     if let Some(mut s) = server.take() {
                         s.stop();
                     }
+                    // 括号里的预期时长同 engine.rs 的提取音轨文案——启动翻译引擎要把几 GB
+                    // 的模型文件加载进显存,这一步没有百分比可显示,不给个"大概多久"的
+                    // 参照,长达一分钟的停顿会被当成卡死。
                     let _ = tx.send(WorkerEvent::JobUpdate {
                         index,
                         status: JobStatus::Running(
                             Stage::Translate,
-                            "正在启动本地翻译引擎...".to_string(),
+                            "正在加载翻译模型(文件较大,首次约需一分钟)...".to_string(),
                             None,
                         ),
                     });
