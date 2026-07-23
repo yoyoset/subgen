@@ -280,13 +280,22 @@ pub fn translate_srt(
     let mut translated: Vec<String> = Vec::with_capacity(total);
     let mut failed_indices: Vec<usize> = Vec::new();
     let mut done = 0usize;
+    // 上一批最后几行(原文, 译文)——现在每批是独立翻译的,人称/称呼/术语在批边界处经常
+    // 漂移(比如上一批刚确定用"她",这一批又变回泛指)。把上一批的结尾喂给下一批当参考
+    // 上下文(不要求模型翻译或复述它),是这类问题里最便宜也最有效的缓解办法,不需要改动
+    // 批量大小或对齐解析逻辑。
+    let mut prev_tail: Vec<(String, String)> = Vec::new();
 
     for chunk in blocks.chunks(BATCH_SIZE) {
         if cancel.load(Ordering::Relaxed) {
             return Err("已取消".to_string());
         }
         let texts: Vec<String> = chunk.iter().map(|(_, _, t)| t.clone()).collect();
-        let (results, failed) = translate_batch_with_retry(server, model, &texts, cancel)?;
+        let (results, failed) =
+            translate_batch_with_retry(server, model, &texts, cancel, &prev_tail)?;
+
+        prev_tail = compute_context_tail(&texts, &results, &failed);
+
         // failed 是这一批内部(0-based)的下标,加上 done(这一批开始前已经处理过的行数)
         // 才是相对整份字幕的全局下标。
         failed_indices.extend(failed.iter().map(|&i| done + i));
@@ -304,6 +313,29 @@ pub fn translate_srt(
         .map_err(|e| format!("写入字幕文件失败: {e}"))?;
 
     Ok(TranslateResult::Written { failed_indices })
+}
+
+/// 从这一批的 (原文, 译文) 和失败下标里,取最后(最多)2 行"成功翻译"的 pair,供下一批
+/// 当上下文参考(见 build_prompt 里 context 参数的说明)。跳过失败行——失败行的"译文"
+/// 就是原文的拷贝(见 translate_batch_with_retry 的单行兜底),拿去当"已确定的译文"
+/// 参考只会把这种错误带进下一批。抽成独立函数是因为这段"跳过失败下标"的逻辑本身就是
+/// 容易出 off-by-one 错误的地方,不该依赖真实的 llama-server 网络调用才能测到。
+fn compute_context_tail(
+    texts: &[String],
+    results: &[String],
+    failed_indices: &[usize],
+) -> Vec<(String, String)> {
+    let failed_set: std::collections::HashSet<usize> = failed_indices.iter().copied().collect();
+    let successful_pairs: Vec<(String, String)> = texts
+        .iter()
+        .cloned()
+        .zip(results.iter().cloned())
+        .enumerate()
+        .filter(|(i, _)| !failed_set.contains(i))
+        .map(|(_, pair)| pair)
+        .collect();
+    let tail_start = successful_pairs.len().saturating_sub(2);
+    successful_pairs[tail_start..].to_vec()
 }
 
 /// 把原文块和翻译结果拼成最终要写出的字幕块。抽成独立函数是因为这段逻辑不该依赖真实的
@@ -340,11 +372,15 @@ fn build_output_blocks(
 /// 返回值第二项是失败行在 `texts` 里的下标(0-based),不是单纯的计数——上层
 /// `translate_srt` 需要知道具体是哪几行,才能在双语模式下避免对失败行重复拼接原文,
 /// 也能在界面警告里告诉用户具体第几条需要人工核对。
+/// `context` 是给模型看的"上一批结尾"参考(见 translate_srt),对半重试时原样传给两个
+/// 子调用——重试是格式错位这种偶发情况的兜底路径,没必要为它精细计算"这一半真正紧邻的
+/// 上文",用同一个批级上下文对两半都总比完全没有上下文好。
 fn translate_batch_with_retry(
     server: &LlamaServer,
     model: &'static TransModel,
     texts: &[String],
     cancel: &Arc<AtomicBool>,
+    context: &[(String, String)],
 ) -> Result<(Vec<String>, Vec<usize>), String> {
     if texts.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -352,14 +388,15 @@ fn translate_batch_with_retry(
     if cancel.load(Ordering::Relaxed) {
         return Err("已取消".to_string());
     }
-    match translate_batch_once(server, model, texts) {
+    match translate_batch_once(server, model, texts, context) {
         Ok(results) if results.len() == texts.len() => Ok((results, Vec::new())),
         _ if texts.len() == 1 => Ok((vec![texts[0].clone()], vec![0])),
         _ => {
             let mid = texts.len() / 2;
             let (mut out, mut failed) =
-                translate_batch_with_retry(server, model, &texts[..mid], cancel)?;
-            let (b, fb) = translate_batch_with_retry(server, model, &texts[mid..], cancel)?;
+                translate_batch_with_retry(server, model, &texts[..mid], cancel, context)?;
+            let (b, fb) =
+                translate_batch_with_retry(server, model, &texts[mid..], cancel, context)?;
             out.extend(b);
             // fb 是后半段(texts[mid..])内部的下标,加上 mid 才是相对整个 texts 的下标。
             failed.extend(fb.iter().map(|&i| i + mid));
@@ -390,6 +427,7 @@ fn translate_batch_once(
     server: &LlamaServer,
     model: &'static TransModel,
     texts: &[String],
+    context: &[(String, String)],
 ) -> Result<Vec<String>, String> {
     let numbered: String = texts
         .iter()
@@ -398,7 +436,7 @@ fn translate_batch_once(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (system, user) = build_prompt(model, &numbered);
+    let (system, user) = build_prompt(model, &numbered, context);
     let body = ChatRequest {
         model: model.key,
         messages: vec![
@@ -444,7 +482,29 @@ fn translate_batch_once(
 ///   是吞吐量(不然一集字幕要发几百次请求)和对齐可靠性之间的权衡,v1 先这样,
 ///   如果实测发现 Sakura 在编号格式下翻译质量明显下降,再改成小批量(如 3~5 行一批)。
 /// - General(Qwen)本来就是通用指令模型,直接要求保留编号格式即可。
-fn build_prompt(model: &TransModel, numbered: &str) -> (String, String) {
+///
+/// `context` 是上一批最后几行的(原文, 译文),不空时拼进 user 消息最前面,给模型一个
+/// "紧接在前的上文"参考——现在每批是独立翻译的,人称代词、称呼、专有名词在批边界处
+/// 经常漂移(比如上一批刚确定某角色用"她",下一批又变回中性称呼),喂一点上文能让模型
+/// 在批与批之间保持一致,不需要为此改动批量大小或编号对齐解析逻辑(上下文只是参考信息,
+/// 不算进正文编号,parse_numbered_response 完全不受影响)。明确要求模型不要把这段上下文
+/// 也翻译/复述出来,避免它把参考内容当成本批正文的一部分。
+fn build_prompt(model: &TransModel, numbered: &str, context: &[(String, String)]) -> (String, String) {
+    let context_block = if context.is_empty() {
+        String::new()
+    } else {
+        let lines: String = context
+            .iter()
+            .map(|(orig, zh)| format!("{orig} → {zh}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "(以下是紧接在前的上文原文及其译文,仅供参考、用来保持人称和称呼前后一致,\
+             不要翻译它、也不要在你的回复里重复输出它:\n{lines}\n参考上文到此结束,\
+             正式要翻译的正文从下一行开始:)\n"
+        )
+    };
+
     match model.prompt_kind {
         PromptKind::Sakura => (
             "你是一个轻小说翻译模型，可以流畅通顺地以日本轻小说的风格将日文翻译成简体中文，\
@@ -452,14 +512,14 @@ fn build_prompt(model: &TransModel, numbered: &str) -> (String, String) {
              输入是带编号的多行日文字幕，请严格逐行翻译，保留原有的“编号.”格式，每行只输出一条\
              译文，不要合并、拆分、增删行，不要输出编号之外的任何解释。"
                 .to_string(),
-            format!("将下面的日文字幕文本翻译成中文：\n{numbered}"),
+            format!("{context_block}将下面的日文字幕文本翻译成中文：\n{numbered}"),
         ),
         PromptKind::General => (
             "你是专业的字幕翻译员。将用户给出的带编号字幕文本翻译成简体中文。要求:逐行对应翻译,\
              严格保留原有的“编号.”格式,每行只输出一条译文,不要合并或拆分行,不要添加编号之外的\
              任何解释、注释或原文。"
                 .to_string(),
-            numbered.to_string(),
+            format!("{context_block}{numbered}"),
         ),
     }
 }
@@ -536,6 +596,78 @@ fn parse_gpu_offload(line: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_context_tail_takes_last_two_successful_pairs() {
+        let texts = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let results = vec!["甲".to_string(), "乙".to_string(), "丙".to_string()];
+        let tail = compute_context_tail(&texts, &results, &[]);
+        assert_eq!(
+            tail,
+            vec![("B".to_string(), "乙".to_string()), ("C".to_string(), "丙".to_string())]
+        );
+    }
+
+    #[test]
+    fn compute_context_tail_skips_failed_lines() {
+        // 第 2 行(下标 1)失败,results[1] 是原文的拷贝——不该被当成"已确定的译文"带进
+        // 下一批上下文,真正该取的是跳过它之后剩下的最后两行成功翻译。
+        let texts = vec!["A".to_string(), "B".to_string(), "C".to_string(), "D".to_string()];
+        let results = vec![
+            "甲".to_string(),
+            "B".to_string(), // 失败,原样保留原文
+            "丙".to_string(),
+            "丁".to_string(),
+        ];
+        let tail = compute_context_tail(&texts, &results, &[1]);
+        assert_eq!(
+            tail,
+            vec![("C".to_string(), "丙".to_string()), ("D".to_string(), "丁".to_string())],
+            "应该跳过失败的第 2 行,只取成功翻译里最后两行: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn compute_context_tail_returns_fewer_than_two_when_not_enough_successful_lines() {
+        let texts = vec!["A".to_string()];
+        let results = vec!["甲".to_string()];
+        let tail = compute_context_tail(&texts, &results, &[]);
+        assert_eq!(tail, vec![("A".to_string(), "甲".to_string())]);
+
+        let texts_all_failed = vec!["A".to_string(), "B".to_string()];
+        let results_all_failed = vec!["A".to_string(), "B".to_string()];
+        let tail_empty = compute_context_tail(&texts_all_failed, &results_all_failed, &[0, 1]);
+        assert!(tail_empty.is_empty(), "全部失败时不该有任何上下文可用: {tail_empty:?}");
+    }
+
+    #[test]
+    fn build_prompt_without_context_has_no_reference_block() {
+        let (_, user) = build_prompt(&QWEN3_4B, "1. Hello", &[]);
+        assert_eq!(user, "1. Hello", "没有上下文时正文不该被额外包装");
+        assert!(!user.contains("紧接在前的上文"));
+    }
+
+    #[test]
+    fn build_prompt_with_context_prepends_reference_block_before_body() {
+        let context = vec![("Hello there.".to_string(), "你好。".to_string())];
+        let (_, user) = build_prompt(&QWEN3_4B, "1. World", &context);
+        assert!(user.contains("紧接在前的上文"), "应该包含上下文说明: {user}");
+        assert!(user.contains("Hello there. → 你好。"), "应该包含具体的上文内容: {user}");
+        let context_pos = user.find("Hello there.").unwrap();
+        let body_pos = user.find("1. World").unwrap();
+        assert!(context_pos < body_pos, "上下文应该在正文之前: {user}");
+    }
+
+    #[test]
+    fn build_prompt_sakura_also_gets_context_block() {
+        // Sakura 和 General 是两套不同的提示词模板,上下文注入要对两边都生效,不能只改
+        // 其中一个分支就当作做完了。
+        let context = vec![("こんにちは".to_string(), "你好".to_string())];
+        let (system, user) = build_prompt(&SAKURA_7B, "1. さようなら", &context);
+        assert!(user.contains("こんにちは → 你好"));
+        assert!(user.contains("将下面的日文字幕文本翻译成中文"));
+        assert!(system.contains("轻小说"));
+    }
 
     /// 格式字符串来自 llama.cpp b10079 源码实测确认(见 parse_gpu_offload 文档注释),
     /// 这里验证解析逻辑本身,不依赖真实的 llama-server 进程。
