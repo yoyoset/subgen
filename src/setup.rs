@@ -29,6 +29,12 @@ pub enum SetupEvent {
     AllReady,
 }
 
+// GitHub Release 资产的反向代理前缀,面向 GitHub 直连不稳定的网络环境(比如国内)。实测
+// 验证过(2026-07-23):对 GyanD/codexffmpeg 的 ffmpeg 资产发 Range 请求,能正确返回
+// 206 Partial Content 和准确的 Content-Range,和官方源行为一致,支持断点续传。这类反代
+// 服务本身不算长期稳定,失效时把这一个常量换掉就行,不用改调用逻辑。
+const GITHUB_PROXY_PREFIX: &str = "https://gh-proxy.com/";
+
 const ENGINE_URL: &str =
     "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-cublas-12.4.0-bin-x64.zip";
 const ENGINE_SHA256: &str = "106a2030eff8998e4ef320fe72e263a78449e9040386ee27c41ea80b001b601b";
@@ -651,12 +657,32 @@ fn hash_existing(path: &Path) -> (Sha256, u64) {
     (hasher, total)
 }
 
-/// 流式下载到临时文件,边下载边计算 sha256,定期上报进度,支持取消、断点续传、网络抖动重试。
+/// 返回按优先级排列的候选下载地址:官方地址永远排第一(镜像稳定性不如官方,能直连就
+/// 不该绕路),官方多次失败后才尝试镜像。只覆盖 huggingface.co 和 github.com 这两个在部分
+/// 网络环境(比如国内)下经常连不上的域名:
+/// - HuggingFace:换成 hf-mirror.com,只替换域名、路径不变——这是国内 ML 社区公认的标准
+///   HuggingFace 镜像方案。
+/// - GitHub:整个 URL 前面加 GITHUB_PROXY_PREFIX 反代前缀。
+/// 其他域名(目前只有 ffmpeg 用的 GitHub,已经在上面覆盖)原样返回,不额外处理。
+fn url_candidates(url: &str) -> Vec<String> {
+    let mut out = vec![url.to_string()];
+    if let Some(rest) = url.strip_prefix("https://huggingface.co") {
+        out.push(format!("https://hf-mirror.com{rest}"));
+    } else if url.starts_with("https://github.com") {
+        out.push(format!("{GITHUB_PROXY_PREFIX}{url}"));
+    }
+    out
+}
+
+/// 流式下载到临时文件,边下载边计算 sha256,定期上报进度,支持取消、断点续传、网络抖动
+/// 重试、镜像回退。
 ///
 /// 大文件(几个 GB)在家用网络上中途断开是首次安装失败率最大的来源;之前每次失败都从零
 /// 重新下载,一个 4GB 文件网络稍微抖一下就前功尽弃。现在 `.part` 临时文件在下载中断(不是
-/// 用户主动取消)后不会被删除,下次调用会先读取已有内容补算哈希,再用 HTTP Range 请求从
-/// 断点续传;单次尝试内读流中途出错也不立即失败,原地重试几次而不是让整个下载失败。
+/// 用户主动取消)后不会被删除,下次尝试会先读取已有内容补算哈希,再用 HTTP Range 请求从
+/// 断点续传——即使切换到镜像地址也一样能续传(镜像和官方源理论上是同一份文件的字节级
+/// 拷贝,最终都要通过哈希校验,续传安全)。每个候选地址内读流中途出错会原地重试几次;
+/// 官方地址试完还失败,才切换到镜像地址重新走一遍同样的重试流程。
 fn download_to_file(
     label: &str,
     url: &str,
@@ -664,28 +690,40 @@ fn download_to_file(
     tx: &Sender<SetupEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<[u8; 32], String> {
-    const MAX_ATTEMPTS: u32 = 3; // 1 次首发 + 2 次重试
+    const ATTEMPTS_PER_URL: u32 = 2;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(1800))
         .build()
         .map_err(|e| format!("创建下载客户端失败: {e}"))?;
 
+    let candidates = url_candidates(url);
+    let total_attempts = candidates.len() as u32 * ATTEMPTS_PER_URL;
+    let mut attempt_no = 0u32;
     let mut last_err = String::new();
-    for attempt in 1..=MAX_ATTEMPTS {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("用户取消下载".to_string());
+
+    for (url_index, candidate_url) in candidates.iter().enumerate() {
+        if url_index > 0 {
+            let _ = tx.send(SetupEvent::Log(format!(
+                "{label} 官方源连接失败,已切换镜像源重试…"
+            )));
         }
-        match try_download_once(label, url, tmp_path, &client, tx, cancel) {
-            Ok(digest) => return Ok(digest),
-            Err(e) if e == "用户取消下载" => return Err(e),
-            Err(e) => {
-                last_err = e;
-                if attempt < MAX_ATTEMPTS {
-                    let _ = tx.send(SetupEvent::Log(format!(
-                        "{label} 下载中断,2 秒后重试(第 {attempt}/{MAX_ATTEMPTS} 次尝试): {last_err}"
-                    )));
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+        for _ in 0..ATTEMPTS_PER_URL {
+            attempt_no += 1;
+            if cancel.load(Ordering::Relaxed) {
+                return Err("用户取消下载".to_string());
+            }
+            match try_download_once(label, candidate_url, tmp_path, &client, tx, cancel) {
+                Ok(digest) => return Ok(digest),
+                Err(e) if e == "用户取消下载" => return Err(e),
+                Err(e) => {
+                    last_err = e;
+                    if attempt_no < total_attempts {
+                        let _ = tx.send(SetupEvent::Log(format!(
+                            "{label} 下载中断,2 秒后重试(第 {attempt_no}/{total_attempts} 次尝试): {last_err}"
+                        )));
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
                 }
             }
         }
@@ -990,6 +1028,35 @@ mod tests {
         let missing = temp_subdir("hash_existing_missing").join("does_not_exist.bin");
         let (_, len) = hash_existing(&missing);
         assert_eq!(len, 0, "文件不存在应该当作没有可续传的内容,退化成从头下载");
+    }
+
+    #[test]
+    fn url_candidates_adds_hf_mirror_for_huggingface_urls() {
+        let candidates =
+            url_candidates("https://huggingface.co/foo/bar/resolve/main/file.bin");
+        assert_eq!(
+            candidates,
+            vec![
+                "https://huggingface.co/foo/bar/resolve/main/file.bin".to_string(),
+                "https://hf-mirror.com/foo/bar/resolve/main/file.bin".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn url_candidates_adds_github_proxy_prefix_for_github_urls() {
+        let original = "https://github.com/foo/bar/releases/download/v1/file.zip";
+        let candidates = url_candidates(original);
+        assert_eq!(
+            candidates,
+            vec![original.to_string(), format!("{GITHUB_PROXY_PREFIX}{original}")]
+        );
+    }
+
+    #[test]
+    fn url_candidates_leaves_other_domains_unchanged() {
+        let candidates = url_candidates("https://www.gyan.dev/something.zip");
+        assert_eq!(candidates, vec!["https://www.gyan.dev/something.zip".to_string()]);
     }
 
     /// 真实网络端到端验证断点续传:下载 VAD 模型(885KB,是这批组件里最小的,适合当实验
