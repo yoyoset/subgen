@@ -50,17 +50,20 @@ pub struct EngineOutcome {
     /// None 表示这次没有真实观测(复用了之前识别好的结果,见"断点续跑"),不代表"没用上
     /// GPU"——调用方只应该在 `Some(false)` 时提示 GPU 警告。
     pub used_gpu: Option<bool>,
-    /// 是否检测到并自动折叠了"复读机"故障(见 collapse_repetitions)。
-    pub repetition_collapsed: bool,
+    /// 检测到并自动折叠了"复读机"故障时,首个被折叠片段的起始时间戳(见 collapse_repetitions);
+    /// 没检测到是 None。界面据此能告诉用户具体去哪个时间点抽查,而不是笼统一句"建议核对"。
+    pub repetition_at: Option<String>,
     /// whisper 自动检测到的源语言(language="auto" 时来自日志解析;显式指定语言时就是那个值)。
     /// 用于翻译阶段挑选对应的翻译模型(如日语走 Sakura)。
     pub detected_language: Option<String>,
-    /// 音轨是否复用了 `tmp/` 里已有的产物,而不是这次真实提取出来的。
-    pub reused_wav: bool,
     /// 字幕是否复用了 `tmp/` 里已有的产物,而不是这次真实识别出来的——复用时完全没有
     /// 真实跑 whisper-cli,调用方(界面)应该让用户知道这次"完成"其实是"沿用了上次的结果",
     /// 而不是让用户误以为换了模型/语言重新识别过。
     pub reused_srt: bool,
+    /// 字幕块数量(`parse_srt_blocks` 的结果长度,复用分支也会重新数一遍)。0 表示这段
+    /// 视频没有识别出任何对白——界面据此把"空字幕"和"识别失败"区分开,不让用户误以为
+    /// 软件坏了。
+    pub subtitle_count: usize,
 }
 
 /// 处理单个视频文件,progress_cb 用于把当前所在阶段/状态文案/百分比回传给调用方(界面线程)。
@@ -166,20 +169,20 @@ pub fn process_video(
         } else {
             recover_detected_language_from_log(&log_file)
         };
-        let repetition_collapsed = collapse_repetitions(&generated_srt).unwrap_or_else(|e| {
+        let repetition_at = collapse_repetitions(&generated_srt).unwrap_or_else(|e| {
             let _ = std::fs::write(
                 paths::logs_dir().join(format!("{unique}_collapse_error.log")),
                 e,
             );
-            false
+            None
         });
         return Ok(EngineOutcome {
-            srt_path: generated_srt,
+            srt_path: generated_srt.clone(),
             used_gpu: None, // 这次没有真实跑 whisper-cli,不知道用没用上 GPU,不该瞎猜
-            repetition_collapsed,
+            repetition_at,
             detected_language,
-            reused_wav: wav_reused,
             reused_srt: true,
+            subtitle_count: count_subtitle_blocks(&generated_srt),
         });
     }
 
@@ -327,13 +330,13 @@ pub fn process_video(
         ));
     }
 
-    let repetition_collapsed = collapse_repetitions(&generated_srt).unwrap_or_else(|e| {
+    let repetition_at = collapse_repetitions(&generated_srt).unwrap_or_else(|e| {
         // 折叠失败不应该让整个任务失败——顶多是没清理掉复读,原样交付
         let _ = std::fs::write(
             paths::logs_dir().join(format!("{unique}_collapse_error.log")),
             e,
         );
-        false
+        None
     });
 
     // language != "auto" 时用户已经明确指定了源语言,不依赖日志解析(whisper 在这种情况下
@@ -344,14 +347,23 @@ pub fn process_video(
         detected_language
     };
 
+    let subtitle_count = count_subtitle_blocks(&generated_srt);
+
     Ok(EngineOutcome {
         srt_path: generated_srt,
         used_gpu: Some(used_gpu),
-        repetition_collapsed,
+        repetition_at,
         detected_language,
-        reused_wav: wav_reused,
         reused_srt: false,
+        subtitle_count,
     })
+}
+
+/// 数一份 srt 里有多少条字幕块,读不到就当 0(不该因为这个附加信息让整个任务失败)。
+fn count_subtitle_blocks(srt_path: &Path) -> usize {
+    std::fs::read_to_string(srt_path)
+        .map(|content| parse_srt_blocks(&content).len())
+        .unwrap_or(0)
 }
 
 /// 判断复用的 srt 是不是"看起来完整"的产物,而不是上次处理中断留下的半成品:内容为空
@@ -392,8 +404,9 @@ fn parse_detected_language(line: &str) -> Option<String> {
 /// whisper.cpp 已知的"复读机"故障模式:长文件连续解码偶发进入死循环,同一句话原样
 /// 重复几十上百次(实测过,真实出现:同一句 983 次)。这里检测连续 >= 4 次完全相同的
 /// 字幕文本,视为异常并折叠成一条(时间跨度取首尾),避免把成百上千行垃圾原样交付给用户。
-/// 返回 true 表示确实检测到并处理过至少一处。
-fn collapse_repetitions(srt_path: &Path) -> Result<bool, String> {
+/// 返回首个被折叠片段的起始时间戳(如 "00:08:06,000")——不只是"有没有",界面据此能告诉
+/// 用户具体去哪个时间点抽查,而不是让用户对着几十分钟的视频从头听起。没检测到返回 None。
+fn collapse_repetitions(srt_path: &Path) -> Result<Option<String>, String> {
     const REPEAT_THRESHOLD: usize = 4;
 
     let content =
@@ -401,7 +414,7 @@ fn collapse_repetitions(srt_path: &Path) -> Result<bool, String> {
     let blocks = parse_srt_blocks(&content);
 
     let mut collapsed = Vec::with_capacity(blocks.len());
-    let mut found = false;
+    let mut first_repetition_at: Option<String> = None;
     let mut i = 0;
     while i < blocks.len() {
         let text = blocks[i].2.trim();
@@ -411,7 +424,9 @@ fn collapse_repetitions(srt_path: &Path) -> Result<bool, String> {
         }
         let run_len = j - i;
         if run_len >= REPEAT_THRESHOLD {
-            found = true;
+            if first_repetition_at.is_none() {
+                first_repetition_at = Some(blocks[i].0.clone());
+            }
             let start = blocks[i].0.clone();
             let end = blocks[j - 1].1.clone();
             collapsed.push((start, end, blocks[i].2.clone()));
@@ -421,11 +436,11 @@ fn collapse_repetitions(srt_path: &Path) -> Result<bool, String> {
         i = j;
     }
 
-    if found {
+    if first_repetition_at.is_some() {
         std::fs::write(srt_path, write_srt_blocks(&collapsed))
             .map_err(|e| format!("写回字幕文件失败: {e}"))?;
     }
-    Ok(found)
+    Ok(first_repetition_at)
 }
 
 /// 极简 SRT 解析:按空行分块,每块取"起止时间戳"+"文本行拼接"。
@@ -603,8 +618,12 @@ mod tests {
             .count();
         assert_eq!(repeated_count, 983, "构造的测试数据应该有 983 条重复");
 
-        let found = collapse_repetitions(&tmp).expect("折叠失败");
-        assert!(found, "应该检测到复读并折叠");
+        let repetition_at = collapse_repetitions(&tmp).expect("折叠失败");
+        assert_eq!(
+            repetition_at.as_deref(),
+            Some("00:00:02,000"),
+            "应该检测到复读并返回首个折叠片段的起始时间戳"
+        );
 
         let after = parse_srt_blocks(&std::fs::read_to_string(&tmp).unwrap());
         let after_repeated_count = after
@@ -787,8 +806,29 @@ mod tests {
                    3\n00:00:03,000 --> 00:00:04,000\nGoodbye now.\n\n";
         let tmp = std::env::temp_dir().join("subgen_test_normal.srt");
         std::fs::write(&tmp, srt).unwrap();
-        let found = collapse_repetitions(&tmp).unwrap();
-        assert!(!found, "正常内容不应该被判定为复读故障");
+        let repetition_at = collapse_repetitions(&tmp).unwrap();
+        assert_eq!(repetition_at, None, "正常内容不应该被判定为复读故障");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn count_subtitle_blocks_counts_parseable_blocks_and_defaults_to_zero_when_missing() {
+        let dir = std::env::temp_dir().join("subgen_test_count_blocks");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let srt = dir.join("three.srt");
+        std::fs::write(
+            &srt,
+            "1\n00:00:01,000 --> 00:00:02,000\nHello.\n\n\
+             2\n00:00:02,000 --> 00:00:03,000\nWorld.\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nBye.\n\n",
+        )
+        .unwrap();
+        assert_eq!(count_subtitle_blocks(&srt), 3);
+
+        let missing = dir.join("does_not_exist.srt");
+        assert_eq!(count_subtitle_blocks(&missing), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

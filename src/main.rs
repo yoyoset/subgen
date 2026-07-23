@@ -430,7 +430,7 @@ impl SubgenApp {
             .jobs
             .iter()
             .enumerate()
-            .filter(|(_, j)| !matches!(j.status, JobStatus::Done | JobStatus::DoneWithWarning(_)))
+            .filter(|(_, j)| !matches!(j.status, JobStatus::Done(_) | JobStatus::DoneWithWarning(..)))
             .map(|(i, _)| i)
             .collect();
         if indices.is_empty() {
@@ -1008,7 +1008,7 @@ fn render_stage_stepper(ui: &mut egui::Ui, status: &JobStatus, translate_enabled
     let (current_ord, is_failed, is_all_done) = match status {
         JobStatus::Running(stage, _, _) => (Some(stage.ordinal()), false, false),
         JobStatus::Failed(stage, _) => (Some(stage.ordinal()), true, false),
-        JobStatus::Done | JobStatus::DoneWithWarning(_) => (None, false, true),
+        JobStatus::Done(_) | JobStatus::DoneWithWarning(..) => (None, false, true),
         _ => return,
     };
 
@@ -1038,6 +1038,47 @@ fn render_stage_stepper(ui: &mut egui::Ui, status: &JobStatus, translate_enabled
     });
 }
 
+/// 把 ISO 639-1 语言代码翻成用户能看懂的中文名,覆盖界面语言下拉框里的选项(见
+/// Config::AVAILABLE_MODELS 旁边那个语言下拉的选项列表:auto/en/zh/ja/ko/fr/de/es)。
+/// 没覆盖到的代码原样返回而不是显示"未知"——保留原始信息总比丢掉信息更安全,万一以后
+/// whisper 检测出一个列表之外的语言代码,用户至少还能看到那串代码去查。
+fn lang_display(code: &str) -> &str {
+    match code {
+        "auto" => "自动检测",
+        "en" => "英语",
+        "zh" => "中文",
+        "ja" => "日语",
+        "ko" => "韩语",
+        "fr" => "法语",
+        "de" => "德语",
+        "es" => "西班牙语",
+        other => other,
+    }
+}
+
+/// 把一次成功处理的 JobReport 拼成"完成"后面跟着的补充信息,比如
+/// " · 日语 · Sakura 7B(日→中,轻小说风格)(复用了上次的识别结果)"。让用户在结果不理想时
+/// 至少知道用的是哪个语言、哪个翻译模型、这次是不是复用了旧结果——不用被动接受一个孤零零
+/// 的"完成"、猜不出问题出在哪个环节。
+fn format_job_report_suffix(report: &job::JobReport) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(lang) = &report.detected_language {
+        parts.push(lang_display(lang));
+    }
+    if let Some(model) = report.translate_model_label {
+        parts.push(model);
+    }
+    let mut suffix = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    };
+    if report.reused_transcript {
+        suffix.push_str("(复用了上次的识别结果)");
+    }
+    suffix
+}
+
 /// 生成任务行第二行的详细状态文案 + 配色。`cancelling` 为 true 时(用户点了取消、批次还没
 /// 真正停下来),正在跑的那一条任务额外附一句"正在取消,等当前步骤结束"——不然用户点完
 /// 取消后看到这一行还在正常显示进度百分比,会以为取消没生效。
@@ -1056,9 +1097,23 @@ fn job_status_line(job: &Job, cancelling: bool) -> (String, egui::Color32) {
             }
             (text, egui::Color32::LIGHT_GRAY)
         }
-        JobStatus::Done => ("完成".to_string(), egui::Color32::from_rgb(60, 170, 60)),
-        JobStatus::DoneWithWarning(reason) => (
-            format!("完成,但有提示: {reason}"),
+        JobStatus::Done(report) => {
+            if report.empty_subtitle() {
+                // 空字幕是合理结果(片段确实没有对白),不是软件坏了——但如果只显示"完成"
+                // 两个字,用户在播放器里加载不出字幕文件时,唯一的结论会是"这个软件坏了"。
+                (
+                    "完成(未检测到对白,字幕为空)".to_string(),
+                    egui::Color32::from_rgb(60, 170, 60),
+                )
+            } else {
+                (
+                    format!("完成{}", format_job_report_suffix(report)),
+                    egui::Color32::from_rgb(60, 170, 60),
+                )
+            }
+        }
+        JobStatus::DoneWithWarning(reason, report) => (
+            format!("完成,但有提示: {reason}{}", format_job_report_suffix(report)),
             egui::Color32::from_rgb(230, 150, 20),
         ),
         JobStatus::Skipped(reason) => (format!("跳过: {reason}"), egui::Color32::GRAY),
@@ -1073,6 +1128,52 @@ fn job_status_line(job: &Job, cancelling: bool) -> (String, egui::Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lang_display_translates_known_codes_and_passes_through_unknown() {
+        assert_eq!(lang_display("ja"), "日语");
+        assert_eq!(lang_display("auto"), "自动检测");
+        assert_eq!(lang_display("xx"), "xx", "没覆盖到的代码应该原样返回,而不是丢掉信息");
+    }
+
+    #[test]
+    fn format_job_report_suffix_combines_language_model_and_reuse_note() {
+        let report = job::JobReport {
+            detected_language: Some("ja".to_string()),
+            translate_model_label: Some("Sakura 7B(日→中,轻小说风格)"),
+            subtitle_count: 42,
+            reused_transcript: true,
+            repetition_at: None,
+        };
+        assert_eq!(
+            format_job_report_suffix(&report),
+            " · 日语 · Sakura 7B(日→中,轻小说风格)(复用了上次的识别结果)"
+        );
+    }
+
+    #[test]
+    fn format_job_report_suffix_empty_when_nothing_to_show() {
+        let report = job::JobReport {
+            detected_language: None,
+            translate_model_label: None,
+            subtitle_count: 10,
+            reused_transcript: false,
+            repetition_at: None,
+        };
+        assert_eq!(format_job_report_suffix(&report), "");
+    }
+
+    #[test]
+    fn format_job_report_suffix_shows_language_only_when_translate_not_used() {
+        let report = job::JobReport {
+            detected_language: Some("en".to_string()),
+            translate_model_label: None,
+            subtitle_count: 10,
+            reused_transcript: false,
+            repetition_at: None,
+        };
+        assert_eq!(format_job_report_suffix(&report), " · 英语");
+    }
 
     #[test]
     fn panic_logger_writes_message_and_location_to_crash_log() {

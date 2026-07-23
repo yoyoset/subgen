@@ -37,13 +37,39 @@ impl Stage {
 pub enum JobStatus {
     Pending,
     Running(Stage, String, Option<f32>),
-    Done,
-    /// 处理成功,但有值得用户注意的情况(目前用于:检测到并自动折叠了"复读机"故障)
-    DoneWithWarning(String),
+    Done(JobReport),
+    /// 处理成功,但有值得用户注意的情况(比如检测到并自动折叠了"复读机"故障、翻译部分行
+    /// 失败、语言检测不确定)
+    DoneWithWarning(String, JobReport),
     Skipped(String),
     /// 带上具体是哪个阶段失败的,界面步骤条上能直接标红对应的那一步,不用去猜。
     Failed(Stage, String),
     Cancelled,
+}
+
+/// 一次处理成功结束后,值得回显给用户看的信息——之前 `JobStatus::Done` 是个无字段变体,
+/// 这些数据在到达终点前就被扔掉了,用户只能看到一个"完成",没有任何自查线索(用了哪个
+/// 语言/哪个翻译模型?这次是不是复用了旧结果?字幕是不是空的?)。这个结构体不是给程序
+/// 内部用的中间状态,是专门为了"诚实展示"而存在的。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct JobReport {
+    /// whisper 检测/用户指定的源语言(ISO 639-1),None 表示没能确定。
+    pub detected_language: Option<String>,
+    /// 实际用来翻译的模型 label(如 "Sakura 7B(日→中,轻小说风格)");没开翻译或翻译没有
+    /// 真正产出结果时是 None。
+    pub translate_model_label: Option<&'static str>,
+    /// 最终字幕的条数,0 表示没有识别出任何对白。
+    pub subtitle_count: usize,
+    /// 这次识别是否复用了 `tmp/` 里已有的产物,没有真的重新跑 whisper-cli。
+    pub reused_transcript: bool,
+    /// 检测到"复读机"故障并自动折叠时,首个折叠片段的起始时间戳;没检测到是 None。
+    pub repetition_at: Option<String>,
+}
+
+impl JobReport {
+    pub fn empty_subtitle(&self) -> bool {
+        self.subtitle_count == 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,12 +207,25 @@ pub fn run_batch(
                     None => msg,
                 });
             };
-            if result.repetition_collapsed {
+            if let Some(ts) = &result.repetition_at {
                 append_warning(
                     &mut warning,
-                    "检测到疑似复读故障已自动折叠,建议抽查该片段".to_string(),
+                    format!("在 {ts} 附近检测到异常重复内容,已自动修正,建议播放核对该处"),
                 );
             }
+
+            // 终态回显信息:结束时不管走哪条路径(正常完成、翻译引擎启动失败等),都要带上
+            // 这份 report,不然用户只看到"完成"两个字,没有任何自查线索(用了哪个语言/哪个
+            // 翻译模型、这次是不是复用了旧结果)。捕获 &result 而不是拿走所有权,因为下面
+            // 还要继续读 result 的其它字段。
+            let build_report = |translate_model_label: Option<&'static str>| JobReport {
+                detected_language: result.detected_language.clone(),
+                translate_model_label,
+                subtitle_count: result.subtitle_count,
+                reused_transcript: result.reused_srt,
+                repetition_at: result.repetition_at.clone(),
+            };
+            let mut translate_model_label: Option<&'static str> = None;
 
             if translate {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -195,6 +234,17 @@ pub fn run_batch(
                         status: JobStatus::Cancelled,
                     });
                     continue;
+                }
+
+                // 语言检测不确定(比如断点续跑复用了旧结果、但找不到对应的旧日志来恢复语言)
+                // 会导致下面 pick_model 落到通用兜底模型,而不是真正匹配源语言的专用模型
+                // (比如日语本该走 Sakura)。这个事实要让用户知道,不然翻译质量下降却完全
+                // 找不到原因。
+                if result.detected_language.is_none() {
+                    append_warning(
+                        &mut warning,
+                        "未能确定源语言,已使用通用翻译模型;如果源语言是日语,建议手动指定语言后重新处理".to_string(),
+                    );
                 }
 
                 let source_lang = result.detected_language.as_deref().unwrap_or("auto");
@@ -232,7 +282,10 @@ pub fn run_batch(
                             );
                             let _ = tx.send(WorkerEvent::JobUpdate {
                                 index,
-                                status: JobStatus::DoneWithWarning(warning.unwrap()),
+                                status: JobStatus::DoneWithWarning(
+                                    warning.unwrap(),
+                                    build_report(None),
+                                ),
                             });
                             continue;
                         }
@@ -258,6 +311,10 @@ pub fn run_batch(
 
                 match translate_outcome {
                     Ok(crate::translate::TranslateResult::Written { failed_indices }) => {
+                        // 只在翻译真的产出了结果时才回显用了哪个模型——启动失败/跳过/出错
+                        // 这几条路径都提前 continue 或没有真正跑起来,不该让用户以为翻译
+                        // 用的是这个模型。
+                        translate_model_label = Some(model_def.label);
                         if !failed_indices.is_empty() {
                             append_warning(&mut warning, format_failed_lines_warning(&failed_indices));
                         }
@@ -278,9 +335,10 @@ pub fn run_batch(
                 }
             }
 
+            let report = build_report(translate_model_label);
             let status = match warning {
-                Some(w) => JobStatus::DoneWithWarning(w),
-                None => JobStatus::Done,
+                Some(w) => JobStatus::DoneWithWarning(w, report),
+                None => JobStatus::Done(report),
             };
             let _ = tx.send(WorkerEvent::JobUpdate { index, status });
         }
