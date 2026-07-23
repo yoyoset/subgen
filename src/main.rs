@@ -471,12 +471,14 @@ impl SubgenApp {
             return;
         }
         // 只重新处理还没成功完成的任务——重新点"开始处理"不应该把已经出字幕的文件再跑一遍
-        // (之前的实现会把所有任务的状态重置成 Pending 再全部重跑)。
+        // (之前的实现会把所有任务的状态重置成 Pending 再全部重跑)。除非用户在任务行点了
+        // "重新处理"(force_reprocess)——那种情况即使是 Done/DoneWithWarning 终态也要
+        // 纳入这一批,并且真正重新跑一遍,不是复用旧结果。
         let indices: Vec<usize> = self
             .jobs
             .iter()
             .enumerate()
-            .filter(|(_, j)| !matches!(j.status, JobStatus::Done(_) | JobStatus::DoneWithWarning(..)))
+            .filter(|(_, j)| should_include_in_batch(j))
             .map(|(i, _)| i)
             .collect();
         if indices.is_empty() {
@@ -494,13 +496,15 @@ impl SubgenApp {
         let (tx, rx) = mpsc::channel();
         self.worker_rx = Some(rx);
 
-        let batch: Vec<(usize, PathBuf)> = indices
+        let batch: Vec<(usize, PathBuf, bool)> = indices
             .iter()
-            .map(|&i| (i, self.jobs[i].video_path.clone()))
+            .map(|&i| (i, self.jobs[i].video_path.clone(), self.jobs[i].force_reprocess))
             .collect();
         for &i in &indices {
             self.jobs[i].status = JobStatus::Pending;
             self.jobs[i].started_at = None;
+            // 入批后复位——这不是"以后每次都强制重跑"的持久开关,只对这一次生效。
+            self.jobs[i].force_reprocess = false;
         }
 
         job::run_batch(
@@ -1129,6 +1133,14 @@ impl SubgenApp {
             ui.add_space(6.0);
         });
 
+        // 单文件操作(移除/重新处理/打开文件夹/展开预览)在渲染循环里只读取 self.jobs,
+        // 真正的修改(可能触发 Vec::remove 导致下标错位)收集到这几个变量里,渲染循环结束
+        // 后统一应用——不在遍历 self.jobs 的同时又去修改它。
+        let mut remove_index: Option<usize> = None;
+        let mut reprocess_index: Option<usize> = None;
+        let mut open_folder_path: Option<PathBuf> = None;
+        let mut toggle_preview_index: Option<usize> = None;
+
         egui::CentralPanel::default().show(ui, |ui| {
             if self.jobs.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -1138,7 +1150,7 @@ impl SubgenApp {
             }
             let translate_enabled = self.config.translate;
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for job in &self.jobs {
+                for (i, job) in self.jobs.iter().enumerate() {
                     ui.vertical(|ui| {
                         // 第一行:文件名(挤不下时省略号截断,hover 能看到完整名字)+ 步骤条。
                         // 步骤条先画(right_to_left 从右边开始分配空间,把它的宽度先占住),
@@ -1178,12 +1190,128 @@ impl SubgenApp {
                                 }
                             }
                         });
+                        // 第三行:单文件操作按钮。处理中全部禁用——"移除"会让 Vec 下标
+                        // 错位,worker 线程发回来的 JobUpdate{index, ..} 是按批次开始时
+                        // 固定下来的下标算的,处理中改动列表会让后续状态更新对错行;
+                        // "重新处理"/预览虽然本身不涉及下标错位,但处理中点这些于用户
+                        // 而言意图也不明确(现在改会不会影响正在跑的这一批?),干脆和
+                        // "移除"一起统一禁用,行为更容易预期。
+                        ui.add_enabled_ui(!self.processing, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("移除").clicked() {
+                                    remove_index = Some(i);
+                                }
+                                if job.status.is_terminal() {
+                                    if ui.small_button("重新处理").clicked() {
+                                        reprocess_index = Some(i);
+                                    }
+                                }
+                                if ui.small_button("打开文件夹").clicked() {
+                                    open_folder_path = Some(reveal_path_for(job));
+                                }
+                                if matches!(job.status, JobStatus::Done(_) | JobStatus::DoneWithWarning(..))
+                                {
+                                    let label = if job.preview_open { "收起预览" } else { "预览" };
+                                    if ui.small_button(label).clicked() {
+                                        toggle_preview_index = Some(i);
+                                    }
+                                }
+                            });
+                        });
+                        if job.preview_open {
+                            render_subtitle_preview(ui, job);
+                        }
                     });
                     ui.separator();
                 }
             });
         });
+
+        if let Some(i) = remove_index {
+            self.jobs.remove(i);
+        }
+        if let Some(i) = reprocess_index {
+            if let Some(j) = self.jobs.get_mut(i) {
+                j.force_reprocess = true;
+            }
+        }
+        if let Some(path) = open_folder_path {
+            let _ = std::process::Command::new("explorer")
+                .arg(format!("/select,{}", path.display()))
+                .spawn();
+        }
+        if let Some(i) = toggle_preview_index {
+            if let Some(j) = self.jobs.get_mut(i) {
+                j.preview_open = !j.preview_open;
+            }
+        }
     }
+}
+
+/// 判断某个任务是否应该被这一次"开始处理"纳入批次:还没到成功终态的任务本来就该跑
+/// (失败/跳过/取消都值得重试),或者用户在任务行显式点了"重新处理"——即使已经是
+/// Done/DoneWithWarning 终态也要纳入,并且 job::run_batch 会用 force 标志让它真正
+/// 重新跑一遍,不是复用旧结果。
+fn should_include_in_batch(job: &Job) -> bool {
+    job.force_reprocess
+        || !matches!(job.status, JobStatus::Done(_) | JobStatus::DoneWithWarning(..))
+}
+
+/// "打开文件夹"要选中的文件:完成态(不管有没有警告)优先选中生成的字幕——双语/仅中文
+/// 场景下是 `Video.zh.srt`,没有翻译则是同名 `Video.srt`;其它状态(还没跑完/失败/跳过)
+/// 没有稳定可用的产物,选中视频本身本来就是用户想找的东西。
+fn reveal_path_for(job: &Job) -> PathBuf {
+    if matches!(job.status, JobStatus::Done(_) | JobStatus::DoneWithWarning(..)) {
+        let zh = paths::sidecar_srt_lang_path(&job.video_path, "zh");
+        if zh.is_file() {
+            return zh;
+        }
+        let srt = paths::sidecar_srt_path(&job.video_path);
+        if srt.is_file() {
+            return srt;
+        }
+    }
+    job.video_path.clone()
+}
+
+/// 展开的字幕预览区:优先读中文翻译字幕(`Video.zh.srt`),没有就读原文字幕
+/// (`Video.srt`),取前 10 条逐行显示"时间戳 + 文本"。这是验证翻译/识别质量最低成本的
+/// 方式——不用离开软件、不用打开资源管理器找文件,10 秒内就能看出这次结果靠不靠谱。
+/// 读不到文件(比如用户手动删了、移动了)显示一句人话而不是静默空白或 panic。
+fn render_subtitle_preview(ui: &mut egui::Ui, job: &Job) {
+    let zh = paths::sidecar_srt_lang_path(&job.video_path, "zh");
+    let path = if zh.is_file() {
+        Some(zh)
+    } else {
+        let srt = paths::sidecar_srt_path(&job.video_path);
+        if srt.is_file() {
+            Some(srt)
+        } else {
+            None
+        }
+    };
+
+    egui::Frame::default()
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .fill(ui.visuals().faint_bg_color)
+        .show(ui, |ui| match path.and_then(|p| std::fs::read_to_string(&p).ok()) {
+            Some(content) => {
+                let blocks = engine::parse_srt_blocks(&content);
+                if blocks.is_empty() {
+                    ui.label("(字幕为空,没有识别出对白)");
+                } else {
+                    for (start, _end, text) in blocks.iter().take(10) {
+                        ui.label(format!("{start}  {text}"));
+                    }
+                    if blocks.len() > 10 {
+                        ui.weak(format!("……(共 {} 条,仅预览前 10 条)", blocks.len()));
+                    }
+                }
+            }
+            None => {
+                ui.label("字幕文件已不在原位置(可能被移动或删除了)");
+            }
+        });
 }
 
 /// 追加一行日志:既存进界面日志区(`log_lines`),也同步落盘到 `logs/app.log`——`log_lines`
@@ -1451,7 +1579,82 @@ mod tests {
             video_path: PathBuf::from("test.mkv"),
             status,
             started_at: None,
+            force_reprocess: false,
+            preview_open: false,
         }
+    }
+
+    #[test]
+    fn should_include_in_batch_retries_non_success_states_without_force() {
+        assert!(should_include_in_batch(&job_with_status(JobStatus::Pending)));
+        assert!(should_include_in_batch(&job_with_status(JobStatus::Skipped(
+            "s".to_string()
+        ))));
+        assert!(should_include_in_batch(&job_with_status(JobStatus::Failed(
+            job::Stage::Transcribe,
+            "f".to_string(),
+            None
+        ))));
+        assert!(should_include_in_batch(&job_with_status(JobStatus::Cancelled)));
+    }
+
+    #[test]
+    fn should_include_in_batch_excludes_finished_success_states_unless_forced() {
+        let done = job_with_status(JobStatus::Done(job::JobReport::default()));
+        assert!(
+            !should_include_in_batch(&done),
+            "普通重跑不该把已经成功的任务再跑一遍"
+        );
+
+        let mut forced_done = done;
+        forced_done.force_reprocess = true;
+        assert!(
+            should_include_in_batch(&forced_done),
+            "用户点了'重新处理'即使是 Done 状态也该纳入这一批"
+        );
+
+        let mut forced_warned =
+            job_with_status(JobStatus::DoneWithWarning("w".to_string(), job::JobReport::default()));
+        forced_warned.force_reprocess = true;
+        assert!(should_include_in_batch(&forced_warned));
+    }
+
+    #[test]
+    fn reveal_path_for_prefers_generated_subtitle_when_done() {
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_reveal_path_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video_path = dir.join("Episode.mkv");
+        std::fs::write(&video_path, b"fake video").unwrap();
+
+        // 完成态但还没有任何字幕文件落地(理论上不该发生,但防御性地验证:找不到字幕就
+        // 退回视频本身,而不是返回一个不存在的路径)。
+        let mut job = job_with_status(JobStatus::Done(job::JobReport::default()));
+        job.video_path = video_path.clone();
+        assert_eq!(reveal_path_for(&job), video_path);
+
+        // 只有原文字幕(没开翻译的场景)
+        let plain_srt = paths::sidecar_srt_path(&video_path);
+        std::fs::write(&plain_srt, "1\n00:00:01,000 --> 00:00:02,000\nHello.\n\n").unwrap();
+        assert_eq!(reveal_path_for(&job), plain_srt);
+
+        // 有中文翻译字幕时优先选中它,而不是原文字幕
+        let zh_srt = paths::sidecar_srt_lang_path(&video_path, "zh");
+        std::fs::write(&zh_srt, "1\n00:00:01,000 --> 00:00:02,000\n你好。\n\n").unwrap();
+        assert_eq!(reveal_path_for(&job), zh_srt);
+
+        // 非完成态(比如 Failed)不管字幕文件在不在,都该选中视频本身
+        let mut failed_job =
+            job_with_status(JobStatus::Failed(job::Stage::Transcribe, "f".to_string(), None));
+        failed_job.video_path = video_path.clone();
+        assert_eq!(reveal_path_for(&failed_job), video_path);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1510,6 +1713,8 @@ mod tests {
             started_at: Some(
                 std::time::Instant::now() - std::time::Duration::from_secs(elapsed_secs),
             ),
+            force_reprocess: false,
+            preview_open: false,
         }
     }
 

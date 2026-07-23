@@ -98,6 +98,12 @@ pub struct Job {
     /// 不依赖 whisper.cpp 自己的进度回调频率——避免复杂/大文件长时间没有百分比更新时
     /// 界面看起来像卡死。
     pub started_at: Option<std::time::Instant>,
+    /// 用户在任务行点了"重新处理"——即使这个任务已经是 Done/DoneWithWarning 终态,下次
+    /// "开始处理"也要把它纳入这一批,并且绕过 engine.rs 的断点续跑缓存真正重新跑一遍。
+    /// 入批后由 main.rs::start_processing 复位,不是"一直重新处理"的开关。
+    pub force_reprocess: bool,
+    /// 完成态任务行是否展开了字幕预览区(见 main.rs 的预览按钮)。
+    pub preview_open: bool,
 }
 
 impl Job {
@@ -106,6 +112,8 @@ impl Job {
             video_path,
             status: JobStatus::Pending,
             started_at: None,
+            force_reprocess: false,
+            preview_open: false,
         }
     }
 }
@@ -132,12 +140,15 @@ fn format_failed_lines_warning(failed_indices: &[usize]) -> String {
     )
 }
 
-/// `batch` 是 (界面列表里的原始下标, 视频路径) 对,只包含这次真正要跑的任务——调用方
-/// (main.rs::start_processing)已经把状态是 Done/DoneWithWarning 的任务过滤掉了,重新点
-/// "开始处理" 不会把已完成的文件重新跑一遍。
+/// `batch` 是 (界面列表里的原始下标, 视频路径, 是否强制重新处理) 三元组,只包含这次真正
+/// 要跑的任务——调用方(main.rs::start_processing)已经把状态是 Done/DoneWithWarning 且
+/// 没有被用户点了"重新处理"的任务过滤掉了,重新点"开始处理"不会把已完成的文件再跑一遍。
+/// `force` 为 true 的任务(用户在任务行点了"重新处理")会绕过 engine.rs 的断点续跑缓存,
+/// 也会让这个文件的输出覆盖策略等效于 overwrite=true——用户主动要求重新处理,就不该再被
+/// "已存在同名字幕,跳过" 挡住。
 #[allow(clippy::too_many_arguments)]
 pub fn run_batch(
-    batch: Vec<(usize, PathBuf)>,
+    batch: Vec<(usize, PathBuf, bool)>,
     model: String,
     language: String,
     overwrite: bool,
@@ -153,8 +164,11 @@ pub fn run_batch(
         // "自动"策略)时才重启。批次结束或被取消时显式 stop,避免 llama-server 常驻。
         let mut server: Option<crate::translate::LlamaServer> = None;
 
-        for (index, video_path) in batch.iter() {
+        for (index, video_path, force) in batch.iter() {
             let index = *index;
+            let force = *force;
+            // 用户点"重新处理"就是要覆盖旧结果,不该再被"已存在同名字幕,跳过"挡住。
+            let effective_overwrite = overwrite || force;
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = tx.send(WorkerEvent::JobUpdate {
                     index,
@@ -168,6 +182,7 @@ pub fn run_batch(
                 video_path,
                 &model,
                 &language,
+                force,
                 &cancel,
                 move |stage, text, pct| {
                     let _ = tx_progress.send(WorkerEvent::JobUpdate {
@@ -201,8 +216,11 @@ pub fn run_batch(
                 let _ = tx.send(WorkerEvent::GpuMissing(Stage::Transcribe));
             }
 
-            let placed = match crate::engine::place_sidecar_srt(video_path, &result.srt_path, overwrite)
-            {
+            let placed = match crate::engine::place_sidecar_srt(
+                video_path,
+                &result.srt_path,
+                effective_overwrite,
+            ) {
                 Ok(p) => p,
                 Err(crate::engine::PlaceError::Skipped(e)) => {
                     let _ = tx.send(WorkerEvent::JobUpdate {
@@ -333,7 +351,7 @@ pub fn run_batch(
                     &placed,
                     video_path,
                     bilingual,
-                    overwrite,
+                    effective_overwrite,
                     &cancel,
                     move |text, pct| {
                         let _ = tx_progress.send(WorkerEvent::JobUpdate {

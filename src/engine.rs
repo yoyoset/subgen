@@ -84,11 +84,17 @@ pub struct EngineOutcome {
 /// 完整,会直接复用、跳过重新跑——这样即使上次处理到一半崩溃/被打断,这次重新处理同一个
 /// 文件也不用把已经做完的工作再做一遍。哈希由路径 + `model_key` + `language` 一起算出
 /// (见 `cache_key`),换模型或换语言会自然算出不同的哈希、不会误命中旧结果。完全自动判断,
-/// 不需要开关;想强制重新跑,手动删掉 `tmp/` 里对应的 `{文件名}_{哈希}.wav`/`.srt` 即可。
+/// 不需要开关;想强制重新跑,`force=true` 即可(界面上"重新处理"按钮用的就是这个),不用
+/// 再手动去 `tmp/` 里删文件。
+///
+/// `force=true` 时两个复用检查都直接跳过,效果上等同于"当作 tmp/ 里从来没有这份产物"——
+/// 不需要额外先物理删除旧文件:ffmpeg 命令本来就带 `-y`(覆盖已有输出),whisper-cli 写
+/// 输出文件也是标准的截断写入,重新跑一遍会自然覆盖旧内容,不会残留旧数据的痕迹。
 pub fn process_video(
     video_path: &Path,
     model_key: &str,
     language: &str,
+    force: bool,
     cancel: &Arc<AtomicBool>,
     mut progress_cb: impl FnMut(Stage, String, Option<f32>),
 ) -> Result<EngineOutcome, EngineError> {
@@ -118,8 +124,10 @@ pub fn process_video(
     let srt_out_prefix = paths::tmp_dir().join(&unique); // whisper -of 不带扩展名,会自动加 .srt
     let log_file = paths::logs_dir().join(format!("{unique}.log"));
 
-    // ---- 1. 提取音轨(支持复用已有的临时 wav) ----
-    let wav_reused = wav_path.is_file() && wav_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    // ---- 1. 提取音轨(支持复用已有的临时 wav,force=true 时强制当作不存在) ----
+    let wav_reused = !force
+        && wav_path.is_file()
+        && wav_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
     if wav_reused {
         progress_cb(
             Stage::ExtractAudio,
@@ -176,9 +184,9 @@ pub fn process_video(
         return Err(no_log(Stage::ExtractAudio, "已取消"));
     }
 
-    // ---- 2. 语音识别(支持复用已有的 srt) ----
+    // ---- 2. 语音识别(支持复用已有的 srt,force=true 时强制当作不存在) ----
     let generated_srt = srt_out_prefix.with_extension("srt");
-    if generated_srt.is_file() && srt_looks_complete(&generated_srt) {
+    if !force && generated_srt.is_file() && srt_looks_complete(&generated_srt) {
         progress_cb(
             Stage::Transcribe,
             "检测到已识别的字幕,跳过重新识别".to_string(),
