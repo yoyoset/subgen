@@ -19,6 +19,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 fn main() -> eframe::Result<()> {
+    if !acquire_single_instance_lock() {
+        rfd::MessageDialog::new()
+            .set_title("字幕生成器 subgen")
+            .set_description("subgen 已经在运行了,请不要重复打开。")
+            .set_level(rfd::MessageLevel::Warning)
+            .show();
+        return Ok(());
+    }
     install_panic_logger();
     job_guard::init_child_job_object();
     let config = Config::load();
@@ -44,6 +52,41 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(SubgenApp::new(config)))
         }),
     )
+}
+
+/// 单实例保护:双开 subgen 会共用同一个 `tmp/` 目录、抢同一个翻译引擎端口(见 translate.rs
+/// 的 `PORT`),第二个实例遇到的报错会被误导成"显存不足"或莫名其妙的文件冲突,完全看不出
+/// 真实原因是"已经开了一个"。对 exe 同目录下的 `subgen.lock` 加进程级排他锁,锁不到说明
+/// 已有实例在跑。用标准库 `File::try_lock`(Rust 1.89 起稳定)而不是 fs4 crate——虽然
+/// Cargo.toml 里已经有 fs4(setup.rs 用它查磁盘剩余空间),但文件锁这块标准库原生就有,
+/// 不用再多绕一层。
+///
+/// 锁文件句柄用 `Box::leak` 让它活到进程结束——同一个进程内不会有第二次加锁的需求,不需要
+/// 精细管理生命周期;进程退出(不管正常退出、崩溃还是被任务管理器强杀)时操作系统会自动
+/// 回收文件句柄,锁随之释放,不依赖任何应用层清理代码(和 job_guard.rs 里 Job Object 的
+/// 设计哲学一致)。
+///
+/// 返回 `true` 表示拿到了锁、可以继续启动;`false` 表示已有实例在跑。加锁过程本身出错(比如
+/// exe 所在目录只读、建不出锁文件)时按"能启动"处理,不该因为这类边缘情况拦住正常用户。
+fn acquire_single_instance_lock() -> bool {
+    let lock_path = paths::app_dir().join("subgen.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return true,
+    };
+
+    match file.try_lock() {
+        Ok(()) => {
+            Box::leak(Box::new(file));
+            true
+        }
+        Err(std::fs::TryLockError::WouldBlock) => false,
+        Err(std::fs::TryLockError::Error(_)) => true,
+    }
 }
 
 /// 注册全局 panic hook,把 panic 信息(消息 + 代码位置)追加写进 logs/crash.log。
@@ -1036,5 +1079,43 @@ mod tests {
         assert!(content.contains("main.rs"), "crash.log 应该包含发生位置: {content}");
 
         let _ = std::fs::remove_file(&crash_log);
+    }
+
+    /// 验证单实例锁依赖的底层机制:同一个文件路径,两个独立的文件句柄(模拟两个进程各自
+    /// open 同一个 subgen.lock),第一个 try_lock 成功后,第二个必须失败并且是
+    /// `WouldBlock`(不是别的错误类型)——这正是 `acquire_single_instance_lock` 用来判断
+    /// "已有实例在跑"的依据。不直接调用 `acquire_single_instance_lock` 本身,因为它写死了
+    /// `paths::app_dir()` 下的固定路径、且用 `Box::leak` 让锁活到进程结束,在 cargo test
+    /// 这种同进程跑多个测试的场景下会产生跨测试的副作用,换成独立临时文件路径验证同一套
+    /// 机制,行为等价但不干扰其它测试。
+    #[test]
+    fn second_handle_to_locked_file_fails_with_would_block() {
+        let path = std::env::temp_dir().join(format!(
+            "subgen_test_lock_{:x}.lock",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let first = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .expect("应该能创建/打开锁文件");
+        first.try_lock().expect("第一个句柄应该能拿到排他锁");
+
+        let second = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .expect("应该能打开同一个文件(open 本身不受锁影响)");
+        match second.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            other => panic!("第二个句柄应该拿锁失败并报 WouldBlock,实际: {other:?}"),
+        }
+
+        drop(first);
+        let _ = std::fs::remove_file(&path);
     }
 }
