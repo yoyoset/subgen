@@ -605,9 +605,22 @@ impl eframe::App for SubgenApp {
                     ui.add_space(8.0);
                     ui.label("以下组件缺失,需联网下载:");
                     ui.add_space(4.0);
+                    // 每项标大小、下面给总计——用户在不知情的情况下点"开始下载"其实是在
+                    // 做一个"可能几十分钟、几个 GB 流量"的决定,不该让他们蒙在鼓里。
+                    let mut total_bytes: u64 = 0;
                     for k in &missing {
-                        ui.label(format!("· {}", k.label()));
+                        let size = setup::estimated_size_bytes(*k, &self.config.model);
+                        total_bytes += size;
+                        ui.label(format!("· {}({})", k.label(), format_download_size(size)));
                     }
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "共需下载约 {},只需下载这一次。",
+                        format_download_size(total_bytes)
+                    ));
+                    // 这句话也是这个软件最大的卖点,之前只写在 README 里,首次见面就该
+                    // 让用户知道:视频和字幕不会离开这台电脑。
+                    ui.label("所有组件均在你自己的电脑上运行,视频和字幕不会上传到任何服务器。");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.label(format!("模型将保存到: {}", paths::models_dir().display()));
@@ -1039,6 +1052,19 @@ fn format_elapsed(total_secs: u64) -> String {
     }
 }
 
+/// 把字节数格式化成下载页面看着顺眼的大小单位:≥1GB 显示到 GB(1 位小数),否则显示到
+/// MB(1 位小数)。只用于下载组件大小提示,不追求通用场景。
+fn format_download_size(bytes: u64) -> String {
+    const GB: f64 = 1_073_741_824.0;
+    const MB: f64 = 1_048_576.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else {
+        format!("{:.1} MB", bytes / MB)
+    }
+}
+
 /// 画流水线步骤条(比如"✓提取 › ●识别 › ○翻译")。`translate_enabled` 决定要不要画"翻译"
 /// 这一步——没开翻译的话流水线只有两步,画第三步没有意义,只会让人以为漏了什么。
 /// Pending/Skipped/Cancelled 这几种状态没有明确的"当前处于哪个阶段"可言,不画步骤条,
@@ -1177,6 +1203,13 @@ fn job_status_line(job: &Job, cancelling: bool) -> (String, egui::Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_download_size_switches_between_mb_and_gb_at_one_gb() {
+        assert_eq!(format_download_size(885_098), "0.8 MB");
+        assert_eq!(format_download_size(1_073_741_824), "1.0 GB");
+        assert_eq!(format_download_size(3_095_033_483), "2.9 GB");
+    }
 
     /// 用独立的 `Vec<String>` 而不是真的构造一个 `SubgenApp` 来测——`push_log` 就是特意
     /// 为了不需要整个 `&mut self` 才写成自由函数的,测试也应该只依赖它实际需要的那点状态。

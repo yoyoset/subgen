@@ -85,13 +85,16 @@ pub enum ComponentKey {
 }
 
 impl ComponentKey {
+    /// 用途导向的文案,不是给开发者看的库名——普通用户不知道 whisper.cpp/llama.cpp/FFmpeg
+    /// 是什么,只关心"这个东西是干什么用的"。技术名放在括号里当补充信息,不是主标题,想
+    /// 深挖的用户(比如想知道具体版本、去查对应项目文档)依然能看到。
     pub fn label(&self) -> &'static str {
         match self {
-            ComponentKey::Engine => "识别引擎 (whisper.cpp)",
-            ComponentKey::Ffmpeg => "FFmpeg (音频提取)",
+            ComponentKey::Engine => "语音识别组件(whisper.cpp)",
+            ComponentKey::Ffmpeg => "音频处理组件(FFmpeg)",
             ComponentKey::Model => "语音识别模型",
             ComponentKey::Vad => "语音活动检测模型",
-            ComponentKey::Translator => "本地翻译引擎 (llama.cpp)",
+            ComponentKey::Translator => "中文翻译组件(llama.cpp)",
             ComponentKey::TransModel(key) => crate::translate::model_by_key(key)
                 .map(|m| m.label)
                 .unwrap_or("翻译模型"),
