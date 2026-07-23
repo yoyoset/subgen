@@ -30,6 +30,10 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([config.window_w, config.window_h])
             .with_min_inner_size([560.0, 420.0])
             .with_drag_and_drop(true),
+        // 显式用 glow(见 Cargo.toml 里 eframe 的 feature 说明),不依赖 Renderer 的
+        // Default 实现——Cargo.toml 已经把 wgpu 从编译产物里拿掉,这里写明白只是让
+        // 意图在代码里也看得见,不用去翻依赖配置才知道用的是哪个后端。
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
@@ -699,7 +703,9 @@ impl eframe::App for SubgenApp {
         }
     }
 
-    fn on_exit(&mut self) {
+    // glow 后端的 App::on_exit 比 wgpu 后端多一个 Option<&glow::Context> 参数(用来在退出前
+    // 释放 OpenGL 资源);这里不需要手动清理任何 GL 资源,参数用不上,但签名必须匹配。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.config.save();
     }
 }

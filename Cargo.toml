@@ -4,7 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.35.0"
+# 只启用 glow(OpenGL)渲染后端,不编译 wgpu 进来——实测遇到过一次主程序意外退出,大概率是
+# wgpu 渲染层在和 whisper-cli/llama-server 抢同一块物理 GPU 时"设备丢失直接 panic"(wgpu
+# 默认行为就是这样)。glow 对设备丢失的容忍度远高于 wgpu,这个 UI 也用不到 wgpu 的能力,
+# 干脆从编译产物里去掉,从根上排除这个崩溃源,而不是指望运行时不触发。
+# eframe 对 winit 的依赖本身固定带了 rwh_06(不受 feature 开关影响);winit 自己的
+# default feature(x11/wayland 等)只影响 Linux 后端选择,Windows 后端按 target_os 编译、
+# 不受 Cargo feature 门控,所以不需要单独打开 winit 的 default feature。x11/wayland/
+# web_screen_reader 同理是 Linux/Web 专属,本项目只发行 Windows 版,不需要。
+eframe = { version = "0.35.0", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "accesskit",
+] }
 fs4 = "1.1.0"
 reqwest = { version = "0.13.4", features = ["blocking", "stream", "json"] }
 rfd = "0.17.2"
