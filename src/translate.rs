@@ -106,11 +106,10 @@ pub struct LlamaServer {
     child: std::process::Child,
     port: u16,
     pub model_key: &'static str,
-    /// 是否观测到模型层被成功卸载到 GPU(见 `parse_gpu_offload` 和 `start` 里 stderr 解析
-    /// 线程)。识别阶段(engine.rs)有 GPU 检测,翻译阶段之前完全没有——llama-server 的
-    /// 日志之前只是排空、不解析,如果翻译意外掉到纯 CPU,用户只会感觉"很慢",没有任何
+    /// 是否探测到可用的 GPU 设备(见 `probe_gpu_available`)。识别阶段(engine.rs)有 GPU
+    /// 检测,翻译阶段之前完全没有——如果翻译意外掉到纯 CPU,用户只会感觉"很慢",没有任何
     /// 界面提示指向真正原因。
-    used_gpu: Arc<AtomicBool>,
+    used_gpu: bool,
 }
 
 impl LlamaServer {
@@ -120,6 +119,15 @@ impl LlamaServer {
         if !model_path.is_file() {
             return Err(format!("翻译模型文件不存在: {}", model_path.display()));
         }
+
+        // llama-server 需要 cudart64_12.dll / cublas64_12.dll / cublasLt64_12.dll 才能用 GPU。
+        // 不单独下载一份约 400MB 的 CUDA 运行库包 —— whisper 引擎(同为 CUDA 12.4 构建)已经带了
+        // 这些 DLL,把它所在目录加进子进程的 PATH 前部,Windows 动态链接器就能找到,免掉重复下载。
+        let dll_dir = paths::whisper_cli_exe().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+        // 先用 --list-devices 单独探测一次 GPU 是否可用,再正式启动服务进程——见
+        // probe_gpu_available 的文档注释,这是踩过真实的坑之后换掉的方案。
+        let used_gpu = probe_gpu_available(&exe, dll_dir.as_deref());
 
         let mut cmd = Command::new(&exe);
         cmd.arg("-m").arg(&model_path);
@@ -131,14 +139,9 @@ impl LlamaServer {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        // llama-server 需要 cudart64_12.dll / cublas64_12.dll / cublasLt64_12.dll 才能用 GPU。
-        // 不单独下载一份约 400MB 的 CUDA 运行库包 —— whisper 引擎(同为 CUDA 12.4 构建)已经带了
-        // 这些 DLL,把它所在目录加进子进程的 PATH 前部,Windows 动态链接器就能找到,免掉重复下载。
-        if let Some(whisper_exe) = paths::whisper_cli_exe() {
-            if let Some(dll_dir) = whisper_exe.parent() {
-                let existing_path = std::env::var("PATH").unwrap_or_default();
-                cmd.env("PATH", format!("{};{existing_path}", dll_dir.display()));
-            }
+        if let Some(dir) = &dll_dir {
+            let existing_path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{};{existing_path}", dir.display()));
         }
 
         #[cfg(windows)]
@@ -149,24 +152,16 @@ impl LlamaServer {
             .map_err(|e| format!("无法启动本地翻译引擎: {e}"))?;
         crate::job_guard::bind_child_to_job(&child);
 
-        // 排空 stdout(不解析,只为防止管道缓冲区打满导致子进程阻塞写入而卡死)。
+        // 排空 stdout/stderr(不解析,只为防止管道缓冲区打满导致子进程阻塞写入而卡死)。
+        // GPU 检测已经在上面用 --list-devices 单独做完,不再依赖这里的日志内容。
         if let Some(s) = child.stdout.take() {
             std::thread::spawn(move || {
                 for _ in BufReader::new(s).lines().map_while(Result::ok) {}
             });
         }
-        // stderr 里有模型加载时的层卸载信息,解析出"是否用上了 GPU"(见 parse_gpu_offload)。
-        // 模型加载(包含层卸载判定)必然发生在下面的健康检查通过之前,所以 health 检查
-        // 通过时这个值已经是这次启动的最终结果,不存在读取时机早晚的问题。
-        let used_gpu = Arc::new(AtomicBool::new(false));
         if let Some(s) = child.stderr.take() {
-            let used_gpu = used_gpu.clone();
             std::thread::spawn(move || {
-                for line in BufReader::new(s).lines().map_while(Result::ok) {
-                    if parse_gpu_offload(&line) == Some(true) {
-                        used_gpu.store(true, Ordering::Relaxed);
-                    }
-                }
+                for _ in BufReader::new(s).lines().map_while(Result::ok) {}
             });
         }
 
@@ -214,7 +209,7 @@ impl LlamaServer {
     }
 
     pub fn used_gpu(&self) -> bool {
-        self.used_gpu.load(Ordering::Relaxed)
+        self.used_gpu
     }
 
     pub fn stop(&mut self) {
@@ -568,29 +563,59 @@ fn split_leading_number(line: &str) -> Option<(usize, &str)> {
     Some((num, after_sep.trim_start()))
 }
 
-/// 解析 llama-server 模型加载时的层卸载日志行,例如
-/// "load_tensors: offloaded 37/37 layers to GPU"。返回 `Some(true)` 表示这一行确实报告
-/// 卸载了至少一层到 GPU(不要求全部——部分卸载也比纯 CPU 快得多,界面警告只关心"完全
-/// 没用上 GPU"这一种情况);匹配不上格式(不是层卸载行,或数字后面不是预期的
-/// "layers to GPU")返回 `None`,调用方应该继续看下一行,不当作"没用 GPU"的证据。
+/// 探测这台机器上 llama-server 能不能找到可用的 GPU 设备。用 `--list-devices` 单独跑
+/// 一次(不加载模型,进程打印设备列表就退出,很快)取代早先"解析主进程 stderr 里的层
+/// 卸载日志行"的方案——见下面的踩坑记录。`-ngl 99` 在这个项目里恒定拉满,所以"探测到
+/// 设备可用"约等于"这次启动会用上 GPU"。
 ///
-/// 格式字符串来自 llama.cpp b10079(和本项目绑定的 llama-server 是同一个版本)源码实测
-/// 确认,不是猜测的:`src/llama-model.cpp` 的 `load_tensors` 函数里
-/// `LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, n, total)`。
-/// 这行日志只在 `llama_supports_gpu_offload()` 为 true(编译时带 GPU 后端支持,这个项目
-/// 绑定的预编译包始终满足)时才会打印;真机在完全没有可用 GPU 的情况下这一行到底是打印
-/// "offloaded 0/N" 还是整段跳过,没有在真实无 GPU/驱动异常的机器上验证过——但两种情况
-/// 这个函数的调用方都会得到"没有观测到 used_gpu=true"的结果,界面警告依然会正确触发,
-/// 不影响判断的正确性,只是没有做到"精确复现该场景下的每一行日志"这个更高标准的验证。
-fn parse_gpu_offload(line: &str) -> Option<bool> {
-    let idx = line.find("offloaded ")?;
-    let rest = &line[idx + "offloaded ".len()..];
-    let n_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if n_str.is_empty() || !rest.contains("layers to GPU") {
-        return None;
+/// 真实踩过的坑:原方案解析形如 "load_tensors: offloaded 37/37 layers to GPU" 的日志行,
+/// 格式号称来自 llama.cpp b10079 源码(`load_tensors()` 里的 `LLAMA_LOG_INFO`)实测确认。
+/// 但用真机(RTX 3060)跑一次完整流程后用 `nvidia-smi` 独立监控显存,启动前基线约
+/// 2260 MiB、加载 2.4GB 的 Qwen3 模型后约 5988 MiB,增量约 3.7GB,证明 GPU 确实被用上了;
+/// 与此同时把这次启动的 stdout(0 行)和 stderr(11 行,全文读完)都检查了一遍,完全没有
+/// 任何包含 offload/CUDA/cuda/device 的行——这个项目实际绑定的 llama-server.exe
+/// (build b10079-40b740ad0)在这次真实运行里根本不打印那一行日志。旧方案在这个真实
+/// 场景下会稳定得到假阴性:GPU 明明工作正常,却告诉用户"未能使用显卡加速",比不做检测
+/// 还糟糕。
+///
+/// `--list-devices` 这条路径已经用同一台机器实测确认过两种情况:PATH 里有 CUDA DLL 时
+/// 输出 "Available devices:\n  CUDA0: NVIDIA GeForce RTX 3060 (12287 MiB, 11255 MiB free)";
+/// PATH 里没有时只输出光秃秃的 "Available devices:" 一行,没有设备行。这个探测依赖的是
+/// "进程能不能枚举到设备"这个更底层的事实,不锚定某一条具体日志字符串的措辞,不会随
+/// llama-server 版本更新就失效。
+fn probe_gpu_available(exe: &Path, dll_dir: Option<&Path>) -> bool {
+    let mut cmd = Command::new(exe);
+    cmd.arg("--list-devices");
+    if let Some(dir) = dll_dir {
+        let existing_path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{};{existing_path}", dir.display()));
     }
-    let n: u32 = n_str.parse().ok()?;
-    Some(n > 0)
+    #[cfg(windows)]
+    cmd.creation_flags(engine::CREATE_NO_WINDOW);
+    let Ok(output) = cmd.output() else {
+        return false;
+    };
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_device_list(&combined)
+}
+
+/// 判断 `--list-devices` 的输出里是否列出了至少一个设备。设备行形如
+/// "  CUDA0: NVIDIA GeForce RTX 3060 (12287 MiB, 11255 MiB free)"——去掉首尾空白后,
+/// 冒号前是一段不含空白的设备名;没有设备时只有标题行 "Available devices:"。不锚定
+/// "CUDA" 这个具体后端名字,是因为同一套预编译包理论上也可能报告 Vulkan/SYCL 等其它
+/// 后端的设备,解析逻辑不该绑定某一个后端。
+fn parse_device_list(output: &str) -> bool {
+    output.lines().any(|line| {
+        let trimmed = line.trim();
+        match trimmed.split_once(':') {
+            Some((name, _)) => !name.is_empty() && !name.contains(char::is_whitespace),
+            None => false,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -669,31 +694,31 @@ mod tests {
         assert!(system.contains("轻小说"));
     }
 
-    /// 格式字符串来自 llama.cpp b10079 源码实测确认(见 parse_gpu_offload 文档注释),
-    /// 这里验证解析逻辑本身,不依赖真实的 llama-server 进程。
+    /// 输出格式来自真机(RTX 3060)实测的 `llama-server.exe --list-devices`(见
+    /// probe_gpu_available 文档注释),不是猜测的。
     #[test]
-    fn parse_gpu_offload_detects_full_offload() {
-        let line = "load_tensors: offloaded 37/37 layers to GPU";
-        assert_eq!(parse_gpu_offload(line), Some(true));
+    fn parse_device_list_detects_cuda_device() {
+        let output = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 3060 (12287 MiB, 11255 MiB free)\n";
+        assert!(parse_device_list(output));
     }
 
     #[test]
-    fn parse_gpu_offload_detects_partial_offload_as_used() {
-        // 部分卸载也比纯 CPU 快得多,只要不是 0,就该算"用上了 GPU"。
-        let line = "load_tensors: offloaded 10/37 layers to GPU";
-        assert_eq!(parse_gpu_offload(line), Some(true));
+    fn parse_device_list_no_devices_returns_false() {
+        // 真机实测:PATH 里没有 CUDA DLL 时,输出只有光秃秃的标题行,没有设备行。
+        let output = "Available devices:\n";
+        assert!(!parse_device_list(output));
     }
 
     #[test]
-    fn parse_gpu_offload_detects_zero_offload_as_not_used() {
-        let line = "load_tensors: offloaded 0/37 layers to GPU";
-        assert_eq!(parse_gpu_offload(line), Some(false));
+    fn parse_device_list_empty_output_returns_false() {
+        assert!(!parse_device_list(""));
     }
 
     #[test]
-    fn parse_gpu_offload_ignores_unrelated_lines() {
-        assert_eq!(parse_gpu_offload("main: server is listening on 127.0.0.1:8712"), None);
-        assert_eq!(parse_gpu_offload("load_tensors: loading model tensors"), None);
+    fn parse_device_list_does_not_match_title_line_itself() {
+        // "Available devices:" 本身也含冒号,但冒号前是"Available devices"(含空格),
+        // 不该被误判成一个设备名。
+        assert!(!parse_device_list("Available devices:"));
     }
 
     /// 真实踩过的坑:失败行的 `translated` 值就是原文本身(见 translate_batch_with_retry
