@@ -880,12 +880,14 @@ impl SubgenApp {
                 ui.add_space(16.0);
                 ui.label("语言:");
                 let mut lang_changed = false;
+                // 下拉框显示中文名(lang_display,和完成状态行回显用的是同一个函数,保持
+                // 界面上语言名称的说法前后一致),存进 config 的还是 ISO 码,不影响存储格式。
                 egui::ComboBox::from_id_salt("lang")
-                    .selected_text(self.config.language.clone())
+                    .selected_text(lang_display(&self.config.language))
                     .show_ui(ui, |ui| {
                         for lang in ["auto", "en", "zh", "ja", "ko", "fr", "de", "es"] {
                             if ui
-                                .selectable_label(self.config.language == lang, lang)
+                                .selectable_label(self.config.language == lang, lang_display(lang))
                                 .clicked()
                             {
                                 self.config.language = lang.to_string();
@@ -910,7 +912,9 @@ impl SubgenApp {
                 // 双语/仅中文纯粹是输出格式,不影响要下载什么,所以单独存 save 不触发重新检测。
                 let mut needs_recheck = false;
                 let mut translate = self.config.translate;
-                if ui.checkbox(&mut translate, "生成中文翻译(本地模型)").changed() {
+                // "本地模型"是给开发者看的实现细节;新手真正关心的是"要不要联网、内容
+                // 会不会被传出去",直接把这个卖点说出来比暗示"用了本地模型"更直接。
+                if ui.checkbox(&mut translate, "翻译成中文(在本机运行,不上传内容)").changed() {
                     self.config.translate = translate;
                     needs_recheck = true;
                 }
@@ -1028,9 +1032,13 @@ impl SubgenApp {
                 }
             });
             if self.gpu_warning_shown {
+                // "CUDA 环境"对不知道自己有没有独立显卡的用户是天书,给出的建议要么可执行
+                // (更新驱动),要么直接告诉他们"你可能就是没有这个硬件",别让人对着一句
+                // 看不懂的话不知道下一步该做什么。
                 ui.colored_label(
                     egui::Color32::from_rgb(230, 150, 20),
-                    "⚠ 检测到处理过程未使用 GPU,速度会非常慢。请检查显卡驱动 / CUDA 环境。",
+                    "⚠ 未能使用显卡加速,处理会慢很多。请到 NVIDIA 官网更新显卡驱动后重试;\
+                     如果这台电脑没有 NVIDIA 显卡,只能使用较慢的模式。",
                 );
             }
             if let Some((text, _)) = &self.transient_notice {

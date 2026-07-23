@@ -522,10 +522,14 @@ pub fn place_sidecar_srt(
     let target = paths::sidecar_srt_path(video_path);
     if target.exists() && !overwrite {
         let _ = std::fs::remove_file(generated_srt);
-        return Err(PlaceError::Skipped(format!(
-            "已存在同名字幕,已跳过: {}",
-            target.display()
-        )));
+        // 只显示文件名,不显示完整路径——界面上这条消息会被拼成"跳过: {这里}",裸露一整条
+        // 绝对路径又长又没必要,文件名已经足够说明"是哪个文件"(视频本身的完整路径已经在
+        // 任务行第一行,hover 能看到)。
+        let filename = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        return Err(PlaceError::Skipped(format!("已有同名字幕,未覆盖({filename})")));
     }
     std::fs::copy(generated_srt, &target)
         .map_err(|e| PlaceError::Failed(format!("写入字幕文件失败: {e}")))?;

@@ -235,9 +235,14 @@ pub fn translate_srt(
 ) -> Result<TranslateResult, String> {
     let target = paths::sidecar_srt_lang_path(video_path, "zh");
     if target.exists() && !overwrite {
+        // 只显示文件名,不显示完整路径,和 engine.rs::place_sidecar_srt 的跳过消息保持
+        // 同样的简洁度——裸露一整条绝对路径又长又没必要。
+        let filename = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         return Ok(TranslateResult::Skipped(format!(
-            "已存在同名中文字幕,已跳过: {}",
-            target.display()
+            "已有同名中文字幕,未覆盖({filename})"
         )));
     }
 
