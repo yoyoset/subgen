@@ -21,7 +21,7 @@
 | 组件 | 来源 | 大小 | 何时需要 |
 |---|---|---|---|
 | whisper.cpp(识别引擎)| [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) 官方 Release,Windows CUDA 预编译版 | 约 650MB | 总是 |
-| FFmpeg(音频提取) | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) essentials 构建 | 约 100MB | 总是 |
+| FFmpeg(音频提取) | [GyanD/codexffmpeg](https://github.com/GyanD/codexffmpeg/releases) essentials 构建(gyan.dev 官方在 GitHub 上的发布仓库,带版本号) | 约 100MB | 总是 |
 | large-v3 语音模型 | [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp) | 约 2.9GB | 总是 |
 | VAD 模型 | [Hugging Face](https://huggingface.co/ggml-org/whisper-vad) | 约 1MB(体积很小,预先下好备用;当前默认识别流程不使用,见下文 VAD 的坑) | 总是 |
 | llama.cpp(本地翻译引擎)| [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) 官方 Release,Windows CUDA 预编译版 | 约 240MB | 勾选翻译后 |
@@ -116,10 +116,10 @@ src/
 
 ### 哈希校验的可信度分级
 
-- `engine`(whisper.cpp)、`vad` 模型、`model`(large-v3)、`translator`(llama.cpp)、两个翻译模型(Sakura/Qwen3):哈希都是通过 GitHub Release API 的资产 digest 字段或 HuggingFace LFS 指针文件核实过的,large-v3 额外做过一次完整下载后本地 `sha256sum` 复核,两者一致;校验不过**阻断安装**
-- `ffmpeg`:gyan.dev 的 essentials 包是滚动更新的"最新构建"链接,没有可钉死的版本号/哈希,不做哈希校验,只做解压后能否找到 `ffmpeg.exe` 的存在性检查
+- `engine`(whisper.cpp)、`ffmpeg`、`vad` 模型、`model`(large-v3)、`translator`(llama.cpp)、两个翻译模型(Sakura/Qwen3):哈希都是通过 GitHub Release API 的资产 digest 字段或 HuggingFace LFS 指针文件核实过的,large-v3、ffmpeg 额外做过一次完整下载后本地 `sha256sum` 复核,两者一致;校验不过**阻断安装**
+- `ffmpeg` 早期用的是 gyan.dev 滚动更新的"最新构建"链接,没有可钉死的版本号/哈希,只做存在性检查;已改用 [GyanD/codexffmpeg](https://github.com/GyanD/codexffmpeg/releases) 在 GitHub 上带版本号的正式发布(内容与 gyan.dev 官网一致),可以像其他组件一样钉版本号 + 强哈希校验,不再依赖一个随时可能变化的滚动链接
 
-如果以后 whisper.cpp/llama.cpp 出新版本、想升级绑定的版本号,去 `src/setup.rs` 顶部改对应的 `_URL`/`_SHA256` 常量,记得重新下载一遍算真实哈希,不要瞎编。
+如果以后 whisper.cpp/ffmpeg/llama.cpp 出新版本、想升级绑定的版本号,去 `src/setup.rs` 顶部改对应的 `_URL`/`_SHA256` 常量,记得重新下载一遍算真实哈希,不要瞎编。
 
 ### TODO / 已知小问题
 

@@ -1,10 +1,12 @@
 //! 首次运行组件检测与自动下载。
 //!
 //! 所有下载地址、哈希值均在编写本文件时实际验证过(直接下载并本地计算哈希 / 实测运行确认可用),
-//! 不是凭空猜测的占位值。engine、vad、model(large-v3)三者的哈希都是完整下载后本地 sha256sum
-//! 验证过的,校验失败会阻断安装(model 的哈希最初来自 HuggingFace 响应头 X-Linked-ETag,后来完整
-//! 下载 large-v3 复核过一遍,两者一致,已从"仅警告"升级为强校验);ffmpeg 用的是滚动更新的
-//! "最新构建"链接,没有可钉死的哈希,只做解压后能否找到 ffmpeg.exe 的存在性校验。
+//! 不是凭空猜测的占位值。engine、vad、model(large-v3)、ffmpeg 四者的哈希都是完整下载后本地
+//! sha256sum 验证过的,校验失败会阻断安装(model 的哈希最初来自 HuggingFace 响应头 X-Linked-ETag,
+//! 后来完整下载 large-v3 复核过一遍,两者一致,已从"仅警告"升级为强校验)。ffmpeg 早期用的是
+//! gyan.dev 滚动更新的"最新构建"链接,没有可钉死的哈希;已改为 GyanD/codexffmpeg 在 GitHub
+//! Release 发布的带版本号构建(gyan.dev 官方在 GitHub 上的镜像),可以钉版本号和哈希,不再
+//! 依赖一个随时可能变化的滚动链接。
 
 use crate::paths;
 use sha2::{Digest, Sha256};
@@ -31,8 +33,15 @@ const ENGINE_URL: &str =
     "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-cublas-12.4.0-bin-x64.zip";
 const ENGINE_SHA256: &str = "106a2030eff8998e4ef320fe72e263a78449e9040386ee27c41ea80b001b601b";
 
-// gyan.dev 的 essentials 包是滚动更新的最新构建链接,没有稳定版本号可钉死哈希。
-const FFMPEG_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+// GyanD/codexffmpeg 是 gyan.dev 构建在 GitHub 上的正式发布仓库,essentials 包内容和
+// gyan.dev 官网提供的一致,但带版本号 tag,可以钉死哈希,不像官网的"最新构建"链接那样
+// 会在不通知的情况下随时变化。哈希取自 GitHub Release API 返回的资产 digest 字段,
+// 并额外完整下载 109,728,040 字节的包本地 sha256sum 复核过一遍,两者一致。
+// 以后升级 ffmpeg 版本:去 https://github.com/GyanD/codexffmpeg/releases/latest 看新 tag,
+// 重新下载一遍算真实哈希,不要凭记忆/推测填写。
+const FFMPEG_URL: &str =
+    "https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-essentials_build.zip";
+const FFMPEG_SHA256: &str = "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec";
 
 const VAD_URL: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
 const VAD_SHA256: &str = "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf";
@@ -107,10 +116,9 @@ pub fn is_present(key: ComponentKey, model: &str) -> bool {
     }
 }
 
-/// 组件的估算下载大小(字节),用于下载前的磁盘空间提示。除 ffmpeg 外都是从 GitHub Release
-/// API / HuggingFace LFS 指针文件核实过的真实字节数,不是拍脑袋估的;ffmpeg 是滚动更新的
-/// "最新构建"链接没有固定版本,下面这个数是写这段代码时实测的当前值,长期看会随上游更新
-/// 漂移,所以只用于提示、不做硬阻断。
+/// 组件的估算下载大小(字节),用于下载前的磁盘空间提示。均从 GitHub Release API / HuggingFace
+/// LFS 指针文件核实过的真实字节数(ffmpeg 已改为固定版本,见 FFMPEG_URL 处说明),不是拍脑袋
+/// 估的;只用于提示、不做硬阻断,所以即便未来上游文件大小有细微出入也不影响功能。
 pub fn estimated_size_bytes(key: ComponentKey, model: &str) -> u64 {
     match key {
         ComponentKey::Engine => 677_887_125,
@@ -218,8 +226,8 @@ pub fn install_component(
             download_and_extract_zip(
                 key.label(),
                 FFMPEG_URL,
-                None,
-                false,
+                Some(FFMPEG_SHA256),
+                true,
                 &paths::ffmpeg_dir(),
                 tx,
                 cancel,
