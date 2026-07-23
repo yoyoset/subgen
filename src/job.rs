@@ -72,6 +72,20 @@ pub enum WorkerEvent {
     BatchDone,
 }
 
+/// 把翻译失败的行下标(0-based,来自 `translate::TranslateResult::Written`)拼成用户能看懂
+/// 的警告文案:"有 3 行翻译失败,已保留原文(第 45、112、113 条)"——不只是给个数量,让用户
+/// 知道具体是哪几行,不用对着几百行字幕从头核对。最多列出前 5 个具体行号(1-based,和 srt
+/// 里的编号对齐),超过 5 个只列前 5 个加"等",避免大量失败时警告文案本身长到没法看。
+fn format_failed_lines_warning(failed_indices: &[usize]) -> String {
+    let numbers: Vec<String> = failed_indices.iter().take(5).map(|i| (i + 1).to_string()).collect();
+    let list = numbers.join("、");
+    let suffix = if failed_indices.len() > 5 { "等" } else { "" };
+    format!(
+        "有 {} 行翻译失败,已保留原文(第 {list} 条{suffix})",
+        failed_indices.len()
+    )
+}
+
 /// `batch` 是 (界面列表里的原始下标, 视频路径) 对,只包含这次真正要跑的任务——调用方
 /// (main.rs::start_processing)已经把状态是 Done/DoneWithWarning 的任务过滤掉了,重新点
 /// "开始处理" 不会把已完成的文件重新跑一遍。
@@ -243,12 +257,9 @@ pub fn run_batch(
                 );
 
                 match translate_outcome {
-                    Ok(crate::translate::TranslateResult::Written { failed_lines, .. }) => {
-                        if failed_lines > 0 {
-                            append_warning(
-                                &mut warning,
-                                format!("翻译中有 {failed_lines} 行未能对齐,已保留原文"),
-                            );
+                    Ok(crate::translate::TranslateResult::Written { failed_indices }) => {
+                        if !failed_indices.is_empty() {
+                            append_warning(&mut warning, format_failed_lines_warning(&failed_indices));
                         }
                     }
                     Ok(crate::translate::TranslateResult::Skipped(e)) => {
@@ -279,4 +290,21 @@ pub fn run_batch(
         }
         let _ = tx.send(WorkerEvent::BatchDone);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_failed_lines_warning_lists_all_indices_when_five_or_fewer() {
+        let msg = format_failed_lines_warning(&[0, 44, 111]);
+        assert_eq!(msg, "有 3 行翻译失败,已保留原文(第 1、45、112 条)");
+    }
+
+    #[test]
+    fn format_failed_lines_warning_truncates_with_suffix_when_more_than_five() {
+        let msg = format_failed_lines_warning(&[0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(msg, "有 7 行翻译失败,已保留原文(第 1、2、3、4、5 条等)");
+    }
 }

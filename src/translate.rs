@@ -212,7 +212,10 @@ impl Drop for LlamaServer {
 }
 
 pub enum TranslateResult {
-    Written { failed_lines: usize },
+    /// `failed_indices` 是翻译失败、原样保留原文的字幕块下标(0-based,对应 `parse_srt_blocks`
+    /// 返回的顺序),不只是一个数量——界面据此能告诉用户具体是第几条,而不是让用户对着几百
+    /// 条字幕从头找起。
+    Written { failed_indices: Vec<usize> },
     Skipped(String),
 }
 
@@ -244,12 +247,14 @@ pub fn translate_srt(
     if blocks.is_empty() {
         // 没有对白(空字幕)是合理结果,直接写一份同样为空的中文字幕,不算失败
         std::fs::write(&target, "").map_err(|e| format!("写入字幕文件失败: {e}"))?;
-        return Ok(TranslateResult::Written { failed_lines: 0 });
+        return Ok(TranslateResult::Written {
+            failed_indices: Vec::new(),
+        });
     }
 
     let total = blocks.len();
     let mut translated: Vec<String> = Vec::with_capacity(total);
-    let mut failed_lines = 0usize;
+    let mut failed_indices: Vec<usize> = Vec::new();
     let mut done = 0usize;
 
     for chunk in blocks.chunks(BATCH_SIZE) {
@@ -258,7 +263,9 @@ pub fn translate_srt(
         }
         let texts: Vec<String> = chunk.iter().map(|(_, _, t)| t.clone()).collect();
         let (results, failed) = translate_batch_with_retry(server, model, &texts, cancel)?;
-        failed_lines += failed;
+        // failed 是这一批内部(0-based)的下标,加上 done(这一批开始前已经处理过的行数)
+        // 才是相对整份字幕的全局下标。
+        failed_indices.extend(failed.iter().map(|&i| done + i));
         translated.extend(results);
         done += chunk.len();
         progress_cb(
@@ -267,48 +274,72 @@ pub fn translate_srt(
         );
     }
 
-    let out_blocks: Vec<(String, String, String)> = blocks
+    let out_blocks = build_output_blocks(&blocks, &translated, &failed_indices, bilingual);
+
+    std::fs::write(&target, engine::write_srt_blocks(&out_blocks))
+        .map_err(|e| format!("写入字幕文件失败: {e}"))?;
+
+    Ok(TranslateResult::Written { failed_indices })
+}
+
+/// 把原文块和翻译结果拼成最终要写出的字幕块。抽成独立函数是因为这段逻辑不该依赖真实的
+/// llama-server 网络调用就能被测到——翻译失败行的 `translated` 本身就是原文的拷贝(见
+/// `translate_batch_with_retry` 的单行兜底),双语模式下不能再按正常行的逻辑拼一遍原文,
+/// 否则同一句话会重复输出两遍(`{orig}\n{orig}`)——失败行不管双语与否都只输出一遍原文。
+fn build_output_blocks(
+    blocks: &[(String, String, String)],
+    translated: &[String],
+    failed_indices: &[usize],
+    bilingual: bool,
+) -> Vec<(String, String, String)> {
+    let failed_set: std::collections::HashSet<usize> = failed_indices.iter().copied().collect();
+    blocks
         .iter()
         .zip(translated.iter())
-        .map(|((start, end, orig), zh)| {
-            let text = if bilingual {
+        .enumerate()
+        .map(|(i, ((start, end, orig), zh))| {
+            let text = if failed_set.contains(&i) {
+                orig.clone()
+            } else if bilingual {
                 format!("{zh}\n{orig}")
             } else {
                 zh.clone()
             };
             (start.clone(), end.clone(), text)
         })
-        .collect();
-
-    std::fs::write(&target, engine::write_srt_blocks(&out_blocks))
-        .map_err(|e| format!("写入字幕文件失败: {e}"))?;
-
-    Ok(TranslateResult::Written { failed_lines })
+        .collect()
 }
 
 /// 翻译一批字幕行,失败/行数错位时递归对半重试,缩小出错范围;单行仍失败则原样保留该行
-/// (计入失败数,不让整个任务失败——用户仍然拿到完整的字幕,只是个别行没翻译)。
+/// (计入失败下标,不让整个任务失败——用户仍然拿到完整的字幕,只是个别行没翻译)。
+///
+/// 返回值第二项是失败行在 `texts` 里的下标(0-based),不是单纯的计数——上层
+/// `translate_srt` 需要知道具体是哪几行,才能在双语模式下避免对失败行重复拼接原文,
+/// 也能在界面警告里告诉用户具体第几条需要人工核对。
 fn translate_batch_with_retry(
     server: &LlamaServer,
     model: &'static TransModel,
     texts: &[String],
     cancel: &Arc<AtomicBool>,
-) -> Result<(Vec<String>, usize), String> {
+) -> Result<(Vec<String>, Vec<usize>), String> {
     if texts.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), Vec::new()));
     }
     if cancel.load(Ordering::Relaxed) {
         return Err("已取消".to_string());
     }
     match translate_batch_once(server, model, texts) {
-        Ok(results) if results.len() == texts.len() => Ok((results, 0)),
-        _ if texts.len() == 1 => Ok((vec![texts[0].clone()], 1)),
+        Ok(results) if results.len() == texts.len() => Ok((results, Vec::new())),
+        _ if texts.len() == 1 => Ok((vec![texts[0].clone()], vec![0])),
         _ => {
             let mid = texts.len() / 2;
-            let (mut out, fa) = translate_batch_with_retry(server, model, &texts[..mid], cancel)?;
+            let (mut out, mut failed) =
+                translate_batch_with_retry(server, model, &texts[..mid], cancel)?;
             let (b, fb) = translate_batch_with_retry(server, model, &texts[mid..], cancel)?;
             out.extend(b);
-            Ok((out, fa + fb))
+            // fb 是后半段(texts[mid..])内部的下标,加上 mid 才是相对整个 texts 的下标。
+            failed.extend(fb.iter().map(|&i| i + mid));
+            Ok((out, failed))
         }
     }
 }
@@ -451,6 +482,33 @@ fn split_leading_number(line: &str) -> Option<(usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 真实踩过的坑:失败行的 `translated` 值就是原文本身(见 translate_batch_with_retry
+    /// 的单行兜底),按正常行的逻辑拼接会变成"原文\n原文",双语字幕里同一句话重复两遍。
+    #[test]
+    fn build_output_blocks_does_not_duplicate_original_text_for_failed_lines() {
+        let blocks = vec![
+            ("00:00:01,000".to_string(), "00:00:02,000".to_string(), "Hello".to_string()),
+            ("00:00:02,000".to_string(), "00:00:03,000".to_string(), "World".to_string()),
+        ];
+        // 第 0 行翻译成功;第 1 行失败,translated[1] 是原文的拷贝(和真实失败路径一致)
+        let translated = vec!["你好".to_string(), "World".to_string()];
+        let out = build_output_blocks(&blocks, &translated, &[1], true);
+        assert_eq!(out[0].2, "你好\nHello");
+        assert_eq!(out[1].2, "World", "失败行双语模式下不应该重复输出原文");
+    }
+
+    #[test]
+    fn build_output_blocks_success_lines_respect_bilingual_flag() {
+        let blocks = vec![("00:00:01,000".to_string(), "00:00:02,000".to_string(), "Hello".to_string())];
+        let translated = vec!["你好".to_string()];
+
+        let bilingual = build_output_blocks(&blocks, &translated, &[], true);
+        assert_eq!(bilingual[0].2, "你好\nHello");
+
+        let zh_only = build_output_blocks(&blocks, &translated, &[], false);
+        assert_eq!(zh_only[0].2, "你好");
+    }
 
     #[test]
     fn parses_well_formed_numbered_response() {
