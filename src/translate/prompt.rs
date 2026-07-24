@@ -73,7 +73,9 @@ pub(super) fn translate_batch_with_retry(
         return Err("已取消".to_string());
     }
     match translate_batch_once(server, model, texts, context) {
-        Ok(results) if results.len() == texts.len() => Ok((results, Vec::new())),
+        Ok(results) if results.len() == texts.len() => {
+            retry_untranslated_lines(server, model, texts, results, cancel, context)
+        }
         _ if texts.len() == 1 => Ok((vec![texts[0].clone()], vec![0])),
         _ => {
             let mid = texts.len() / 2;
@@ -87,6 +89,62 @@ pub(super) fn translate_batch_with_retry(
             Ok((out, failed))
         }
     }
+}
+
+/// 真实踩过的坑:字幕原文经常是"一句话被切成好几条时间轴"的碎片(比如"...that just
+/// gets you feeling good about, you know,"),批量翻译时模型有时会把这类碎片当成不完整
+/// 句子,要么原样抄回英文不翻译,要么把好几条的意思压缩合并进一条、导致后面几条只剩
+/// 残渣——这两种情况 `parse_numbered_response` 都测不出来(返回的行数是对的,只是内容
+/// 不对),之前完全没有机制发现。
+///
+/// 这里在"格式校验通过"之后再加一层"内容看起来像不像真的翻译过"的检查(`looks_untranslated`,
+/// 只抓"整行原样抄回来"这种最确定的信号,不去猜测更微妙的合并错位,避免误伤正常翻译)。
+/// 命中的行单独、脱离其它 14 行干扰地再问模型一次——很多时候模型是被同批里的其它碎片
+/// 分心了,单独喂反而能给出正确翻译。这次重试仍然不对,才真正计入失败(交给上层
+/// `build_output_blocks`/`format_failed_lines_warning` 走既有的"保留原文 + 提醒用户
+/// 核对"流程,不静默接受一行没翻译的内容)。
+fn retry_untranslated_lines(
+    server: &LlamaServer,
+    model: &'static TransModel,
+    texts: &[String],
+    mut results: Vec<String>,
+    cancel: &Arc<AtomicBool>,
+    context: &[(String, String)],
+) -> Result<(Vec<String>, Vec<usize>), String> {
+    let suspects: Vec<usize> = texts
+        .iter()
+        .zip(results.iter())
+        .enumerate()
+        .filter(|(_, (t, r))| looks_untranslated(t, r))
+        .map(|(i, _)| i)
+        .collect();
+    if suspects.is_empty() {
+        return Ok((results, Vec::new()));
+    }
+
+    let mut still_failed = Vec::new();
+    for i in suspects {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".to_string());
+        }
+        let single = [texts[i].clone()];
+        match translate_batch_once(server, model, &single, context) {
+            Ok(retry) if retry.len() == 1 && !looks_untranslated(&texts[i], &retry[0]) => {
+                results[i] = retry.into_iter().next().unwrap();
+            }
+            _ => still_failed.push(i),
+        }
+    }
+    Ok((results, still_failed))
+}
+
+/// 判断一行"译文"是不是看起来根本没有被翻译、只是把原文抄了回来(大小写不敏感、首尾
+/// 空白不敏感)。只在原文本身含有实际文字内容(字母/汉字/假名等)时才判断——纯符号/
+/// 数字/音乐记号(比如"♪♪♪")本来就没有可翻译的文字,原样返回是对的,不该被当成
+/// 翻译失败。
+pub(super) fn looks_untranslated(original: &str, translated: &str) -> bool {
+    original.chars().any(|c| c.is_alphabetic())
+        && original.trim().eq_ignore_ascii_case(translated.trim())
 }
 
 #[derive(Serialize)]
@@ -194,14 +252,18 @@ fn build_prompt(model: &TransModel, numbered: &str, context: &[(String, String)]
             "你是一个轻小说翻译模型，可以流畅通顺地以日本轻小说的风格将日文翻译成简体中文，\
              并联系上下文正确使用人称代词，不擅自添加原文中没有的代词。\n\
              输入是带编号的多行日文字幕，请严格逐行翻译，保留原有的“编号.”格式，每行只输出一条\
-             译文，不要合并、拆分、增删行，不要输出编号之外的任何解释。"
+             译文，不要合并、拆分、增删行，不要输出编号之外的任何解释。字幕原文经常是被截断的\
+             半句话，即使某一行看起来意思不完整，也只翻译这一行本身给出的文字，不要把它的内容\
+             并入上一行或下一行、也不要为了让译文通顺而擅自补全整句。"
                 .to_string(),
             format!("{context_block}将下面的日文字幕文本翻译成中文：\n{numbered}"),
         ),
         PromptKind::General => (
             "你是专业的字幕翻译员。将用户给出的带编号字幕文本翻译成简体中文。要求:逐行对应翻译,\
              严格保留原有的“编号.”格式,每行只输出一条译文,不要合并或拆分行,不要添加编号之外的\
-             任何解释、注释或原文。"
+             任何解释、注释或原文。字幕原文经常是被截断的半句话,即使某一行看起来意思不完整,\
+             也只翻译这一行本身给出的文字,不要把它的内容并入上一行或下一行、也不要为了让译文\
+             通顺而擅自补全整句。"
                 .to_string(),
             format!("{context_block}{numbered}"),
         ),
@@ -416,4 +478,32 @@ mod tests {
         assert!(parse_numbered_response(content, 2).is_err());
     }
 
+    /// 真实踩过的坑:第 16 集连续 4 行原文是"you know, somewhere where you just take,
+    /// you know,"这类口语碎片,模型原样把英文抄了回来当"译文",行数对得上、
+    /// `parse_numbered_response` 完全测不出来。
+    #[test]
+    fn looks_untranslated_detects_verbatim_echo_of_english_source() {
+        assert!(looks_untranslated(
+            " somewhere where you just take, you know,",
+            "somewhere where you just take, you know,"
+        ));
+    }
+
+    #[test]
+    fn looks_untranslated_is_case_and_whitespace_insensitive() {
+        assert!(looks_untranslated("Hello World", "  hello world  "));
+    }
+
+    #[test]
+    fn looks_untranslated_false_for_real_translation() {
+        assert!(!looks_untranslated("Hello there.", "你好。"));
+    }
+
+    /// 纯符号/音乐记号(比如 whisper 给背景音乐标的"♪♪♪")本来就没有可翻译的文字内容,
+    /// 模型原样返回是对的,不该被误判成"翻译失败"。
+    #[test]
+    fn looks_untranslated_false_for_content_without_letters() {
+        assert!(!looks_untranslated("♪♪♪", "♪♪♪"));
+        assert!(!looks_untranslated("123", "123"));
+    }
 }
