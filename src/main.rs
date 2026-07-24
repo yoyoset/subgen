@@ -86,9 +86,13 @@ fn window_title() -> String {
 /// exe 所在目录只读、建不出锁文件)时按"能启动"处理,不该因为这类边缘情况拦住正常用户。
 fn acquire_single_instance_lock() -> bool {
     let lock_path = paths::app_dir().join("subgen.lock");
+    // 这个文件只用来拿排他锁,从来不写入内容——truncate/append 选哪个都不影响行为,
+    // 显式 truncate(true) 只是消除"create+write 却不说清截断策略"的歧义(clippy
+    // suspicious_open_options 提示过),不是修复真实 bug。
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(true)
         .open(&lock_path)
     {
         Ok(f) => f,

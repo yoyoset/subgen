@@ -134,11 +134,10 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
             ui.heading(name);
             // 钉住了别的文件、但批次还在跑另一个时,给一条能一键跳回去的路——不然用户
             // 查完一个失败文件后,还得自己去左边找回正在跑的那一行。
-            if is_pinned && active.is_some() && active != Some(i) {
-                if ui.small_button("▸ 回到正在处理的文件").clicked() {
+            if is_pinned && active.is_some() && active != Some(i)
+                && ui.small_button("▸ 回到正在处理的文件").clicked() {
                     jump_to_active = true;
                 }
-            }
         });
         ui.add_space(4.0);
 
@@ -152,11 +151,10 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
             let (text, color) = job_status_line(job, app.cancelling);
             ui.colored_label(color, text);
         });
-        if let JobStatus::Failed(_, _, Some(log_path)) = &job.status {
-            if ui.small_button("查看日志").clicked() {
+        if let JobStatus::Failed(_, _, Some(log_path)) = &job.status
+            && ui.small_button("查看日志").clicked() {
                 let _ = std::process::Command::new("notepad").arg(log_path).spawn();
             }
-        }
 
         ui.add_space(8.0);
         ui.separator();
@@ -195,16 +193,14 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
         app.jobs.remove(i);
         app.selected = reconcile_selection(app.selected, i, app.jobs.len());
     } else {
-        if reprocess_clicked {
-            if let Some(j) = app.jobs.get_mut(i) {
+        if reprocess_clicked
+            && let Some(j) = app.jobs.get_mut(i) {
                 j.force_reprocess = true;
             }
-        }
-        if toggle_preview {
-            if let Some(j) = app.jobs.get_mut(i) {
+        if toggle_preview
+            && let Some(j) = app.jobs.get_mut(i) {
                 j.preview_open = !j.preview_open;
             }
-        }
     }
     if let Some(path) = open_folder_path {
         let _ = std::process::Command::new("explorer")

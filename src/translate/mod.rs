@@ -79,11 +79,10 @@ pub fn model_by_key(key: &str) -> Option<&'static TransModel> {
 /// 挑选翻译模型:`selected` 不是 "auto" 时尊重用户手动指定;否则按 `source_lang`
 /// 精确匹配某个模型的 `langs`,匹配不到就落到 `langs` 含 `"*"` 的兜底模型。
 pub fn pick_model(source_lang: &str, selected: &str) -> &'static TransModel {
-    if selected != "auto" {
-        if let Some(m) = model_by_key(selected) {
+    if selected != "auto"
+        && let Some(m) = model_by_key(selected) {
             return m;
         }
-    }
     let lang = source_lang.to_ascii_lowercase();
     MODELS
         .iter()

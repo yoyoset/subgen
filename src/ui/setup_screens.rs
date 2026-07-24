@@ -44,9 +44,8 @@ pub(crate) fn render_needs_download(app: &mut SubgenApp, ui: &mut egui::Ui, miss
                         ui.colored_label(egui::Color32::RED, e);
                     }
                     if let Some((needed, avail)) =
-                        setup::check_disk_space(&missing, &app.config.model, &paths::models_dir())
-                    {
-                        if avail < needed {
+                        setup::check_disk_space(missing, &app.config.model, &paths::models_dir())
+                        && avail < needed {
                             ui.colored_label(
                                 egui::Color32::from_rgb(230, 150, 20),
                                 format!(
@@ -57,7 +56,6 @@ pub(crate) fn render_needs_download(app: &mut SubgenApp, ui: &mut egui::Ui, miss
                                 ),
                             );
                         }
-                    }
                     ui.add_space(12.0);
                     if ui.button("开始下载").clicked() {
                         app.start_downloading();

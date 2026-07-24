@@ -8,15 +8,14 @@ use eframe::egui;
 pub(crate) fn render_queue_panel(app: &mut SubgenApp, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.button("选择视频文件...").clicked() {
-            if let Some(files) = rfd::FileDialog::new()
+        if ui.button("选择视频文件...").clicked()
+            && let Some(files) = rfd::FileDialog::new()
                 .add_filter("视频", SubgenApp::VIDEO_EXTENSIONS)
                 .set_title("选择要生成字幕的视频文件")
                 .pick_files()
             {
                 app.add_files(files);
             }
-        }
         // 处理中直接置灰禁用,而不是"按钮外观正常、点了却静默无效"——那种写法会让用户
         // 以为按钮坏了,反复点击也得不到任何反馈。
         if ui

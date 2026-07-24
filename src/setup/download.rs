@@ -132,6 +132,7 @@ fn hash_existing(path: &Path) -> (Sha256, u64) {
 /// - HuggingFace:换成 hf-mirror.com,只替换域名、路径不变——这是国内 ML 社区公认的标准
 ///   HuggingFace 镜像方案。
 /// - GitHub:整个 URL 前面加 GITHUB_PROXY_PREFIX 反代前缀。
+///
 /// 其他域名(目前只有 ffmpeg 用的 GitHub,已经在上面覆盖)原样返回,不额外处理。
 fn url_candidates(url: &str) -> Vec<String> {
     let mut out = vec![url.to_string()];

@@ -410,15 +410,13 @@ impl SubgenApp {
                             queue,
                             ..
                         } = &mut self.setup_phase
-                        {
-                            if !queue.is_empty() {
+                            && !queue.is_empty() {
                                 let next = queue.remove(0);
                                 *current_label = next.label().to_string();
                                 *current_index += 1;
                                 *downloaded = 0;
                                 *total = 0;
                             }
-                        }
                     }
                     SetupEvent::Failed(e) => failed = Some(e),
                     SetupEvent::AllReady => done = true,

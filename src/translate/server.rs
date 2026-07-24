@@ -101,11 +101,9 @@ impl LlamaServer {
             if let Ok(resp) = health_client
                 .get(format!("http://127.0.0.1:{PORT}/health"))
                 .send()
-            {
-                if resp.status().is_success() {
+                && resp.status().is_success() {
                     break;
                 }
-            }
             if std::time::Instant::now() > deadline {
                 let _ = child.kill();
                 let _ = child.wait();
