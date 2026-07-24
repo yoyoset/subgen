@@ -11,11 +11,11 @@ mod job_guard;
 mod paths;
 mod setup;
 mod translate;
+mod ui;
 
 use app::SubgenApp;
 use config::Config;
 use eframe::egui;
-use job::{Job, JobStatus};
 use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
@@ -167,96 +167,6 @@ fn setup_chinese_fonts(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
 }
-
-
-/// 展开的字幕预览区:优先读中文翻译字幕(`Video.zh.srt`),没有就读原文字幕
-/// (`Video.srt`),取前 10 条逐行显示"时间戳 + 文本"。这是验证翻译/识别质量最低成本的
-/// 方式——不用离开软件、不用打开资源管理器找文件,10 秒内就能看出这次结果靠不靠谱。
-/// 读不到文件(比如用户手动删了、移动了)显示一句人话而不是静默空白或 panic。
-fn render_subtitle_preview(ui: &mut egui::Ui, job: &Job) {
-    let zh = paths::sidecar_srt_lang_path(&job.video_path, "zh");
-    let path = if zh.is_file() {
-        Some(zh)
-    } else {
-        let srt = paths::sidecar_srt_path(&job.video_path);
-        if srt.is_file() {
-            Some(srt)
-        } else {
-            None
-        }
-    };
-
-    egui::Frame::default()
-        .inner_margin(egui::Margin::symmetric(12, 8))
-        .fill(ui.visuals().faint_bg_color)
-        .show(ui, |ui| match path.and_then(|p| std::fs::read_to_string(&p).ok()) {
-            Some(content) => {
-                let blocks = engine::parse_srt_blocks(&content);
-                if blocks.is_empty() {
-                    ui.label("(字幕为空,没有识别出对白)");
-                } else {
-                    for (start, _end, text) in blocks.iter().take(10) {
-                        ui.label(format!("{start}  {text}"));
-                    }
-                    if blocks.len() > 10 {
-                        ui.weak(format!("……(共 {} 条,仅预览前 10 条)", blocks.len()));
-                    }
-                }
-            }
-            None => {
-                ui.label("字幕文件已不在原位置(可能被移动或删除了)");
-            }
-        });
-}
-
-/// 画流水线步骤条(比如"✓提取 › ●识别 › ○翻译")。`translate_enabled` 决定要不要画"翻译"
-/// 这一步——没开翻译的话流水线只有两步,画第三步没有意义,只会让人以为漏了什么。
-/// Pending/Skipped/Cancelled 这几种状态没有明确的"当前处于哪个阶段"可言,不画步骤条,
-/// 靠下面单独一行的状态文案说明就够了。
-fn render_stage_stepper(ui: &mut egui::Ui, status: &JobStatus, translate_enabled: bool) {
-    let stages: &[job::Stage] = if translate_enabled {
-        &[
-            job::Stage::ExtractAudio,
-            job::Stage::Transcribe,
-            job::Stage::Translate,
-        ]
-    } else {
-        &[job::Stage::ExtractAudio, job::Stage::Transcribe]
-    };
-
-    let (current_ord, is_failed, is_all_done) = match status {
-        JobStatus::Running(stage, _, _) => (Some(stage.ordinal()), false, false),
-        JobStatus::Failed(stage, _, _) => (Some(stage.ordinal()), true, false),
-        JobStatus::Done(_) | JobStatus::DoneWithWarning(..) => (None, false, true),
-        _ => return,
-    };
-
-    const DONE_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 170, 60);
-    const RUNNING_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 150, 230);
-    const FAIL_COLOR: egui::Color32 = egui::Color32::RED;
-    const PENDING_COLOR: egui::Color32 = egui::Color32::GRAY;
-
-    ui.horizontal(|ui| {
-        for (i, stage) in stages.iter().enumerate() {
-            let ord = stage.ordinal();
-            let (glyph, color) = if is_all_done {
-                ("✓", DONE_COLOR)
-            } else {
-                match current_ord {
-                    Some(cur) if ord < cur => ("✓", DONE_COLOR),
-                    Some(cur) if ord == cur && is_failed => ("✗", FAIL_COLOR),
-                    Some(cur) if ord == cur => ("●", RUNNING_COLOR),
-                    _ => ("○", PENDING_COLOR),
-                }
-            };
-            ui.colored_label(color, format!("{glyph}{}", stage.label()));
-            if i + 1 < stages.len() {
-                ui.label("›");
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
