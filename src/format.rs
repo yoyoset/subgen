@@ -234,6 +234,107 @@ pub fn job_status_line(job: &Job, cancelling: bool) -> (String, eframe::egui::Co
     }
 }
 
+/// 队列里单行状态点的颜色,和 `job_status_line`/步骤条用的是同一套配色语义(绿=完成、
+/// 橙=有提示、红=失败、灰=中性/终止态),Running 单独用步骤条的"进行中"蓝色而不是
+/// `job_status_line` 文字用的浅灰——队列行缩成一行后,这个点是唯一能一眼分辨"正在跑的是
+/// 哪一条"的视觉元素,不能和"等待中"用同一个灰。
+pub fn status_dot_color(status: &JobStatus) -> eframe::egui::Color32 {
+    match status {
+        JobStatus::Pending => eframe::egui::Color32::GRAY,
+        JobStatus::Running(..) => eframe::egui::Color32::from_rgb(90, 150, 230),
+        JobStatus::Done(report) if report.empty_subtitle() => eframe::egui::Color32::GRAY,
+        JobStatus::Done(_) => eframe::egui::Color32::from_rgb(60, 170, 60),
+        JobStatus::DoneWithWarning(..) => eframe::egui::Color32::from_rgb(230, 150, 20),
+        JobStatus::Skipped(_) => eframe::egui::Color32::GRAY,
+        JobStatus::Failed(..) => eframe::egui::Color32::RED,
+        JobStatus::Cancelled => eframe::egui::Color32::GRAY,
+    }
+}
+
+/// 队列缩成一行后,行内只留得下几个字的状态摘要(完整文案留给详情区的 `job_status_line`)。
+pub fn compact_status_text(job: &Job) -> String {
+    match &job.status {
+        JobStatus::Pending => "等待中".to_string(),
+        JobStatus::Running(stage, _, pct) => match pct {
+            Some(pct) => format!("{} {pct:.0}%", stage.label()),
+            None => stage.label().to_string(),
+        },
+        JobStatus::Done(report) if report.empty_subtitle() => "完成(字幕为空)".to_string(),
+        JobStatus::Done(_) => "完成".to_string(),
+        JobStatus::DoneWithWarning(..) => "完成 · 建议核对".to_string(),
+        JobStatus::Skipped(_) => "已跳过".to_string(),
+        JobStatus::Failed(stage, ..) => format!("{}失败", stage.label()),
+        JobStatus::Cancelled => "已取消".to_string(),
+    }
+}
+
+/// 当前正在处理的任务在 `jobs` 里的下标——串行单 worker,任何时刻至多一个 Running。
+/// 详情区"自动跟随"就是跟着这个下标走;找不到(没有任务在跑)时返回 None。
+pub fn active_job_index(jobs: &[Job]) -> Option<usize> {
+    jobs.iter().position(|j| matches!(j.status, JobStatus::Running(..)))
+}
+
+/// 从 `jobs` 里移除下标 `removed` 之后,原来钉住的 `selected` 该指向哪:钉住的正好是被
+/// 移除的那一行 → 回到 None(自动跟随);钉住的在被移除行之后 → 整体前移一位跟着补位;
+/// 钉住的在之前 → 不受影响。`new_len` 兜底越界情况(防御性:理论上不会发生,但避免
+/// 万一上游调用顺序错了导致后续 `jobs.get(selected)` panic)。
+pub fn reconcile_selection(selected: Option<usize>, removed: usize, new_len: usize) -> Option<usize> {
+    let adjusted = match selected {
+        None => return None,
+        Some(i) if i == removed => return None,
+        Some(i) if i > removed => i - 1,
+        Some(i) => i,
+    };
+    if adjusted < new_len {
+        Some(adjusted)
+    } else {
+        None
+    }
+}
+
+/// 线性外推批次剩余时间:用"已完成 done 个用了 elapsed"的平均速度估算剩下 (total-done)
+/// 个还要多久。`done == 0` 时没有速度样本,不给出估算(强行外推第一个还没完成的样本
+/// 波动极大,没有参考价值,和 `job_status_line` 里单文件 ETA 至少要 5% 进度才显示是
+/// 同一个道理)。
+pub fn estimate_batch_remaining(
+    elapsed: std::time::Duration,
+    done: usize,
+    total: usize,
+) -> Option<std::time::Duration> {
+    if done == 0 || total <= done {
+        return None;
+    }
+    let per_item = elapsed / done as u32;
+    Some(per_item * (total - done) as u32)
+}
+
+/// 从 `jobs` + 这一批的原始下标列表算出"第几个/共几个":`total` 是批次大小,`done` 是
+/// 已经到终态(不管成功/失败/跳过/取消)的数量。窗口标题(`app.rs::poll_worker`)和批次条
+/// 都要用同一套计数,抽成一个纯函数,避免两处各写一遍、以后改了口径只改一处漏了另一处。
+pub fn batch_progress_counts(jobs: &[Job], batch_indices: &[usize]) -> (usize, usize) {
+    let total = batch_indices.len();
+    let done = batch_indices
+        .iter()
+        .filter(|&&i| jobs.get(i).is_some_and(|j| j.status.is_terminal()))
+        .count();
+    (done, total)
+}
+
+/// 批次条上的一行进度文案,比如"第 7/20 个 · 预计剩 48 分钟 · 已用 31 分钟"。`done` 是
+/// 已经到终态(不管成功/失败/跳过/取消)的数量,`current` 是"正在进行的是第几个"
+/// (`done + 1`,封顶在 `total`)。
+pub fn format_batch_progress_line(current: usize, total: usize, elapsed: std::time::Duration, done: usize) -> String {
+    let mut line = format!("第 {current}/{total} 个 · 已用 {}", format_elapsed(elapsed.as_secs()));
+    if let Some(remaining) = estimate_batch_remaining(elapsed, done, total) {
+        line = format!(
+            "第 {current}/{total} 个 · 预计剩 {} · 已用 {}",
+            format_elapsed(remaining.as_secs()),
+            format_elapsed(elapsed.as_secs())
+        );
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +581,89 @@ mod tests {
             repetition_at: None,
         };
         assert_eq!(format_job_report_suffix(&report), " · 英语");
+    }
+
+    fn job_with(status: JobStatus) -> Job {
+        Job {
+            video_path: PathBuf::from("test.mkv"),
+            status,
+            started_at: None,
+            force_reprocess: false,
+            preview_open: false,
+        }
+    }
+
+    #[test]
+    fn active_job_index_finds_the_single_running_job() {
+        let jobs = vec![
+            job_with(JobStatus::Done(crate::job::JobReport::default())),
+            job_with(JobStatus::Running(crate::job::Stage::Transcribe, "x".to_string(), None)),
+            job_with(JobStatus::Pending),
+        ];
+        assert_eq!(active_job_index(&jobs), Some(1));
+    }
+
+    #[test]
+    fn active_job_index_none_when_nothing_running() {
+        let jobs = vec![job_with(JobStatus::Pending), job_with(JobStatus::Cancelled)];
+        assert_eq!(active_job_index(&jobs), None);
+    }
+
+    #[test]
+    fn reconcile_selection_clears_when_removed_row_was_selected() {
+        assert_eq!(reconcile_selection(Some(2), 2, 4), None);
+    }
+
+    #[test]
+    fn reconcile_selection_shifts_down_when_removed_row_was_before_selection() {
+        assert_eq!(reconcile_selection(Some(3), 1, 4), Some(2));
+    }
+
+    #[test]
+    fn reconcile_selection_unaffected_when_removed_row_was_after_selection() {
+        assert_eq!(reconcile_selection(Some(1), 3, 4), Some(1));
+    }
+
+    #[test]
+    fn reconcile_selection_passes_through_none() {
+        assert_eq!(reconcile_selection(None, 0, 3), None);
+    }
+
+    #[test]
+    fn estimate_batch_remaining_none_without_any_completed_sample() {
+        assert_eq!(
+            estimate_batch_remaining(std::time::Duration::from_secs(60), 0, 10),
+            None
+        );
+    }
+
+    #[test]
+    fn estimate_batch_remaining_extrapolates_linearly_from_average_pace() {
+        // 4 个用了 60 秒(每个 15 秒),剩 6 个 → 90 秒。
+        let remaining = estimate_batch_remaining(std::time::Duration::from_secs(60), 4, 10).unwrap();
+        assert_eq!(remaining, std::time::Duration::from_secs(90));
+    }
+
+    #[test]
+    fn format_batch_progress_line_includes_eta_once_available() {
+        let line = format_batch_progress_line(5, 10, std::time::Duration::from_secs(60), 4);
+        assert_eq!(line, "第 5/10 个 · 预计剩 1分30秒 · 已用 1分0秒");
+    }
+
+    #[test]
+    fn format_batch_progress_line_omits_eta_before_first_sample() {
+        let line = format_batch_progress_line(1, 10, std::time::Duration::from_secs(5), 0);
+        assert_eq!(line, "第 1/10 个 · 已用 5秒");
+    }
+
+    #[test]
+    fn batch_progress_counts_counts_only_terminal_states_within_the_batch() {
+        let jobs = vec![
+            job_with(JobStatus::Done(crate::job::JobReport::default())), // 下标 0,不在这批里
+            job_with(JobStatus::Done(crate::job::JobReport::default())), // 下标 1,这批的
+            job_with(JobStatus::Running(crate::job::Stage::Transcribe, "x".to_string(), None)), // 下标 2,这批的,还没到终态
+        ];
+        let (done, total) = batch_progress_counts(&jobs, &[1, 2]);
+        assert_eq!((done, total), (1, 2));
     }
 }

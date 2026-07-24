@@ -77,6 +77,19 @@ pub struct SubgenApp {
     /// 上一批结束时生成的汇总文案("17 个成功、2 个建议核对、1 个失败"这种),下一批开始
     /// 时清空——批次跑完前用户看到的应该是上一批的结果还是空白,不该是半新不旧的状态。
     pub(crate) last_summary: Option<String>,
+    /// 详情区当前钉住的任务行下标(界面列表原始下标)。None = 自动跟随正在处理的那一个
+    /// (单 GPU 串行处理,任何时刻至多一个文件在跑,天然有唯一的默认关注对象,见
+    /// `format::active_job_index`);Some(i) = 用户手动点选过某一行,详情区钉住显示它,
+    /// 不再跟着处理进度跳动,方便一边继续跑一边查看别的文件。`jobs` 长度变化(移除某行)
+    /// 时用 `format::reconcile_selection` 校正,避免指向已经不存在的下标。
+    pub(crate) selected: Option<usize>,
+    /// "设置"浮窗是否展开。按需弹出而不是常驻顶部——设置是批次之间的低频操作,处理中
+    /// 整块常驻却大部分时间不可用,反而是最容易让人困惑的界面状态。
+    pub(crate) settings_open: bool,
+    /// "组件/存放位置"浮窗是否展开,和设置浮窗是两个独立入口(而不是揉进设置里)——
+    /// 模型存放目录这类"环境"信息在处理中依然可能想查看(比如确认这次到底用的是哪个
+    /// 目录),不该和"改了要下一批才生效"的设置项混在一起。
+    pub(crate) components_open: bool,
 }
 
 impl SubgenApp {
@@ -104,6 +117,9 @@ impl SubgenApp {
             last_title_progress: None,
             batch_started_at: None,
             last_summary: None,
+            selected: None,
+            settings_open: false,
+            components_open: false,
         }
     }
 
@@ -444,13 +460,8 @@ impl SubgenApp {
         // 标题带上"第 N/M 个"——用户切到别的窗口干活时,任务栏悬停就能看到大致进度,
         // 不用切回来才知道跑到哪了。只在进度真的变化时才发 Title 命令,不是每帧都发。
         if self.processing && !self.batch_indices.is_empty() {
-            let total = self.batch_indices.len();
-            let terminal_count = self
-                .batch_indices
-                .iter()
-                .filter(|&&i| self.jobs.get(i).is_some_and(|j| j.status.is_terminal()))
-                .count();
-            let current = (terminal_count + 1).min(total);
+            let (done, total) = batch_progress_counts(&self.jobs, &self.batch_indices);
+            let current = (done + 1).min(total);
             if self.last_title_progress != Some((current, total)) {
                 self.last_title_progress = Some((current, total));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
