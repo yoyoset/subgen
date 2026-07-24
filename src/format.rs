@@ -1,0 +1,484 @@
+/// 纯格式化小函数:把数字/状态/枚举值转成界面显示用的人话字符串,或对数据做简单的业务
+/// 逻辑判断(比如"这条任务应不应该纳入这一批处理")。
+/// 这些函数不依赖 SubgenApp 的私有状态,搬家到独立文件不涉及可见性改动,也不涉及
+/// 新的跨文件依赖(只依赖既有的 job/paths 等模块)。
+
+use crate::job::{Job, JobStatus};
+use crate::paths;
+use std::path::PathBuf;
+
+/// 判断某个任务是否应该被这一次"开始处理"纳入批次:还没到成功终态的任务本来就该跑
+/// (失败/跳过/取消都值得重试),或者用户在任务行显式点了"重新处理"——即使已经是
+/// Done/DoneWithWarning 终态也要纳入,并且 job::run_batch 会用 force 标志让它真正
+/// 重新跑一遍,不是复用旧结果。
+pub fn should_include_in_batch(job: &Job) -> bool {
+    job.force_reprocess
+        || !matches!(job.status, JobStatus::Done(_) | JobStatus::DoneWithWarning(..))
+}
+
+/// "打开文件夹"要选中的文件:完成态(不管有没有警告)优先选中生成的字幕——双语/仅中文
+/// 场景下是 `Video.zh.srt`,没有翻译则是同名 `Video.srt`;其它状态(还没跑完/失败/跳过)
+/// 没有稳定可用的产物,选中视频本身本来就是用户想找的东西。
+pub fn reveal_path_for(job: &Job) -> PathBuf {
+    if matches!(job.status, JobStatus::Done(_) | JobStatus::DoneWithWarning(..)) {
+        let zh = paths::sidecar_srt_lang_path(&job.video_path, "zh");
+        if zh.is_file() {
+            return zh;
+        }
+        let srt = paths::sidecar_srt_path(&job.video_path);
+        if srt.is_file() {
+            return srt;
+        }
+    }
+    job.video_path.clone()
+}
+
+/// 追加一行日志:既存进界面日志区(`log_lines`),也同步落盘到 `logs/app.log`——`log_lines`
+/// 只在内存里,关窗即丢,用户报障时"把 logs 文件夹发我"这句话要成立,日志就得先落盘。
+/// 时间戳格式和 crash.log(见 install_panic_logger)保持一致,用 unix 时间戳而不是拼日历
+/// 时间,没有额外引入日期时间处理依赖。写盘失败(比如目录还没建出来)静默忽略,这只是个
+/// 附加的排障能力,不该反过来影响主流程。
+///
+/// 写成自由函数、只接收 `&mut Vec<String>` 而不是 `&mut SubgenApp` 方法——调用方常常是
+/// 先 `if let Some(rx) = &self.xxx_rx { while ... }` 借着 `rx` 读事件、循环体里再要记日志,
+/// 如果写成 `&mut self` 方法,会和外层对 `self.xxx_rx` 的借用冲突(借用检查器认为方法调用
+/// 需要整个 `self` 的独占访问权);只借 `log_lines` 这一个字段就没有这个问题。
+pub fn push_log(log_lines: &mut Vec<String>, line: String) {
+    let _ = std::fs::create_dir_all(paths::logs_dir());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths::logs_dir().join("app.log"))
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "[unix {timestamp}] {line}");
+    }
+    log_lines.push(line);
+}
+
+/// 把秒数格式化成 "12s" 或 "1分23秒" 这种人可读的形式,用于界面上的"已运行"计时。
+pub fn format_elapsed(total_secs: u64) -> String {
+    if total_secs < 60 {
+        format!("{total_secs}秒")
+    } else {
+        let m = total_secs / 60;
+        let s = total_secs % 60;
+        format!("{m}分{s}秒")
+    }
+}
+
+/// 批次结束时拼一句汇总,比如"本批完成:17 个成功、2 个建议核对、1 个失败(共用时
+/// 23分14秒)"。之前批次跑完只能靠肉眼扫一遍任务列表数有几个失败/警告,20 集里混着看很
+/// 容易漏掉;现在结束时直接给一个数字上的总结。只统计 `batch_indices` 里的任务(这一批
+/// 真正处理过的),不是整个任务列表——列表里可能还有上一批已经成功、这一批没碰过的文件。
+pub fn build_batch_summary(jobs: &[Job], batch_indices: &[usize], elapsed: std::time::Duration) -> String {
+    let mut done = 0u32;
+    let mut warned = 0u32;
+    let mut failed = 0u32;
+    let mut skipped = 0u32;
+    let mut cancelled = 0u32;
+    for &i in batch_indices {
+        if let Some(status) = jobs.get(i).map(|j| &j.status) {
+            match status {
+                JobStatus::Done(_) => done += 1,
+                JobStatus::DoneWithWarning(..) => warned += 1,
+                JobStatus::Failed(..) => failed += 1,
+                JobStatus::Skipped(_) => skipped += 1,
+                JobStatus::Cancelled => cancelled += 1,
+                JobStatus::Pending | JobStatus::Running(..) => {}
+            }
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if done > 0 {
+        parts.push(format!("{done} 个成功"));
+    }
+    if warned > 0 {
+        parts.push(format!("{warned} 个建议核对"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} 个失败"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} 个跳过"));
+    }
+    if cancelled > 0 {
+        parts.push(format!("{cancelled} 个已取消"));
+    }
+    let counts = if parts.is_empty() {
+        "没有任务被处理".to_string()
+    } else {
+        parts.join("、")
+    };
+
+    let mut summary = format!("本批完成:{counts}(共用时 {})", format_elapsed(elapsed.as_secs()));
+    // 有需要用户看一眼的项时,顺手提示一句去哪找——不重排列表顺序(用户对列表顺序有
+    // 预期,批次跑完突然打乱反而更难找),颜色区分现有机制已经覆盖,只是加一句指引。
+    if warned > 0 || failed > 0 {
+        summary.push_str("(建议核对与失败的项已在列表中用颜色标出)");
+    }
+    summary
+}
+
+/// 把字节数格式化成下载页面看着顺眼的大小单位:≥1GB 显示到 GB(1 位小数),否则显示到
+/// MB(1 位小数)。只用于下载组件大小提示,不追求通用场景。
+pub fn format_download_size(bytes: u64) -> String {
+    const GB: f64 = 1_073_741_824.0;
+    const MB: f64 = 1_048_576.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes / GB)
+    } else {
+        format!("{:.1} MB", bytes / MB)
+    }
+}
+
+/// 把 ISO 639-1 语言代码翻成用户能看懂的中文名,覆盖界面语言下拉框里的选项(见
+/// Config::AVAILABLE_MODELS 旁边那个语言下拉的选项列表:auto/en/zh/ja/ko/fr/de/es)。
+/// 没覆盖到的代码原样返回而不是显示"未知"——保留原始信息总比丢掉信息更安全,万一以后
+/// whisper 检测出一个列表之外的语言代码,用户至少还能看到那串代码去查。
+pub fn lang_display(code: &str) -> &str {
+    match code {
+        "auto" => "自动检测",
+        "en" => "英语",
+        "zh" => "中文",
+        "ja" => "日语",
+        "ko" => "韩语",
+        "fr" => "法语",
+        "de" => "德语",
+        "es" => "西班牙语",
+        other => other,
+    }
+}
+
+/// 把一次成功处理的 JobReport 拼成"完成"后面跟着的补充信息,比如
+/// " · 日语 · Sakura 7B(日→中,轻小说风格)(复用了上次的识别结果)"。让用户在结果不理想时
+/// 至少知道用的是哪个语言、哪个翻译模型、这次是不是复用了旧结果——不用被动接受一个孤零零
+/// 的"完成"、猜不出问题出在哪个环节。
+pub fn format_job_report_suffix(report: &crate::job::JobReport) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(lang) = &report.detected_language {
+        parts.push(lang_display(lang));
+    }
+    if let Some(model) = report.translate_model_label {
+        parts.push(model);
+    }
+    let mut suffix = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    };
+    if report.reused_transcript {
+        suffix.push_str("(复用了上次的识别结果)");
+    }
+    suffix
+}
+
+/// 生成任务行第二行的详细状态文案 + 配色。`cancelling` 为 true 时(用户点了取消、批次还没
+/// 真正停下来),正在跑的那一条任务额外附一句"正在取消,等当前步骤结束"——不然用户点完
+/// 取消后看到这一行还在正常显示进度百分比,会以为取消没生效。
+pub fn job_status_line(job: &Job, cancelling: bool) -> (String, eframe::egui::Color32) {
+    match &job.status {
+        JobStatus::Pending => ("等待中".to_string(), eframe::egui::Color32::GRAY),
+        JobStatus::Running(_, text, pct) => {
+            let elapsed = job.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            let elapsed_str = format_elapsed(elapsed);
+            // 百分比太小或刚开始跑时,线性外推出来的剩余时间波动极大(比如 1% 时算出来的
+            // "约剩" 可能离谱到几十分钟),没有参考价值,只在有一定进度基础后才显示。
+            let mut text = match pct {
+                Some(pct) if *pct >= 5.0 && elapsed >= 10 => {
+                    let eta_secs = (elapsed as f32 * (100.0 - pct) / pct).round() as u64;
+                    format!(
+                        "{text} {pct:.0}%(已运行 {elapsed_str},约剩 {})",
+                        format_elapsed(eta_secs)
+                    )
+                }
+                Some(pct) => format!("{text} {pct:.0}%(已运行 {elapsed_str})"),
+                None => format!("{text}(已运行 {elapsed_str})"),
+            };
+            if cancelling {
+                text.push_str("(正在取消,等当前步骤结束)");
+            }
+            (text, eframe::egui::Color32::LIGHT_GRAY)
+        }
+        JobStatus::Done(report) => {
+            if report.empty_subtitle() {
+                // 空字幕是合理结果(片段确实没有对白),不是软件坏了——但如果只显示"完成"
+                // 两个字,用户在播放器里加载不出字幕文件时,唯一的结论会是"这个软件坏了"。
+                (
+                    "完成(未检测到对白,字幕为空)".to_string(),
+                    eframe::egui::Color32::from_rgb(60, 170, 60),
+                )
+            } else {
+                (
+                    format!("完成{}", format_job_report_suffix(report)),
+                    eframe::egui::Color32::from_rgb(60, 170, 60),
+                )
+            }
+        }
+        JobStatus::DoneWithWarning(reason, report) => (
+            format!("完成,但有提示: {reason}{}", format_job_report_suffix(report)),
+            eframe::egui::Color32::from_rgb(230, 150, 20),
+        ),
+        JobStatus::Skipped(reason) => (format!("跳过: {reason}"), eframe::egui::Color32::GRAY),
+        JobStatus::Failed(stage, reason, _) => (
+            format!("{}阶段失败: {reason}", stage.label()),
+            eframe::egui::Color32::RED,
+        ),
+        JobStatus::Cancelled => ("已取消".to_string(), eframe::egui::Color32::GRAY),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_download_size_switches_between_mb_and_gb_at_one_gb() {
+        assert_eq!(format_download_size(885_098), "0.8 MB");
+        assert_eq!(format_download_size(1_073_741_824), "1.0 GB");
+        assert_eq!(format_download_size(3_095_033_483), "2.9 GB");
+    }
+
+    fn job_with_status(status: JobStatus) -> Job {
+        Job {
+            video_path: PathBuf::from("test.mkv"),
+            status,
+            started_at: None,
+            force_reprocess: false,
+            preview_open: false,
+        }
+    }
+
+    #[test]
+    fn should_include_in_batch_retries_non_success_states_without_force() {
+        assert!(should_include_in_batch(&job_with_status(JobStatus::Pending)));
+        assert!(should_include_in_batch(&job_with_status(JobStatus::Skipped(
+            "s".to_string()
+        ))));
+        assert!(should_include_in_batch(&job_with_status(JobStatus::Failed(
+            crate::job::Stage::Transcribe,
+            "f".to_string(),
+            None
+        ))));
+        assert!(should_include_in_batch(&job_with_status(JobStatus::Cancelled)));
+    }
+
+    #[test]
+    fn should_include_in_batch_excludes_finished_success_states_unless_forced() {
+        let done = job_with_status(JobStatus::Done(crate::job::JobReport::default()));
+        assert!(
+            !should_include_in_batch(&done),
+            "普通重跑不该把已经成功的任务再跑一遍"
+        );
+
+        let mut forced_done = done;
+        forced_done.force_reprocess = true;
+        assert!(
+            should_include_in_batch(&forced_done),
+            "用户点了'重新处理'即使是 Done 状态也该纳入这一批"
+        );
+
+        let mut forced_warned =
+            job_with_status(JobStatus::DoneWithWarning("w".to_string(), crate::job::JobReport::default()));
+        forced_warned.force_reprocess = true;
+        assert!(should_include_in_batch(&forced_warned));
+    }
+
+    #[test]
+    fn reveal_path_for_prefers_generated_subtitle_when_done() {
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_reveal_path_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video_path = dir.join("Episode.mkv");
+        std::fs::write(&video_path, b"fake video").unwrap();
+
+        // 完成态但还没有任何字幕文件落地(理论上不该发生,但防御性地验证:找不到字幕就
+        // 退回视频本身,而不是返回一个不存在的路径)。
+        let mut job = job_with_status(JobStatus::Done(crate::job::JobReport::default()));
+        job.video_path = video_path.clone();
+        assert_eq!(reveal_path_for(&job), video_path);
+
+        // 只有原文字幕(没开翻译的场景)
+        let plain_srt = paths::sidecar_srt_path(&video_path);
+        std::fs::write(&plain_srt, "1\n00:00:01,000 --> 00:00:02,000\nHello.\n\n").unwrap();
+        assert_eq!(reveal_path_for(&job), plain_srt);
+
+        // 有中文翻译字幕时优先选中它,而不是原文字幕
+        let zh_srt = paths::sidecar_srt_lang_path(&video_path, "zh");
+        std::fs::write(&zh_srt, "1\n00:00:01,000 --> 00:00:02,000\n你好。\n\n").unwrap();
+        assert_eq!(reveal_path_for(&job), zh_srt);
+
+        // 非完成态(比如 Failed)不管字幕文件在不在,都该选中视频本身
+        let mut failed_job =
+            job_with_status(JobStatus::Failed(crate::job::Stage::Transcribe, "f".to_string(), None));
+        failed_job.video_path = video_path.clone();
+        assert_eq!(reveal_path_for(&failed_job), video_path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_batch_summary_counts_each_status_and_lists_them_in_order() {
+        let jobs = vec![
+            job_with_status(JobStatus::Done(crate::job::JobReport::default())),
+            job_with_status(JobStatus::Done(crate::job::JobReport::default())),
+            job_with_status(JobStatus::DoneWithWarning(
+                "w".to_string(),
+                crate::job::JobReport::default(),
+            )),
+            job_with_status(JobStatus::Failed(crate::job::Stage::Transcribe, "f".to_string(), None)),
+            job_with_status(JobStatus::Skipped("s".to_string())),
+        ];
+        let batch_indices = vec![0, 1, 2, 3, 4];
+        let summary =
+            build_batch_summary(&jobs, &batch_indices, std::time::Duration::from_secs(74));
+        assert_eq!(
+            summary,
+            "本批完成:2 个成功、1 个建议核对、1 个失败、1 个跳过(共用时 1分14秒)\
+             (建议核对与失败的项已在列表中用颜色标出)"
+        );
+    }
+
+    #[test]
+    fn build_batch_summary_omits_zero_categories_and_hint_when_all_succeeded() {
+        let jobs = vec![
+            job_with_status(JobStatus::Done(crate::job::JobReport::default())),
+            job_with_status(JobStatus::Done(crate::job::JobReport::default())),
+        ];
+        let batch_indices = vec![0, 1];
+        let summary =
+            build_batch_summary(&jobs, &batch_indices, std::time::Duration::from_secs(5));
+        assert_eq!(summary, "本批完成:2 个成功(共用时 5秒)");
+        assert!(!summary.contains("建议核对"), "全部成功时不该出现其它类别: {summary}");
+        assert!(!summary.contains("已在列表中用颜色标出"), "全部成功时不该出现核对提示: {summary}");
+    }
+
+    #[test]
+    fn build_batch_summary_only_counts_jobs_in_this_batch() {
+        // 列表里可能还有上一批已经成功、这一批完全没碰过的文件,不该被算进这一批的汇总。
+        let jobs = vec![
+            job_with_status(JobStatus::Done(crate::job::JobReport::default())), // 上一批的,不在这次 batch_indices 里
+            job_with_status(JobStatus::Failed(crate::job::Stage::ExtractAudio, "f".to_string(), None)),
+        ];
+        let batch_indices = vec![1];
+        let summary =
+            build_batch_summary(&jobs, &batch_indices, std::time::Duration::from_secs(1));
+        assert_eq!(summary, "本批完成:1 个失败(共用时 1秒)(建议核对与失败的项已在列表中用颜色标出)");
+    }
+
+    fn running_job_with_elapsed(pct: Option<f32>, elapsed_secs: u64) -> Job {
+        Job {
+            video_path: PathBuf::from("test.mkv"),
+            status: JobStatus::Running(crate::job::Stage::Transcribe, "正在识别语音...".to_string(), pct),
+            started_at: Some(
+                std::time::Instant::now() - std::time::Duration::from_secs(elapsed_secs),
+            ),
+            force_reprocess: false,
+            preview_open: false,
+        }
+    }
+
+    #[test]
+    fn job_status_line_shows_eta_once_progress_and_elapsed_pass_thresholds() {
+        // 60 秒跑了 25%,线性外推:剩余 75% 还要 60 * 75/25 = 180 秒 = 3 分 0 秒。
+        let job = running_job_with_elapsed(Some(25.0), 60);
+        let (text, _) = job_status_line(&job, false);
+        assert!(text.contains("约剩 3分0秒"), "应该显示外推出的剩余时间: {text}");
+    }
+
+    #[test]
+    fn job_status_line_hides_eta_when_progress_too_low() {
+        // 1% 时线性外推出来的剩余时间波动极大,没有参考价值,不该显示。
+        let job = running_job_with_elapsed(Some(1.0), 60);
+        let (text, _) = job_status_line(&job, false);
+        assert!(!text.contains("约剩"), "百分比太低时不该显示约剩: {text}");
+    }
+
+    #[test]
+    fn job_status_line_hides_eta_when_just_started() {
+        // 刚开始跑(已运行时间很短)时,即使百分比够高,外推同样不可靠。
+        let job = running_job_with_elapsed(Some(50.0), 3);
+        let (text, _) = job_status_line(&job, false);
+        assert!(!text.contains("约剩"), "刚开始跑时不该显示约剩: {text}");
+    }
+
+    #[test]
+    fn job_status_line_hides_eta_when_no_percent_available() {
+        let job = running_job_with_elapsed(None, 60);
+        let (text, _) = job_status_line(&job, false);
+        assert!(!text.contains("约剩"), "没有百分比时无法外推,不该显示约剩: {text}");
+    }
+
+    #[test]
+    fn push_log_writes_to_app_log_and_in_memory_vec() {
+        let app_log = paths::logs_dir().join("app.log");
+        let _ = std::fs::remove_file(&app_log);
+
+        let mut lines: Vec<String> = Vec::new();
+        push_log(&mut lines, "测试日志行".to_string());
+
+        assert_eq!(lines, vec!["测试日志行".to_string()]);
+        let content = std::fs::read_to_string(&app_log).expect("app.log 应该已经被写出来");
+        assert!(content.contains("测试日志行"), "app.log 应该包含这行日志: {content}");
+        assert!(content.contains("[unix "), "应该带时间戳前缀: {content}");
+
+        let _ = std::fs::remove_file(&app_log);
+    }
+
+    #[test]
+    fn lang_display_translates_known_codes_and_passes_through_unknown() {
+        assert_eq!(lang_display("ja"), "日语");
+        assert_eq!(lang_display("auto"), "自动检测");
+        assert_eq!(lang_display("xx"), "xx", "没覆盖到的代码应该原样返回,而不是丢掉信息");
+    }
+
+    #[test]
+    fn format_job_report_suffix_combines_language_model_and_reuse_note() {
+        let report = crate::job::JobReport {
+            detected_language: Some("ja".to_string()),
+            translate_model_label: Some("Sakura 7B(日→中,轻小说风格)"),
+            subtitle_count: 42,
+            reused_transcript: true,
+            repetition_at: None,
+        };
+        assert_eq!(
+            format_job_report_suffix(&report),
+            " · 日语 · Sakura 7B(日→中,轻小说风格)(复用了上次的识别结果)"
+        );
+    }
+
+    #[test]
+    fn format_job_report_suffix_empty_when_nothing_to_show() {
+        let report = crate::job::JobReport {
+            detected_language: None,
+            translate_model_label: None,
+            subtitle_count: 10,
+            reused_transcript: false,
+            repetition_at: None,
+        };
+        assert_eq!(format_job_report_suffix(&report), "");
+    }
+
+    #[test]
+    fn format_job_report_suffix_shows_language_only_when_translate_not_used() {
+        let report = crate::job::JobReport {
+            detected_language: Some("en".to_string()),
+            translate_model_label: None,
+            subtitle_count: 10,
+            reused_transcript: false,
+            repetition_at: None,
+        };
+        assert_eq!(format_job_report_suffix(&report), " · 英语");
+    }
+}
