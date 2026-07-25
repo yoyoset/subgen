@@ -29,6 +29,24 @@ pub fn models_dir_override() -> Option<PathBuf> {
     MODELS_DIR_OVERRIDE.lock().ok().and_then(|g| g.clone())
 }
 
+/// 进程级的模型绑定表(见 `Config.model_files`),和 `MODELS_DIR_OVERRIDE` 是同一种模式:
+/// main.rs 启动时用配置里读到的值设置一次,以后用户通过"定位…"确认一个绑定时再更新。
+static MODEL_BINDINGS: Mutex<std::collections::BTreeMap<String, PathBuf>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+pub fn set_model_bindings(bindings: std::collections::BTreeMap<String, PathBuf>) {
+    if let Ok(mut guard) = MODEL_BINDINGS.lock() {
+        *guard = bindings;
+    }
+}
+
+/// 按绑定表 key(见 `models::whisper_binding_key` 等)查显式绑定的路径,不检查文件是否
+/// 还真的存在——调用方(`model_path` 等)已经在做"路径解析优先级"的编排,存在性检查统一
+/// 交给它们做,这里只负责回答"有没有绑定"。
+fn model_binding(key: &str) -> Option<PathBuf> {
+    MODEL_BINDINGS.lock().ok().and_then(|g| g.get(key).cloned())
+}
+
 pub fn engine_dir() -> PathBuf {
     app_dir().join("engine")
 }
@@ -121,6 +139,9 @@ pub fn store_path(file_name: &str) -> PathBuf {
 /// (`store_path`)——这个退回值同时也是 `setup.rs` 下载新模型时的写入目标,语义上依然
 /// 正确,不需要另外维护一套"下载目标路径"。
 pub fn model_path(model: &str) -> PathBuf {
+    if let Some(bound) = model_binding(&crate::models::whisper_binding_key(model)) {
+        return bound;
+    }
     // 已注册的模型用注册表里的 file_name(单一事实来源);未注册的 key(比如配置文件里
     // 存了个过期/拼错的值)退回原来的模板,行为和收拢进注册表之前完全一致。
     let file_name = crate::models::whisper::by_key(model)
@@ -130,12 +151,21 @@ pub fn model_path(model: &str) -> PathBuf {
 }
 
 pub fn vad_model_path() -> PathBuf {
+    if let Some(bound) = model_binding(crate::models::VAD_BINDING_KEY) {
+        return bound;
+    }
     let file_name = "ggml-silero-v5.1.2.bin";
     resolve_in_store(file_name).unwrap_or_else(|| store_path(file_name))
 }
 
-/// 翻译模型(gguf)文件路径,文件名由调用方(translate.rs 的模型注册表)指定。
-pub fn trans_model_path(file_name: &str) -> PathBuf {
+/// 翻译模型(gguf)文件路径。`key` 是 translate::MODELS 里的模型标识(如 "sakura-7b"),
+/// 用来查绑定表;`file_name` 是没有绑定时用来在存放目录里搜索/计算下载目标的文件名
+/// (调用方传 `TransModel.file_name`)。两个参数分开是因为绑定表按稳定的模型标识
+/// (不随文件名变化)存,不能只拿 file_name 反查。
+pub fn trans_model_path(key: &str, file_name: &str) -> PathBuf {
+    if let Some(bound) = model_binding(&crate::models::trans_binding_key(key)) {
+        return bound;
+    }
     resolve_in_store(file_name).unwrap_or_else(|| store_path(file_name))
 }
 
@@ -187,7 +217,7 @@ mod tests {
         // find_file_recursive 会直接返回 None,正确退回平铺路径)
         assert_eq!(model_path("large-v3"), custom.join("ggml-large-v3.bin"));
         assert_eq!(vad_model_path(), custom.join("ggml-silero-v5.1.2.bin"));
-        assert_eq!(trans_model_path("qwen3.gguf"), custom.join("qwen3.gguf"));
+        assert_eq!(trans_model_path("qwen3-4b", "qwen3.gguf"), custom.join("qwen3.gguf"));
         // resolve_in_store/store_path 是上面几个函数拆出来的两块——目录不存在时,
         // resolve_in_store 该老实返回 None(不是"猜"出一个路径),store_path 只管算写入
         // 目标、不检查存在与否。
@@ -224,7 +254,7 @@ mod tests {
 
         set_models_dir_override(Some(nested_root.clone()));
         assert_eq!(
-            trans_model_path("sakura-7b-qwen2.5-v1.0-iq4xs.gguf"),
+            trans_model_path("sakura-7b", "sakura-7b-qwen2.5-v1.0-iq4xs.gguf"),
             sakura_file,
             "应该在嵌套目录里找到翻译模型,而不是退回平铺路径"
         );
@@ -236,10 +266,26 @@ mod tests {
             "resolve_in_store 应该能直接在嵌套目录里找到文件"
         );
         assert_eq!(
-            trans_model_path("qwen3-not-downloaded-yet.gguf"),
+            trans_model_path("qwen3-4b", "qwen3-not-downloaded-yet.gguf"),
             nested_root.join("qwen3-not-downloaded-yet.gguf"),
             "找不到时应该退回平铺路径(下载新模型要用这个当写入目标),而不是 panic"
         );
+
+        // 绑定表优先于递归搜索/平铺退回路径——用户显式定位过的文件不该被"猜"出来的结果
+        // 覆盖,哪怕绑定的路径和递归搜索本来会找到的结果不是同一个文件。
+        let mut bindings = std::collections::BTreeMap::new();
+        let explicit = nested_root.join("explicitly_located_sakura.gguf");
+        bindings.insert(crate::models::trans_binding_key("sakura-7b"), explicit.clone());
+        set_model_bindings(bindings);
+        assert_eq!(
+            trans_model_path("sakura-7b", "sakura-7b-qwen2.5-v1.0-iq4xs.gguf"),
+            explicit,
+            "有绑定时应该直接用绑定路径,不再走递归搜索"
+        );
+        // 没有绑定的模型不受影响,继续走原来的解析顺序。
+        assert_eq!(model_path("large-v3"), large_v3_file, "没有绑定的模型不该被绑定表影响");
+        set_model_bindings(std::collections::BTreeMap::new());
+
         let _ = std::fs::remove_dir_all(&nested_root);
 
         set_models_dir_override(None);

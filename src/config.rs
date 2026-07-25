@@ -24,6 +24,13 @@ pub struct Config {
     pub models_dir_override: Option<String>,
     pub window_w: f32,
     pub window_h: f32,
+    /// 模型绑定表:显式指定"某个模型(key 见 models::whisper_binding_key 等)对应磁盘上
+    /// 哪个具体文件",绝对路径。空表(默认)= 完全退回 models_dir() 里递归搜索的旧行为,
+    /// 不影响任何现有用户。用户通过"定位…"手动选中一个文件、且哈希校验通过后才会写入
+    /// 一条绑定(见项目计划 B7,当前还没有 UI 会写入这张表)。声明在结构体最后一个字段,
+    /// 纯粹是为了让 TOML 输出把这张表(可能较长)放在文件末尾,不打断前面那些标量字段的
+    /// 可读性,不影响解析。
+    pub model_files: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -38,6 +45,7 @@ impl Default for Config {
             models_dir_override: None,
             window_w: 760.0,
             window_h: 560.0,
+            model_files: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -152,6 +160,40 @@ mod tests {
         "#;
         let (_, warning) = Config::parse_or_recover(text);
         assert!(warning.is_some());
+    }
+
+    #[test]
+    fn old_config_without_model_files_field_still_parses() {
+        // 老用户的 config.toml 里没有 model_files 这个键(这一版才加的),不该导致解析失败
+        // ——serde 的 #[serde(default)] 应该让缺失字段落到 Default::default()(空表)。
+        let text = r#"
+            model = "large-v3"
+            language = "auto"
+            overwrite_existing = false
+            translate = false
+            translate_model = "auto"
+            bilingual = true
+            window_w = 760.0
+            window_h = 560.0
+        "#;
+        let (config, warning) = Config::parse_or_recover(text);
+        assert!(warning.is_none(), "{warning:?}");
+        assert!(config.model_files.is_empty());
+    }
+
+    #[test]
+    fn model_files_binding_table_round_trips_through_toml() {
+        let mut original = Config::default();
+        original
+            .model_files
+            .insert("trans:sakura-7b".to_string(), r"F:\hf_cache\sakura-7b.gguf".to_string());
+        let text = toml::to_string_pretty(&original).unwrap();
+        let (parsed, warning) = Config::parse_or_recover(&text);
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(
+            parsed.model_files.get("trans:sakura-7b"),
+            Some(&r"F:\hf_cache\sakura-7b.gguf".to_string())
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub struct LlamaServer {
 impl LlamaServer {
     pub fn start(model: &'static TransModel, cancel: &Arc<AtomicBool>) -> Result<Self, String> {
         let exe = paths::llama_server_exe().ok_or("找不到 llama-server.exe,请先完成组件下载")?;
-        let model_path = paths::trans_model_path(model.file_name);
+        let model_path = paths::trans_model_path(model.key, model.file_name);
         if !model_path.is_file() {
             return Err(format!("翻译模型文件不存在: {}", model_path.display()));
         }

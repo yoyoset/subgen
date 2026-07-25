@@ -35,6 +35,15 @@ fn main() -> eframe::Result<()> {
     // 模型目录覆盖值是进程级状态(见 paths.rs),用配置里读到的值设置一次;用户在界面里
     // 改存放位置时会再调用一次,让后续路径解析立刻用上新值。
     paths::set_models_dir_override(config.models_dir_override.clone().map(PathBuf::from));
+    // 模型绑定表同理是进程级状态(见 paths.rs);目前只有启动时读取这一条路径,
+    // 还没有 UI 会写入 config.model_files(见项目计划 B7),空表时行为完全不变。
+    paths::set_model_bindings(
+        config
+            .model_files
+            .iter()
+            .map(|(k, v)| (k.clone(), PathBuf::from(v)))
+            .collect(),
+    );
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([config.window_w, config.window_h])
         .with_min_inner_size([560.0, 420.0])

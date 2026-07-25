@@ -105,7 +105,7 @@ pub fn is_present(key: ComponentKey, model: &str) -> bool {
         ComponentKey::Translator => paths::llama_server_exe().is_some(),
         ComponentKey::TransModel(key) => match crate::translate::model_by_key(key) {
             Some(tm) => {
-                let p = paths::trans_model_path(tm.file_name);
+                let p = paths::trans_model_path(tm.key, tm.file_name);
                 p.is_file() && p.metadata().map(|m| m.len() > 1_000_000).unwrap_or(false)
             }
             None => false,
@@ -278,7 +278,7 @@ pub(super) fn install_trans_model(
     tx: &Sender<SetupEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let target = paths::trans_model_path(tm.file_name);
+    let target = paths::trans_model_path(tm.key, tm.file_name);
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
     }
