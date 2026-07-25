@@ -94,6 +94,21 @@ pub struct SubgenApp {
     /// 挂在 Job 结构体上长期持有——报告文本可能有几十 KB,只有正在查看的这一份需要留在
     /// 内存里,切换到别的任务或重新生成会覆盖它。
     pub(crate) review: Option<ReviewReportState>,
+    /// 模型清单界面"定位…"选中一个候选文件后,正在后台校验哈希的那一项。同一时刻只有
+    /// 一个在跑(用户点了另一行的"定位…"会覆盖它,前一个后台线程发现自己被取代不会再有
+    /// 人收它的结果,静默结束——不需要显式互斥,`pending_verify` 被覆盖后旧的 `rx`/`cancel`
+    /// 直接被丢弃,线程发送失败的 `Err` 会被忽略)。
+    pub(crate) pending_verify: Option<PendingVerify>,
+}
+
+/// 见 `SubgenApp::pending_verify` 字段说明。
+pub(crate) struct PendingVerify {
+    pub binding_key: String,
+    pub label: String,
+    pub path: PathBuf,
+    /// `Ok(true)` = 哈希匹配,应该绑定;`Ok(false)` = 哈希不匹配;`Err` = 读取失败或被取消。
+    pub rx: mpsc::Receiver<Result<bool, String>>,
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// 见 `SubgenApp::review` 字段说明。
@@ -141,6 +156,7 @@ impl SubgenApp {
             settings_open: false,
             components_open: false,
             review: None,
+            pending_verify: None,
         }
     }
 
@@ -557,6 +573,115 @@ impl SubgenApp {
         }
     }
 
+    /// "定位…"按钮的入口:弹出文件选择框,选中后先做便宜的类型+大小粗筛(读文件开头
+    /// 4 字节魔数 + 元数据,不用起线程),粗筛通过才起后台线程算哈希(见 `poll_verify`)
+    /// ——几 GB 的文件哈希要算几十秒,不能挡住 UI 线程。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_locate_model(
+        &mut self,
+        binding_key: String,
+        label: String,
+        expected_kind: crate::models::FileKind,
+        expected_size: u64,
+        expected_sha256: &'static str,
+        extension_filter: &'static str,
+    ) {
+        let Some(picked) = rfd::FileDialog::new()
+            .add_filter(&label, &[extension_filter])
+            .pick_file()
+        else {
+            return; // 用户在选择框里按了取消
+        };
+
+        let actual_size = match std::fs::metadata(&picked) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                self.transient_notice = Some((format!("读取文件信息失败: {e}"), std::time::Instant::now()));
+                return;
+            }
+        };
+        let magic = match read_magic(&picked) {
+            Ok(m) => m,
+            Err(e) => {
+                self.transient_notice = Some((format!("读取文件失败: {e}"), std::time::Instant::now()));
+                return;
+            }
+        };
+
+        match crate::models::classify_picked_file(magic, actual_size, expected_kind, expected_size) {
+            crate::models::PickOutcome::WrongKind => {
+                self.transient_notice = Some((
+                    "这个文件看起来不是同一类模型,已忽略(只按文件头判断类型,不解析内容细节)"
+                        .to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            crate::models::PickOutcome::SizeMismatch { expected, actual } => {
+                self.transient_notice = Some((
+                    format!(
+                        "文件大小不对(期望 {},实际 {}),已忽略",
+                        format_download_size(expected),
+                        format_download_size(actual)
+                    ),
+                    std::time::Instant::now(),
+                ));
+            }
+            crate::models::PickOutcome::Plausible => {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let (tx, rx) = mpsc::channel();
+                let cancel_thread = cancel.clone();
+                let path_thread = picked.clone();
+                std::thread::spawn(move || {
+                    let result = setup::sha256_file_cancelable(&path_thread, &cancel_thread)
+                        .map(|digest| setup::to_hex(&digest).eq_ignore_ascii_case(expected_sha256));
+                    let _ = tx.send(result);
+                });
+                self.pending_verify = Some(PendingVerify { binding_key, label, path: picked, rx, cancel });
+            }
+        }
+    }
+
+    fn poll_verify(&mut self, ctx: &egui::Context) {
+        let mut finished: Option<(String, String, PathBuf, Result<bool, String>)> = None;
+        if let Some(pv) = &self.pending_verify
+            && let Ok(result) = pv.rx.try_recv()
+        {
+            finished = Some((pv.binding_key.clone(), pv.label.clone(), pv.path.clone(), result));
+        }
+        if let Some((binding_key, label, path, result)) = finished {
+            self.pending_verify = None;
+            match result {
+                Ok(true) => {
+                    self.config.model_files.insert(binding_key, path.to_string_lossy().to_string());
+                    self.config.save();
+                    paths::set_model_bindings(
+                        self.config
+                            .model_files
+                            .iter()
+                            .map(|(k, v)| (k.clone(), PathBuf::from(v)))
+                            .collect(),
+                    );
+                    push_log(&mut self.log_lines, format!("{label} 已绑定到 {}", path.display()));
+                    self.transient_notice = Some((format!("{label} 已绑定"), std::time::Instant::now()));
+                }
+                Ok(false) => {
+                    self.transient_notice = Some((
+                        format!("{label}:文件哈希和预期不一致,不是这个模型,已忽略"),
+                        std::time::Instant::now(),
+                    ));
+                }
+                Err(e) if e == "已取消" => {}
+                Err(e) => {
+                    self.transient_notice =
+                        Some((format!("{label}:校验失败: {e}"), std::time::Instant::now()));
+                }
+            }
+        }
+        if self.pending_verify.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
     fn poll_setup(&mut self, ctx: &egui::Context) {
         let mut done = false;
         let mut failed: Option<String> = None;
@@ -701,6 +826,7 @@ impl eframe::App for SubgenApp {
         self.poll_setup(&ctx);
         self.poll_worker(&ctx);
         self.poll_migrate(&ctx);
+        self.poll_verify(&ctx);
 
         // 记录当前窗口尺寸,在 on_exit 里一次性落盘(而不是每帧都写文件——拖拽调整窗口大小
         // 时每帧尺寸都在变,逐帧写盘没必要地增加磁盘 IO)。config.toml 里其实一直有这两个
@@ -840,4 +966,13 @@ impl eframe::App for SubgenApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.config.save();
     }
+}
+
+/// 读文件开头 4 个字节,给 `models::classify_picked_file` 做类型嗅探用。
+fn read_magic(path: &std::path::Path) -> std::io::Result<[u8; 4]> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 4];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
 }

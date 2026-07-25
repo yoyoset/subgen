@@ -35,7 +35,7 @@ pub(crate) fn render_components_window(app: &mut SubgenApp, ctx: &egui::Context)
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            model_manifest::render_manifest_body(ui);
+            model_manifest::render_manifest_body(app, ui);
         });
     app.components_open = open;
 }

@@ -38,7 +38,8 @@ mod migrate;
 
 pub use migrate::{migrate_models_dir, MigrateEvent};
 
-use download::{download_and_extract_zip, download_file, sha256_file, to_hex};
+use download::{download_and_extract_zip, download_file, sha256_file};
+pub(crate) use download::{sha256_file_cancelable, to_hex};
 
 
 const ENGINE_URL: &str =
@@ -56,7 +57,7 @@ const FFMPEG_URL: &str =
 const FFMPEG_SHA256: &str = "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec";
 
 const VAD_URL: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
-const VAD_SHA256: &str = "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf";
+pub(crate) const VAD_SHA256: &str = "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf";
 
 // llama.cpp release b10079,Windows CUDA 12.4 预编译版。哈希取自 GitHub Release API 返回的
 // 资产 digest 字段(下载前用 API 校验过,不是凭空写的)。不随附单独的 cudart 运行库包(那个

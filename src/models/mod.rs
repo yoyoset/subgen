@@ -85,6 +85,62 @@ pub const VAD_FILE_NAME: &str = "ggml-silero-v5.1.2.bin";
 /// 大小比对,收成一份常量,两处共用。
 pub const VAD_SIZE_BYTES: u64 = 885_098;
 
+/// "定位…"选中一个文件后,先做的廉价类型嗅探——不解析 GGUF/ggml 完整文件头(那里没有
+/// `prompt_kind`/`langs` 这些真正需要的信息,解析了也白解析,见项目计划里的决定 2),
+/// 只看前 4 个字节的魔数,挡掉"选错文件类型"这种最基本的误操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    /// whisper.cpp 的 ggml 格式(语音识别模型、VAD 模型都是这个格式)。
+    Ggml,
+    /// llama.cpp 的 GGUF 格式(翻译模型)。
+    Gguf,
+}
+
+/// whisper.cpp 的 `GGML_FILE_MAGIC` 是 `0x67676d6c`,按小端字节序写在磁盘上就是这四个
+/// 字节(ASCII 读作 "lmgg")——**已用真实文件核实**(`F:\hf_cache\ggml-large-v3.bin` 和
+/// `ggml-silero-v5.1.2.bin` 的前 4 字节都是这个值,hexdump 核对过,不是凭记忆写的字节序)。
+const GGML_MAGIC: [u8; 4] = [0x6c, 0x6d, 0x67, 0x67];
+/// GGUF 格式的魔数就是 ASCII "GGUF" 四个字符,同样用真实文件核实过
+/// (`Qwen3-4B-Instruct-2507-Q4_K_M.gguf` 和 `sakura-7b-qwen2.5-v1.0-iq4xs.gguf` 都是)。
+const GGUF_MAGIC: [u8; 4] = *b"GGUF";
+
+/// 纯函数:看前 4 个字节判断文件类型,两种已知魔数之外的一律返回 `None`(不认识,不猜测)。
+pub fn sniff_kind(magic: [u8; 4]) -> Option<FileKind> {
+    match magic {
+        GGML_MAGIC => Some(FileKind::Ggml),
+        GGUF_MAGIC => Some(FileKind::Gguf),
+        _ => None,
+    }
+}
+
+/// "定位…"选中一个文件后、真正读取哈希之前的粗筛结果。`Plausible` 只表示"类型和大小都对
+/// 得上,值得花时间去算哈希",不代表内容一定对——最终认定还是要看哈希比对结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickOutcome {
+    Plausible,
+    WrongKind,
+    SizeMismatch { expected: u64, actual: u64 },
+}
+
+/// 纯函数:根据选中文件的魔数+实际大小,和这一行模型期望的类型+大小比对。
+pub fn classify_picked_file(
+    magic: [u8; 4],
+    actual_size: u64,
+    expected_kind: FileKind,
+    expected_size: u64,
+) -> PickOutcome {
+    match sniff_kind(magic) {
+        Some(kind) if kind == expected_kind => {
+            if actual_size == expected_size {
+                PickOutcome::Plausible
+            } else {
+                PickOutcome::SizeMismatch { expected: expected_size, actual: actual_size }
+            }
+        }
+        _ => PickOutcome::WrongKind,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +188,51 @@ mod tests {
     }
 
     #[test]
+    fn sniff_kind_recognizes_real_ggml_magic_from_hexdump() {
+        // 真实核实过的字节(见 GGML_MAGIC 处注释):F:\hf_cache\ggml-large-v3.bin 和
+        // ggml-silero-v5.1.2.bin 的前 4 字节都是 6c 6d 67 67。
+        assert_eq!(sniff_kind([0x6c, 0x6d, 0x67, 0x67]), Some(FileKind::Ggml));
+    }
+
+    #[test]
+    fn sniff_kind_recognizes_real_gguf_magic_from_hexdump() {
+        // 真实核实过的字节:Qwen3-4B-Instruct-2507-Q4_K_M.gguf 和
+        // sakura-7b-qwen2.5-v1.0-iq4xs.gguf 的前 4 字节都是 47 47 55 46("GGUF")。
+        assert_eq!(sniff_kind([0x47, 0x47, 0x55, 0x46]), Some(FileKind::Gguf));
+    }
+
+    #[test]
+    fn sniff_kind_returns_none_for_unknown_magic() {
+        assert_eq!(sniff_kind([0, 0, 0, 0]), None);
+        assert_eq!(sniff_kind(*b"RIFF"), None); // 比如误选了个 wav/avi 文件
+    }
+
+    #[test]
+    fn classify_picked_file_plausible_when_kind_and_size_match() {
+        let outcome = classify_picked_file([0x6c, 0x6d, 0x67, 0x67], 3_095_033_483, FileKind::Ggml, 3_095_033_483);
+        assert_eq!(outcome, PickOutcome::Plausible);
+    }
+
+    #[test]
+    fn classify_picked_file_wrong_kind_when_magic_mismatches() {
+        // 给语音识别模型的行选了个翻译模型(GGUF)文件。
+        let outcome = classify_picked_file(*b"GGUF", 3_095_033_483, FileKind::Ggml, 3_095_033_483);
+        assert_eq!(outcome, PickOutcome::WrongKind);
+    }
+
+    #[test]
+    fn classify_picked_file_wrong_kind_when_magic_unrecognized() {
+        let outcome = classify_picked_file([0, 0, 0, 0], 3_095_033_483, FileKind::Ggml, 3_095_033_483);
+        assert_eq!(outcome, PickOutcome::WrongKind);
+    }
+
+    #[test]
+    fn classify_picked_file_size_mismatch_when_kind_ok_but_size_off() {
+        let outcome = classify_picked_file([0x6c, 0x6d, 0x67, 0x67], 2_000_000_000, FileKind::Ggml, 3_095_033_483);
+        assert_eq!(outcome, PickOutcome::SizeMismatch { expected: 3_095_033_483, actual: 2_000_000_000 });
+    }
+
+    #[test]
     fn model_status_is_ready_only_matches_ready_variant() {
         let path = PathBuf::from("x");
         assert!(ModelStatus::Ready { path: path.clone(), size: 1 }.is_ready());
@@ -140,3 +241,4 @@ mod tests {
         assert!(!ModelStatus::SizeMismatch { path, expected: 1, actual: 2 }.is_ready());
     }
 }
+

@@ -14,10 +14,21 @@ use std::sync::Arc;
 const GITHUB_PROXY_PREFIX: &str = "https://gh-proxy.com/";
 
 pub(super) fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
+    let never_cancel = Arc::new(AtomicBool::new(false));
+    sha256_file_cancelable(path, &never_cancel)
+}
+
+/// 和 `sha256_file` 一样逐块算哈希,但每块之间检查一次取消标志——"定位…"手动绑定一个
+/// 几 GB 的文件时,哈希要算几十秒,用户选错文件想反悔不该被迫等完。`sha256_file` 内部
+/// 复用这个函数(传一个永远不会被置位的标志),避免同一段循环写两遍。
+pub(crate) fn sha256_file_cancelable(path: &Path, cancel: &Arc<AtomicBool>) -> Result<[u8; 32], String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("打开文件失败: {e}"))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".to_string());
+        }
         let n = file.read(&mut buf).map_err(|e| format!("读取文件失败: {e}"))?;
         if n == 0 {
             break;
@@ -299,7 +310,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-pub(super) fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
