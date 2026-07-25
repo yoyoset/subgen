@@ -57,6 +57,7 @@ const FFMPEG_SHA256: &str = "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12
 
 const VAD_URL: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
 const VAD_SHA256: &str = "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf";
+const VAD_SIZE_BYTES: u64 = 885_098;
 
 // llama.cpp release b10079,Windows CUDA 12.4 预编译版。哈希取自 GitHub Release API 返回的
 // 资产 digest 字段(下载前用 API 校验过,不是凭空写的)。不随附单独的 cudart 运行库包(那个
@@ -100,22 +101,40 @@ pub fn is_present(key: ComponentKey, model: &str) -> bool {
     match key {
         ComponentKey::Engine => paths::whisper_cli_exe().is_some(),
         ComponentKey::Ffmpeg => paths::ffmpeg_exe().is_some(),
+        ComponentKey::Translator => paths::llama_server_exe().is_some(),
+        ComponentKey::Model | ComponentKey::Vad | ComponentKey::TransModel(_) => {
+            status_for(key, model).map(|s| s.is_ready()).unwrap_or(false)
+        }
+    }
+}
+
+/// `ModelStatus` 版本的 `is_present`,给"单文件模型"三种组件用(Engine/Ffmpeg/Translator
+/// 是解压出的可执行文件,不是单个已知大小的文件,不适用这套)。`None` 表示传入的模型 key
+/// 在注册表里查不到(比如配置文件里存了个过期/拼错的值)——这种情况不该被判定为"已就绪",
+/// 交给上层(`is_present`)按"不存在"处理,后续尝试安装时 `install_component` 会给出
+/// 明确的"未知标识"错误,而不是静默用一个凑巧存在的同名文件。
+///
+/// 是 `pub(crate)` 而不是内部私有——B6(模型清单界面)需要完整的 `ModelStatus`,不只是
+/// 一个布尔值,是同一份判定逻辑的两种消费方式。
+pub(crate) fn status_for(key: ComponentKey, model: &str) -> Option<crate::models::ModelStatus> {
+    match key {
         ComponentKey::Model => {
-            let p = paths::model_path(model);
-            p.is_file() && p.metadata().map(|m| m.len() > 1_000_000).unwrap_or(false)
+            let wm = crate::models::whisper::by_key(model)?;
+            let path = paths::model_path(model);
+            let binding_key = crate::models::whisper_binding_key(model);
+            Some(crate::models::resolve_status(&path, &binding_key, wm.size_bytes))
         }
         ComponentKey::Vad => {
-            let p = paths::vad_model_path();
-            p.is_file() && p.metadata().map(|m| m.len() > 100_000).unwrap_or(false)
+            let path = paths::vad_model_path();
+            Some(crate::models::resolve_status(&path, crate::models::VAD_BINDING_KEY, VAD_SIZE_BYTES))
         }
-        ComponentKey::Translator => paths::llama_server_exe().is_some(),
-        ComponentKey::TransModel(key) => match crate::translate::model_by_key(key) {
-            Some(tm) => {
-                let p = paths::trans_model_path(tm.key, tm.file_name);
-                p.is_file() && p.metadata().map(|m| m.len() > 1_000_000).unwrap_or(false)
-            }
-            None => false,
-        },
+        ComponentKey::TransModel(key) => {
+            let tm = crate::translate::model_by_key(key)?;
+            let path = paths::trans_model_path(tm.key, tm.file_name);
+            let binding_key = crate::models::trans_binding_key(tm.key);
+            Some(crate::models::resolve_status(&path, &binding_key, tm.size_bytes))
+        }
+        ComponentKey::Engine | ComponentKey::Ffmpeg | ComponentKey::Translator => None,
     }
 }
 
@@ -129,7 +148,7 @@ pub fn estimated_size_bytes(key: ComponentKey, model: &str) -> u64 {
         ComponentKey::Model => crate::models::whisper::by_key(model)
             .map(|m| m.size_bytes)
             .unwrap_or(3_000_000_000), // 未知档位,给一个保守估算,不影响功能只影响提示准确度
-        ComponentKey::Vad => 885_098,
+        ComponentKey::Vad => VAD_SIZE_BYTES,
         ComponentKey::Translator => 249_081_777,
         ComponentKey::TransModel(key) => crate::translate::model_by_key(key)
             .map(|m| m.size_bytes)

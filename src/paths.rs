@@ -43,7 +43,7 @@ pub fn set_model_bindings(bindings: std::collections::BTreeMap<String, PathBuf>)
 /// 按绑定表 key(见 `models::whisper_binding_key` 等)查显式绑定的路径,不检查文件是否
 /// 还真的存在——调用方(`model_path` 等)已经在做"路径解析优先级"的编排,存在性检查统一
 /// 交给它们做,这里只负责回答"有没有绑定"。
-fn model_binding(key: &str) -> Option<PathBuf> {
+pub fn model_binding(key: &str) -> Option<PathBuf> {
     MODEL_BINDINGS.lock().ok().and_then(|g| g.get(key).cloned())
 }
 
