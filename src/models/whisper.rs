@@ -39,8 +39,9 @@ pub const LARGE_V3_TURBO: WhisperModel = WhisperModel {
     label: "快速(准确率略降)",
     file_name: "ggml-large-v3-turbo.bin",
     url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
-    // TODO(B1b): 用 HF /raw/ 端点的 LFS 指针拿权威 sha256,交叉验证后再填,不要凭记忆/估算填写。
-    sha256: None,
+    // 2026-07-25 核实:HF /raw/ 端点的 LFS 指针(oid sha256:...)和 /resolve/ 的 HEAD 响应头
+    // X-Linked-ETag 两个独立来源结果一致,size 也和已有的 size_bytes 吻合。
+    sha256: Some("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"),
     size_bytes: 1_624_555_275,
 };
 
@@ -49,8 +50,8 @@ pub const MEDIUM: WhisperModel = WhisperModel {
     label: "极速(适合显卡较弱或纯 CPU 的电脑)",
     file_name: "ggml-medium.bin",
     url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
-    // TODO(B1b): 同上。
-    sha256: None,
+    // 2026-07-25 核实,来源和交叉验证方式同上。
+    sha256: Some("6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208"),
     size_bytes: 1_533_763_059,
 };
 
