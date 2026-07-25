@@ -102,6 +102,13 @@ pub struct SubgenApp {
     /// 模型清单里点"下载"正在装的那一项(同一时刻只有一个,和 `pending_verify` 同一种
     /// 单槽设计)。见 `begin_inline_install`/`poll_inline_install`。
     pub(crate) inline_install: Option<InlineInstall>,
+    /// "扫描本机已有模型"结果:绑定表 key -> 候选文件路径。只按文件名+大小匹配,不做
+    /// 哈希(扫描要遍历用户可能几十 GB 的共享缓存目录,哈希每个候选太慢)——真正的哈希
+    /// 校验留到用户点"使用此文件"时,复用 `begin_locate_model` 同一条校验+绑定路径。
+    /// `None` = 还没扫描过或正在扫描中,`Some(空表)` = 扫描完成但什么都没找到,两者在
+    /// 界面上该显示的文案不一样("点这里扫一下" vs "没找到候选")。
+    pub(crate) scan_results: Option<std::collections::BTreeMap<String, PathBuf>>,
+    pub(crate) scan_rx: Option<mpsc::Receiver<std::collections::BTreeMap<String, PathBuf>>>,
 }
 
 /// 见 `SubgenApp::pending_verify` 字段说明。
@@ -171,6 +178,8 @@ impl SubgenApp {
             review: None,
             pending_verify: None,
             inline_install: None,
+            scan_results: None,
+            scan_rx: None,
         }
     }
 
@@ -587,9 +596,8 @@ impl SubgenApp {
         }
     }
 
-    /// "定位…"按钮的入口:弹出文件选择框,选中后先做便宜的类型+大小粗筛(读文件开头
-    /// 4 字节魔数 + 元数据,不用起线程),粗筛通过才起后台线程算哈希(见 `poll_verify`)
-    /// ——几 GB 的文件哈希要算几十秒,不能挡住 UI 线程。
+    /// "定位…"按钮的入口:弹出文件选择框,选中后交给 `begin_verify_candidate` 做粗筛+
+    /// 哈希校验。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_locate_model(
         &mut self,
@@ -606,15 +614,30 @@ impl SubgenApp {
         else {
             return; // 用户在选择框里按了取消
         };
+        self.begin_verify_candidate(binding_key, label, picked, expected_kind, expected_size, expected_sha256);
+    }
 
-        let actual_size = match std::fs::metadata(&picked) {
+    /// 给定一个候选路径(来自文件选择框,或者"扫描本机已有模型"找到的候选),先做便宜的
+    /// 类型+大小粗筛(读文件开头 4 字节魔数 + 元数据,不用起线程),粗筛通过才起后台线程
+    /// 算哈希(见 `poll_verify`)——几 GB 的文件哈希要算几十秒,不能挡住 UI 线程。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_verify_candidate(
+        &mut self,
+        binding_key: String,
+        label: String,
+        candidate: PathBuf,
+        expected_kind: crate::models::FileKind,
+        expected_size: u64,
+        expected_sha256: &'static str,
+    ) {
+        let actual_size = match std::fs::metadata(&candidate) {
             Ok(m) => m.len(),
             Err(e) => {
                 self.transient_notice = Some((format!("读取文件信息失败: {e}"), std::time::Instant::now()));
                 return;
             }
         };
-        let magic = match read_magic(&picked) {
+        let magic = match read_magic(&candidate) {
             Ok(m) => m,
             Err(e) => {
                 self.transient_notice = Some((format!("读取文件失败: {e}"), std::time::Instant::now()));
@@ -644,13 +667,13 @@ impl SubgenApp {
                 let cancel = Arc::new(AtomicBool::new(false));
                 let (tx, rx) = mpsc::channel();
                 let cancel_thread = cancel.clone();
-                let path_thread = picked.clone();
+                let path_thread = candidate.clone();
                 std::thread::spawn(move || {
                     let result = setup::sha256_file_cancelable(&path_thread, &cancel_thread)
                         .map(|digest| setup::to_hex(&digest).eq_ignore_ascii_case(expected_sha256));
                     let _ = tx.send(result);
                 });
-                self.pending_verify = Some(PendingVerify { binding_key, label, path: picked, rx, cancel });
+                self.pending_verify = Some(PendingVerify { binding_key, label, path: candidate, rx, cancel });
             }
         }
     }
@@ -729,6 +752,54 @@ impl SubgenApp {
             ));
         }
         if self.inline_install.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// "扫描本机已有模型"入口:后台遍历已知的外部缓存位置(HF_HOME/HF_HUB_CACHE/
+    /// `~/.cache/huggingface/hub`,见 `setup::find_in_known_roots`),按(文件名, 大小)
+    /// 粗筛候选——不做哈希,扫描要遍历用户可能几十 GB 的共享缓存目录,把每个候选都哈希一遍
+    /// 太慢。真正认定"是不是这个模型"留到用户点"使用此文件"时,复用
+    /// `begin_locate_model` 同一条哈希校验+绑定路径,扫描只负责"提示可能在哪"。
+    pub(crate) fn begin_scan_for_models(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut found: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+            let mut check = |binding_key: String, file_name: &str, expected_size: u64| {
+                if let Some(p) = setup::find_in_known_roots(file_name)
+                    && std::fs::metadata(&p).map(|m| m.len()).ok() == Some(expected_size)
+                {
+                    found.insert(binding_key, p);
+                }
+            };
+            for wm in crate::models::whisper::MODELS {
+                check(crate::models::whisper_binding_key(wm.key), wm.file_name, wm.size_bytes);
+            }
+            check(
+                crate::models::VAD_BINDING_KEY.to_string(),
+                crate::models::VAD_FILE_NAME,
+                crate::models::VAD_SIZE_BYTES,
+            );
+            for tm in crate::translate::MODELS {
+                check(crate::models::trans_binding_key(tm.key), tm.file_name, tm.size_bytes);
+            }
+            let _ = tx.send(found);
+        });
+        self.scan_rx = Some(rx);
+    }
+
+    fn poll_scan(&mut self, ctx: &egui::Context) {
+        let mut result = None;
+        if let Some(rx) = &self.scan_rx
+            && let Ok(found) = rx.try_recv()
+        {
+            result = Some(found);
+        }
+        if let Some(found) = result {
+            self.scan_rx = None;
+            self.scan_results = Some(found);
+        }
+        if self.scan_rx.is_some() {
             ctx.request_repaint();
         }
     }
@@ -909,6 +980,7 @@ impl eframe::App for SubgenApp {
         self.poll_migrate(&ctx);
         self.poll_verify(&ctx);
         self.poll_inline_install(&ctx);
+        self.poll_scan(&ctx);
 
         // 记录当前窗口尺寸,在 on_exit 里一次性落盘(而不是每帧都写文件——拖拽调整窗口大小
         // 时每帧尺寸都在变,逐帧写盘没必要地增加磁盘 IO)。config.toml 里其实一直有这两个

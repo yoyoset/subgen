@@ -93,8 +93,22 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
 
     let mut locate_clicked: Option<usize> = None;
     let mut download_clicked: Option<usize> = None;
+    let mut use_candidate_clicked: Option<usize> = None;
     let mut cancel_verify_clicked = false;
     let mut cancel_install_clicked = false;
+
+    ui.horizontal(|ui| {
+        if ui.add_enabled(app.scan_rx.is_none(), egui::Button::new("扫描本机已有模型")).clicked() {
+            app.begin_scan_for_models();
+        }
+        if app.scan_rx.is_some() {
+            ui.spinner();
+            ui.weak("正在扫描…");
+        } else if let Some(found) = &app.scan_results {
+            ui.weak(format!("上次扫描发现 {} 个候选", found.len()));
+        }
+    });
+    ui.add_space(4.0);
 
     egui::ScrollArea::vertical()
         .max_height(320.0)
@@ -117,6 +131,14 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
 
                         let is_verifying = pending_verify_key.as_deref() == Some(row.binding_key.as_str());
                         let is_installing = installing_key == Some(row.component_key);
+                        // 只在这一行还没就绪、且不是正在忙的时候才提示扫描候选——已经 Ready
+                        // 了就不需要再建议一个候选(哪怕碰巧发现了别的同名文件也不该干扰)。
+                        let candidate = if !row.status.is_ready() && !is_verifying && !is_installing {
+                            app.scan_results.as_ref().and_then(|m| m.get(&row.binding_key))
+                        } else {
+                            None
+                        };
+
                         if is_verifying {
                             ui.horizontal(|ui| {
                                 ui.spinner();
@@ -135,8 +157,13 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                 }
                             });
                         } else {
-                            let (text, color) = model_status_line(&row.status);
-                            ui.colored_label(color, text);
+                            ui.vertical(|ui| {
+                                let (text, color) = model_status_line(&row.status);
+                                ui.colored_label(color, text);
+                                if let Some(p) = candidate {
+                                    ui.weak(format!("发现候选: {}", p.display()));
+                                }
+                            });
                         }
 
                         ui.horizontal(|ui| {
@@ -167,6 +194,12 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                     cancel_install_clicked = true;
                                 }
                             } else {
+                                if candidate.is_some()
+                                    && row.expected_sha256.is_some()
+                                    && ui.add_enabled(actions_enabled, egui::Button::new("使用此文件")).clicked()
+                                {
+                                    use_candidate_clicked = Some(i);
+                                }
                                 if row.expected_sha256.is_some()
                                     && ui.add_enabled(actions_enabled, egui::Button::new("定位…")).clicked()
                                 {
@@ -213,5 +246,21 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
     if let Some(i) = download_clicked {
         let row = &rows[i];
         app.begin_inline_install(row.component_key, row.label.clone(), row.whisper_model_arg.clone());
+    }
+    if let Some(i) = use_candidate_clicked {
+        let row = &rows[i];
+        // 重新从 scan_results 里取路径,而不是在渲染循环里就把它存下来——避免克隆一份
+        // Option<&PathBuf> 到闭包外的生命周期麻烦,反正这里再查一次表是 O(1) 的开销。
+        let found = app.scan_results.as_ref().and_then(|m| m.get(&row.binding_key).cloned());
+        if let (Some(path), Some(sha256)) = (found, row.expected_sha256) {
+            app.begin_verify_candidate(
+                row.binding_key.clone(),
+                row.label.clone(),
+                path,
+                row.expected_kind,
+                row.expected_size,
+                sha256,
+            );
+        }
     }
 }

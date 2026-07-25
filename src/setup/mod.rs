@@ -393,7 +393,7 @@ fn install_or_bind(
 /// (`~/.cache/huggingface/hub`),都是 huggingface_hub 官方文档记录的标准缓存位置解析
 /// 顺序,不是猜的路径。以前只有翻译模型会走这个查找,现在 whisper/VAD 模型也复用同一套
 /// (见项目计划 B4)——没道理翻译模型能省下重复下载,语音模型就不能。
-fn find_in_known_roots(file_name: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_known_roots(file_name: &str) -> Option<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(hf_hub_cache) = std::env::var("HF_HUB_CACHE") {
         roots.push(PathBuf::from(hf_hub_cache));
