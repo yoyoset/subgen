@@ -77,11 +77,20 @@ pub fn config_path() -> PathBuf {
 
 /// whisper.cpp 官方发布包解压后内部目录结构不完全固定(历史上出现过 Release/ 前缀等),
 /// 所以不硬编码内部路径,改为递归搜索目标文件名。这样即使以后 whisper.cpp 发布包内部结构变化,
-/// 只要文件名不变,程序依然能找到。
+/// 只要文件名不变,程序依然能找到。只要第一个命中就返回——是 `find_all_matching_files`
+/// 的薄包装,大多数调用方只关心"有没有、在哪",不需要知道是不是有多份。
 pub fn find_file_recursive(dir: &Path, file_name: &str) -> Option<PathBuf> {
+    find_all_matching_files(dir, file_name).into_iter().next()
+}
+
+/// 和 `find_file_recursive` 一样递归搜索,但收集**全部**命中而不是找到第一个就停——用于
+/// 检测重复文件(见 `models` 模块的清单"清理重复"功能):同一个模型的文件如果在存放目录
+/// 树里出现不止一份,这是找出"除了正在用的那份之外还有哪些"的基础。
+pub fn find_all_matching_files(dir: &Path, file_name: &str) -> Vec<PathBuf> {
     if !dir.exists() {
-        return None;
+        return Vec::new();
     }
+    let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
         let entries = match std::fs::read_dir(&current) {
@@ -98,11 +107,11 @@ pub fn find_file_recursive(dir: &Path, file_name: &str) -> Option<PathBuf> {
                 .map(|n| n.eq_ignore_ascii_case(file_name))
                 .unwrap_or(false)
             {
-                return Some(path);
+                found.push(path);
             }
         }
     }
-    None
+    found
 }
 
 pub fn whisper_cli_exe() -> Option<PathBuf> {
@@ -194,6 +203,33 @@ pub fn sidecar_review_path(video_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 不碰 MODELS_DIR_OVERRIDE(参数直接传目录,不经过全局状态),可以独立成测试,
+    /// 不用并进下面那个大测试函数里。
+    #[test]
+    fn find_all_matching_files_collects_every_match_not_just_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_find_all_{:x}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let nested = dir.join("nested").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("model.gguf"), b"flat copy").unwrap();
+        std::fs::write(nested.join("model.gguf"), b"nested copy").unwrap();
+        std::fs::write(dir.join("other.gguf"), b"different file").unwrap();
+
+        let mut found = find_all_matching_files(&dir, "model.gguf");
+        found.sort();
+        assert_eq!(found.len(), 2, "应该找到两份同名文件,不是只找到第一份: {found:?}");
+        assert!(found.contains(&dir.join("model.gguf")));
+        assert!(found.contains(&nested.join("model.gguf")));
+
+        // find_file_recursive 应该还是只返回其中一个(行为没变,只是现在是薄包装)。
+        assert!(find_file_recursive(&dir, "model.gguf").is_some());
+        assert_eq!(find_all_matching_files(&dir, "does-not-exist.gguf"), Vec::<PathBuf>::new());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 合并成一个测试而不是拆成好几个:MODELS_DIR_OVERRIDE 是进程级全局状态,cargo test
     /// 默认并行跑同一个二进制里的测试,拆开写会互相踩状态导致偶发失败(真实踩过一次:

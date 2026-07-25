@@ -122,6 +122,29 @@ pub enum PickOutcome {
     SizeMismatch { expected: u64, actual: u64 },
 }
 
+/// "清理重复"要把确认过的重复文件移到 `models_dir/_trash/`,而不是直接删除(用户要求
+/// "先不去重,方案完善好再删除"——移到 _trash 是"完善好"之后的版本,依然是可撤销的软删除,
+/// 不是真删)。纯函数:如果目标文件名在 _trash 里还没有,直接用原文件名;已经有同名的
+/// (比如清理过两次、或者两个不同来源但同名的文件),加数字后缀直到不冲突,不覆盖已经在
+/// _trash 里的东西。
+pub fn trash_destination(
+    trash_dir: &std::path::Path,
+    file_name: &str,
+    already_in_trash: &std::collections::HashSet<String>,
+) -> PathBuf {
+    if !already_in_trash.contains(file_name) {
+        return trash_dir.join(file_name);
+    }
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("{n}_{file_name}");
+        if !already_in_trash.contains(&candidate) {
+            return trash_dir.join(candidate);
+        }
+        n += 1;
+    }
+}
+
 /// 这个文件名是不是"subgen 认得"的模型文件——判断依据是三个注册表(whisper::MODELS/
 /// VAD/translate::MODELS)本身,不是另外单独维护的一份名单,不会跟注册表脱节。
 /// `setup::migrate_models_dir` 用它决定"旧目录里哪些文件是 subgen 自己的、该跟着搬"
@@ -215,6 +238,33 @@ mod tests {
     fn sniff_kind_returns_none_for_unknown_magic() {
         assert_eq!(sniff_kind([0, 0, 0, 0]), None);
         assert_eq!(sniff_kind(*b"RIFF"), None); // 比如误选了个 wav/avi 文件
+    }
+
+    #[test]
+    fn trash_destination_uses_original_name_when_no_collision() {
+        let trash_dir = PathBuf::from(r"F:\hf_cache\_trash");
+        let existing = std::collections::HashSet::new();
+        assert_eq!(
+            trash_destination(&trash_dir, "sakura-7b.gguf", &existing),
+            trash_dir.join("sakura-7b.gguf")
+        );
+    }
+
+    #[test]
+    fn trash_destination_appends_counter_on_collision() {
+        let trash_dir = PathBuf::from(r"F:\hf_cache\_trash");
+        let mut existing = std::collections::HashSet::new();
+        existing.insert("sakura-7b.gguf".to_string());
+        assert_eq!(
+            trash_destination(&trash_dir, "sakura-7b.gguf", &existing),
+            trash_dir.join("1_sakura-7b.gguf")
+        );
+
+        existing.insert("1_sakura-7b.gguf".to_string());
+        assert_eq!(
+            trash_destination(&trash_dir, "sakura-7b.gguf", &existing),
+            trash_dir.join("2_sakura-7b.gguf")
+        );
     }
 
     #[test]

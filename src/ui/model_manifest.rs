@@ -86,16 +86,22 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
     let pending_verify_key = app.pending_verify.as_ref().map(|pv| pv.binding_key.clone());
     let installing_key = app.inline_install.as_ref().map(|i| i.key);
     let install_progress = app.inline_install.as_ref().map(|i| (i.downloaded, i.total));
+    let cleaning_key = app.pending_cleanup.as_ref().map(|pc| pc.binding_key.clone());
     // 处理中(批次在跑)不允许改动存放目录里的文件——llama-server/whisper-cli 可能正
-    // 持有着这些文件,这时候写入是自找麻烦。同一时刻也只允许一项定位/下载在跑,避免
-    // 多个后台线程同时写 config.model_files 相互覆盖。
-    let actions_enabled = !app.processing && app.pending_verify.is_none() && app.inline_install.is_none();
+    // 持有着这些文件,这时候写入是自找麻烦。同一时刻也只允许一项定位/下载/清理在跑,
+    // 避免多个后台线程同时写 config.model_files 或同时挪动文件相互干扰。
+    let actions_enabled = !app.processing
+        && app.pending_verify.is_none()
+        && app.inline_install.is_none()
+        && app.pending_cleanup.is_none();
 
     let mut locate_clicked: Option<usize> = None;
     let mut download_clicked: Option<usize> = None;
     let mut use_candidate_clicked: Option<usize> = None;
+    let mut cleanup_clicked: Option<usize> = None;
     let mut cancel_verify_clicked = false;
     let mut cancel_install_clicked = false;
+    let mut cancel_cleanup_clicked = false;
 
     ui.horizontal(|ui| {
         if ui.add_enabled(app.scan_rx.is_none(), egui::Button::new("扫描本机已有模型")).clicked() {
@@ -131,12 +137,21 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
 
                         let is_verifying = pending_verify_key.as_deref() == Some(row.binding_key.as_str());
                         let is_installing = installing_key == Some(row.component_key);
+                        let is_cleaning = cleaning_key.as_deref() == Some(row.binding_key.as_str());
+                        let busy = is_verifying || is_installing || is_cleaning;
                         // 只在这一行还没就绪、且不是正在忙的时候才提示扫描候选——已经 Ready
                         // 了就不需要再建议一个候选(哪怕碰巧发现了别的同名文件也不该干扰)。
-                        let candidate = if !row.status.is_ready() && !is_verifying && !is_installing {
+                        let candidate = if !row.status.is_ready() && !busy {
                             app.scan_results.as_ref().and_then(|m| m.get(&row.binding_key))
                         } else {
                             None
+                        };
+                        // 重复文件和"是不是 Ready"无关——恰恰是 Ready 的那份之外,还多出来
+                        // 的副本才是清理的对象。
+                        let duplicates: &[std::path::PathBuf] = if !busy {
+                            app.dup_results.as_ref().and_then(|m| m.get(&row.binding_key)).map(|v| v.as_slice()).unwrap_or(&[])
+                        } else {
+                            &[]
                         };
 
                         if is_verifying {
@@ -156,6 +171,11 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                     _ => ui.weak("正在安装…"),
                                 }
                             });
+                        } else if is_cleaning {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.weak("正在清理重复文件…");
+                            });
                         } else {
                             ui.vertical(|ui| {
                                 let (text, color) = model_status_line(&row.status);
@@ -163,12 +183,26 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                 if let Some(p) = candidate {
                                     ui.weak(format!("发现候选: {}", p.display()));
                                 }
+                                if !duplicates.is_empty() {
+                                    let total: u64 = duplicates
+                                        .iter()
+                                        .filter_map(|p| std::fs::metadata(p).ok())
+                                        .map(|m| m.len())
+                                        .sum();
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(230, 150, 20),
+                                        format!(
+                                            "发现 {} 份重复副本(共 {}),占了双倍磁盘空间",
+                                            duplicates.len(),
+                                            format_download_size(total)
+                                        ),
+                                    );
+                                }
                             });
                         }
 
                         ui.horizontal(|ui| {
                             let path = row.status.path();
-                            let busy = is_verifying || is_installing;
                             if ui
                                 .add_enabled(path.is_some() && !busy, egui::Button::new("在文件夹中显示"))
                                 .clicked()
@@ -193,6 +227,10 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                 if ui.button("取消").clicked() {
                                     cancel_install_clicked = true;
                                 }
+                            } else if is_cleaning {
+                                if ui.button("取消").clicked() {
+                                    cancel_cleanup_clicked = true;
+                                }
                             } else {
                                 if candidate.is_some()
                                     && row.expected_sha256.is_some()
@@ -210,6 +248,12 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                 {
                                     download_clicked = Some(i);
                                 }
+                                if !duplicates.is_empty()
+                                    && row.expected_sha256.is_some()
+                                    && ui.add_enabled(actions_enabled, egui::Button::new("清理重复")).clicked()
+                                {
+                                    cleanup_clicked = Some(i);
+                                }
                             }
                         });
                         ui.end_row();
@@ -226,6 +270,11 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
         && let Some(inst) = &app.inline_install
     {
         inst.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if cancel_cleanup_clicked
+        && let Some(pc) = &app.pending_cleanup
+    {
+        pc.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(i) = locate_clicked {
         let row = &rows[i];
@@ -261,6 +310,16 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                 row.expected_size,
                 sha256,
             );
+        }
+    }
+    if let Some(i) = cleanup_clicked {
+        let row = &rows[i];
+        // 重新从 dup_results 里取路径,原因同 use_candidate_clicked。
+        let found = app.dup_results.as_ref().and_then(|m| m.get(&row.binding_key).cloned());
+        if let (Some(paths), Some(sha256)) = (found, row.expected_sha256)
+            && !paths.is_empty()
+        {
+            app.begin_cleanup_duplicates(row.binding_key.clone(), row.label.clone(), paths, sha256);
         }
     }
 }

@@ -108,7 +108,29 @@ pub struct SubgenApp {
     /// `None` = 还没扫描过或正在扫描中,`Some(空表)` = 扫描完成但什么都没找到,两者在
     /// 界面上该显示的文案不一样("点这里扫一下" vs "没找到候选")。
     pub(crate) scan_results: Option<std::collections::BTreeMap<String, PathBuf>>,
-    pub(crate) scan_rx: Option<mpsc::Receiver<std::collections::BTreeMap<String, PathBuf>>>,
+    /// 同一趟扫描顺带找到的"存放目录里同一个文件名不止一份"的记录:绑定表 key -> 除了
+    /// 正在用的那份之外,还找到的其它路径。只探测不动手,用户点"清理"才会真的移动文件
+    /// (见 `begin_cleanup_duplicates`)。
+    pub(crate) dup_results: Option<std::collections::BTreeMap<String, Vec<PathBuf>>>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) scan_rx: Option<
+        mpsc::Receiver<(
+            std::collections::BTreeMap<String, PathBuf>,
+            std::collections::BTreeMap<String, Vec<PathBuf>>,
+        )>,
+    >,
+    /// "清理"重复文件正在跑的那一项(同一时刻只有一个,和 `pending_verify`/`inline_install`
+    /// 同一种单槽设计)。
+    pub(crate) pending_cleanup: Option<PendingCleanup>,
+}
+
+/// 见 `SubgenApp::pending_cleanup` 字段说明。
+pub(crate) struct PendingCleanup {
+    pub binding_key: String,
+    pub label: String,
+    /// `(移动成功的数量, 每一处没能清理的说明)`。
+    pub rx: mpsc::Receiver<(usize, Vec<String>)>,
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// 见 `SubgenApp::pending_verify` 字段说明。
@@ -179,7 +201,9 @@ impl SubgenApp {
             pending_verify: None,
             inline_install: None,
             scan_results: None,
+            dup_results: None,
             scan_rx: None,
+            pending_cleanup: None,
         }
     }
 
@@ -791,34 +815,54 @@ impl SubgenApp {
         }
     }
 
-    /// "扫描本机已有模型"入口:后台遍历已知的外部缓存位置(HF_HOME/HF_HUB_CACHE/
-    /// `~/.cache/huggingface/hub`,见 `setup::find_in_known_roots`),按(文件名, 大小)
-    /// 粗筛候选——不做哈希,扫描要遍历用户可能几十 GB 的共享缓存目录,把每个候选都哈希一遍
-    /// 太慢。真正认定"是不是这个模型"留到用户点"使用此文件"时,复用
-    /// `begin_locate_model` 同一条哈希校验+绑定路径,扫描只负责"提示可能在哪"。
+    /// "扫描本机已有模型"入口。做两件事,同一趟遍历顺带做,不需要用户分别点两个按钮:
+    /// (1) 后台遍历已知的外部缓存位置(HF_HOME/HF_HUB_CACHE/`~/.cache/huggingface/hub`,
+    /// 见 `setup::find_in_known_roots`),按(文件名, 大小)粗筛候选——不做哈希,扫描要遍历
+    /// 用户可能几十 GB 的共享缓存目录,把每个候选都哈希一遍太慢。真正认定"是不是这个模型"
+    /// 留到用户点"使用此文件"时,复用 `begin_locate_model` 同一条哈希校验+绑定路径。
+    /// (2) 在存放目录树里找同一个文件名是否存在不止一份(见 `paths::find_all_matching_files`)
+    /// ——这是"清理重复"(用户明确要求"先不去重,方案完善好再删除",这里只探测、只在
+    /// 用户点"清理"时才真的动文件,见 `begin_cleanup_duplicates`)的前置扫描。
     pub(crate) fn begin_scan_for_models(&mut self) {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut found: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
-            let mut check = |binding_key: String, file_name: &str, expected_size: u64| {
+            let mut duplicates: std::collections::BTreeMap<String, Vec<PathBuf>> = std::collections::BTreeMap::new();
+            let mut check = |binding_key: String, file_name: &str, expected_size: u64, kept: Option<PathBuf>| {
                 if let Some(p) = setup::find_in_known_roots(file_name)
                     && std::fs::metadata(&p).map(|m| m.len()).ok() == Some(expected_size)
                 {
-                    found.insert(binding_key, p);
+                    found.insert(binding_key.clone(), p);
+                }
+                let all = paths::find_all_matching_files(&paths::models_dir(), file_name);
+                let extra: Vec<PathBuf> = all.into_iter().filter(|p| Some(p) != kept.as_ref()).collect();
+                if !extra.is_empty() {
+                    duplicates.insert(binding_key, extra);
                 }
             };
             for wm in crate::models::whisper::MODELS {
-                check(crate::models::whisper_binding_key(wm.key), wm.file_name, wm.size_bytes);
+                check(
+                    crate::models::whisper_binding_key(wm.key),
+                    wm.file_name,
+                    wm.size_bytes,
+                    Some(paths::model_path(wm.key)),
+                );
             }
             check(
                 crate::models::VAD_BINDING_KEY.to_string(),
                 crate::models::VAD_FILE_NAME,
                 crate::models::VAD_SIZE_BYTES,
+                Some(paths::vad_model_path()),
             );
             for tm in crate::translate::MODELS {
-                check(crate::models::trans_binding_key(tm.key), tm.file_name, tm.size_bytes);
+                check(
+                    crate::models::trans_binding_key(tm.key),
+                    tm.file_name,
+                    tm.size_bytes,
+                    Some(paths::trans_model_path(tm.key, tm.file_name)),
+                );
             }
-            let _ = tx.send(found);
+            let _ = tx.send((found, duplicates));
         });
         self.scan_rx = Some(rx);
     }
@@ -826,15 +870,98 @@ impl SubgenApp {
     fn poll_scan(&mut self, ctx: &egui::Context) {
         let mut result = None;
         if let Some(rx) = &self.scan_rx
-            && let Ok(found) = rx.try_recv()
+            && let Ok(r) = rx.try_recv()
         {
-            result = Some(found);
+            result = Some(r);
         }
-        if let Some(found) = result {
+        if let Some((found, duplicates)) = result {
             self.scan_rx = None;
             self.scan_results = Some(found);
+            self.dup_results = Some(duplicates);
         }
         if self.scan_rx.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// "清理"按钮的入口:对某个模型已知的重复文件逐个哈希校验(只处理确认过哈希和期望值
+    /// 一致的副本——用户要求"先不去重",这里再加一层保险,不匹配的文件原样不动),验证
+    /// 通过的移到 `models_dir/_trash/`(软删除,不是真删,用户想反悔还能从那里找回来)。
+    pub(crate) fn begin_cleanup_duplicates(
+        &mut self,
+        binding_key: String,
+        label: String,
+        candidates: Vec<PathBuf>,
+        expected_sha256: &'static str,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = cancel.clone();
+        std::thread::spawn(move || {
+            let trash_dir = paths::models_dir().join("_trash");
+            let _ = std::fs::create_dir_all(&trash_dir);
+            let already_in_trash: std::collections::HashSet<String> = std::fs::read_dir(&trash_dir)
+                .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+                .unwrap_or_default();
+            let mut moved = 0usize;
+            let mut skipped: Vec<String> = Vec::new();
+            let mut trash_names = already_in_trash;
+            for candidate in candidates {
+                if cancel_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                let file_name = candidate
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                match setup::sha256_file_cancelable(&candidate, &cancel_thread) {
+                    Ok(digest) if setup::to_hex(&digest).eq_ignore_ascii_case(expected_sha256) => {
+                        let dst = crate::models::trash_destination(&trash_dir, &file_name, &trash_names);
+                        match std::fs::rename(&candidate, &dst) {
+                            Ok(()) => {
+                                trash_names.insert(
+                                    dst.file_name().and_then(|n| n.to_str()).unwrap_or(&file_name).to_string(),
+                                );
+                                moved += 1;
+                            }
+                            Err(e) => skipped.push(format!("{} 移动失败: {e}", candidate.display())),
+                        }
+                    }
+                    Ok(_) => skipped.push(format!("{} 哈希和预期不一致,未清理", candidate.display())),
+                    Err(e) => skipped.push(format!("{} 校验失败: {e}", candidate.display())),
+                }
+            }
+            let _ = tx.send((moved, skipped));
+        });
+        self.pending_cleanup = Some(PendingCleanup { binding_key, label, rx, cancel });
+    }
+
+    fn poll_cleanup(&mut self, ctx: &egui::Context) {
+        let mut finished: Option<(usize, Vec<String>)> = None;
+        if let Some(pc) = &self.pending_cleanup
+            && let Ok(result) = pc.rx.try_recv()
+        {
+            finished = Some(result);
+        }
+        if let Some((moved, skipped)) = finished {
+            let label = self.pending_cleanup.take().map(|p| p.label).unwrap_or_default();
+            for s in &skipped {
+                push_log(&mut self.log_lines, format!("{label} 清理: {s}"));
+            }
+            self.transient_notice = Some((
+                if skipped.is_empty() {
+                    format!("{label}:已清理 {moved} 份重复文件到 _trash")
+                } else {
+                    format!("{label}:已清理 {moved} 份,{} 份未处理(详见日志)", skipped.len())
+                },
+                std::time::Instant::now(),
+            ));
+            // 清理完之后候选列表已经不准了(文件挪走了),清掉避免用户对着过期的
+            // "发现候选"提示再点一次。
+            self.dup_results = None;
+        }
+        if self.pending_cleanup.is_some() {
             ctx.request_repaint();
         }
     }
@@ -1016,6 +1143,7 @@ impl eframe::App for SubgenApp {
         self.poll_verify(&ctx);
         self.poll_inline_install(&ctx);
         self.poll_scan(&ctx);
+        self.poll_cleanup(&ctx);
 
         // 记录当前窗口尺寸,在 on_exit 里一次性落盘(而不是每帧都写文件——拖拽调整窗口大小
         // 时每帧尺寸都在变,逐帧写盘没必要地增加磁盘 IO)。config.toml 里其实一直有这两个
