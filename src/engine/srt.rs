@@ -59,10 +59,12 @@ pub(super) fn collapse_repetitions(srt_path: &Path) -> Result<Option<String>, St
     Ok(first_repetition_at)
 }
 
-/// 极简 SRT 解析:按空行分块,每块取"起止时间戳"+"文本行拼接"。
-/// 不追求处理所有 SRT 边缘格式,够用来做重复检测/折叠即可。
-/// pub(crate) 因为 translate.rs 复用它来读取原文 srt、按块喂给翻译模型。
-pub(crate) fn parse_srt_blocks(content: &str) -> Vec<(String, String, String)> {
+/// 和 `parse_srt_blocks` 共享同一套块切分逻辑,但保留每块内部原始的多行结构、不拿空格
+/// 拼接——`parse_srt_blocks` 拼接是给"重复检测/整块喂给翻译模型"这类只关心整块文本的
+/// 场景用的,但双语字幕("中文\n原文"两行一块,见 `translate::build_output_blocks`)拼接后
+/// 会把中文和原文糊成一坨、丢掉行边界。`report.rs` 的复核报告需要单独取出第一行(不管
+/// 双语还是仅中文模式,写出时中文永远是每块的第一行)时就需要这份没拼接过的版本。
+pub(crate) fn parse_srt_blocks_lines(content: &str) -> Vec<(String, String, Vec<String>)> {
     let mut out = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
@@ -76,10 +78,10 @@ pub(crate) fn parse_srt_blocks(content: &str) -> Vec<(String, String, String)> {
                 let mut k = ts_line_idx + 1;
                 let mut text_lines = Vec::new();
                 while k < lines.len() && !lines[k].trim().is_empty() {
-                    text_lines.push(lines[k]);
+                    text_lines.push(lines[k].to_string());
                     k += 1;
                 }
-                out.push((start, end, text_lines.join(" ")));
+                out.push((start, end, text_lines));
                 i = k;
                 continue;
             }
@@ -87,6 +89,16 @@ pub(crate) fn parse_srt_blocks(content: &str) -> Vec<(String, String, String)> {
         i += 1;
     }
     out
+}
+
+/// 极简 SRT 解析:按空行分块,每块取"起止时间戳"+"文本行拼接"。
+/// 不追求处理所有 SRT 边缘格式,够用来做重复检测/折叠即可。
+/// pub(crate) 因为 translate.rs 复用它来读取原文 srt、按块喂给翻译模型。
+pub(crate) fn parse_srt_blocks(content: &str) -> Vec<(String, String, String)> {
+    parse_srt_blocks_lines(content)
+        .into_iter()
+        .map(|(start, end, lines)| (start, end, lines.join(" ")))
+        .collect()
 }
 
 pub(crate) fn write_srt_blocks(blocks: &[(String, String, String)]) -> String {
@@ -219,6 +231,21 @@ mod tests {
         let repetition_at = collapse_repetitions(&tmp).unwrap();
         assert_eq!(repetition_at, None, "正常内容不应该被判定为复读故障");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn parse_srt_blocks_lines_keeps_bilingual_lines_separate() {
+        // 双语字幕每块是"中文\n原文"两行(见 translate::build_output_blocks),
+        // parse_srt_blocks 会把它们拼成 "中文 原文" 一坨;parse_srt_blocks_lines 不该这样,
+        // 报告/回灌功能需要能单独拿到第一行(中文)。
+        let content = "1\n00:00:01,000 --> 00:00:02,000\n你好。\nHello there.\n\n";
+        let blocks = parse_srt_blocks_lines(content);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].2, vec!["你好。".to_string(), "Hello there.".to_string()]);
+
+        // parse_srt_blocks 本身的拼接行为必须逐字节保持不变(既有测试/调用方都依赖这个)。
+        let joined = parse_srt_blocks(content);
+        assert_eq!(joined[0].2, "你好。 Hello there.");
     }
 
     #[test]

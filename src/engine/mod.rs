@@ -28,7 +28,7 @@
 mod srt;
 mod whisper_log;
 
-pub(crate) use srt::{parse_srt_blocks, write_srt_blocks};
+pub(crate) use srt::{parse_srt_blocks, parse_srt_blocks_lines, write_srt_blocks};
 use srt::{collapse_repetitions, count_subtitle_blocks, srt_looks_complete};
 use whisper_log::{describe_exit_status, parse_detected_language, parse_progress_percent, recover_detected_language_from_log};
 

@@ -17,6 +17,7 @@ pub use server::LlamaServer;
 use crate::engine;
 use crate::paths;
 use prompt::{build_output_blocks, compute_context_tail, translate_batch_with_retry};
+pub(crate) use prompt::{looks_untranslated, split_leading_number};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

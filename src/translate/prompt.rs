@@ -142,7 +142,7 @@ fn retry_untranslated_lines(
 /// 空白不敏感)。只在原文本身含有实际文字内容(字母/汉字/假名等)时才判断——纯符号/
 /// 数字/音乐记号(比如"♪♪♪")本来就没有可翻译的文字,原样返回是对的,不该被当成
 /// 翻译失败。
-pub(super) fn looks_untranslated(original: &str, translated: &str) -> bool {
+pub(crate) fn looks_untranslated(original: &str, translated: &str) -> bool {
     original.chars().any(|c| c.is_alphabetic())
         && original.trim().eq_ignore_ascii_case(translated.trim())
 }
@@ -299,7 +299,7 @@ fn parse_numbered_response(content: &str, expected: usize) -> Result<Vec<String>
     Ok(out)
 }
 
-fn split_leading_number(line: &str) -> Option<(usize, &str)> {
+pub(crate) fn split_leading_number(line: &str) -> Option<(usize, &str)> {
     let digits_len = line.chars().take_while(|c| c.is_ascii_digit()).count();
     if digits_len == 0 {
         return None;
