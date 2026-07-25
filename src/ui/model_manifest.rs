@@ -1,17 +1,21 @@
 use crate::app::SubgenApp;
-use crate::format::model_status_line;
+use crate::format::{format_download_size, model_status_line};
 use crate::models::{FileKind, ModelStatus};
 use crate::setup::{status_for, ComponentKey};
 use eframe::egui;
 
-/// 清单一行:名称、用途、状态,以及"定位…"需要的全部信息。故意不带"选中的那个"这种
-/// 概念——用户要看的是"这几个模型各自处于什么状态",不是当前配置选了哪个,那是设置窗口
-/// 的职责。
+/// 清单一行:名称、用途、状态,以及"定位…"/"下载"需要的全部信息。故意不带"选中的那个"
+/// 这种概念——用户要看的是"这几个模型各自处于什么状态",不是当前配置选了哪个,那是设置
+/// 窗口的职责。
 struct Row {
     label: String,
     purpose: &'static str,
     status: ModelStatus,
     binding_key: String,
+    component_key: ComponentKey,
+    /// `install_component` 的 `model` 参数——只有 `ComponentKey::Model`(whisper)真正用到,
+    /// Vad/TransModel 忽略它,统一传空字符串。
+    whisper_model_arg: String,
     expected_kind: FileKind,
     expected_size: u64,
     /// 没有权威哈希可比对时是 `None`——目前三种模型都已经有哈希了(见项目计划 B1b),
@@ -32,6 +36,8 @@ fn collect_rows() -> Vec<Row> {
                 purpose: "语音识别",
                 status,
                 binding_key: crate::models::whisper_binding_key(wm.key),
+                component_key: ComponentKey::Model,
+                whisper_model_arg: wm.key.to_string(),
                 expected_kind: FileKind::Ggml,
                 expected_size: wm.size_bytes,
                 expected_sha256: wm.sha256,
@@ -45,6 +51,8 @@ fn collect_rows() -> Vec<Row> {
             purpose: "语音识别(辅助)",
             status,
             binding_key: crate::models::VAD_BINDING_KEY.to_string(),
+            component_key: ComponentKey::Vad,
+            whisper_model_arg: String::new(),
             expected_kind: FileKind::Ggml,
             expected_size: crate::models::VAD_SIZE_BYTES,
             expected_sha256: Some(crate::setup::VAD_SHA256),
@@ -58,6 +66,8 @@ fn collect_rows() -> Vec<Row> {
                 purpose: "翻译",
                 status,
                 binding_key: crate::models::trans_binding_key(tm.key),
+                component_key: ComponentKey::TransModel(tm.key),
+                whisper_model_arg: String::new(),
                 expected_kind: FileKind::Gguf,
                 expected_size: tm.size_bytes,
                 expected_sha256: Some(tm.sha256),
@@ -73,9 +83,18 @@ fn collect_rows() -> Vec<Row> {
 /// B6),避免"逐个确认"和"首次批量下载"分裂成两套代码。
 pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
     let rows = collect_rows();
-    let pending_key = app.pending_verify.as_ref().map(|pv| pv.binding_key.clone());
+    let pending_verify_key = app.pending_verify.as_ref().map(|pv| pv.binding_key.clone());
+    let installing_key = app.inline_install.as_ref().map(|i| i.key);
+    let install_progress = app.inline_install.as_ref().map(|i| (i.downloaded, i.total));
+    // 处理中(批次在跑)不允许改动存放目录里的文件——llama-server/whisper-cli 可能正
+    // 持有着这些文件,这时候写入是自找麻烦。同一时刻也只允许一项定位/下载在跑,避免
+    // 多个后台线程同时写 config.model_files 相互覆盖。
+    let actions_enabled = !app.processing && app.pending_verify.is_none() && app.inline_install.is_none();
+
     let mut locate_clicked: Option<usize> = None;
-    let mut cancel_clicked = false;
+    let mut download_clicked: Option<usize> = None;
+    let mut cancel_verify_clicked = false;
+    let mut cancel_install_clicked = false;
 
     egui::ScrollArea::vertical()
         .max_height(320.0)
@@ -96,11 +115,24 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                         ui.label(&row.label);
                         ui.label(row.purpose);
 
-                        let is_verifying = pending_key.as_deref() == Some(row.binding_key.as_str());
+                        let is_verifying = pending_verify_key.as_deref() == Some(row.binding_key.as_str());
+                        let is_installing = installing_key == Some(row.component_key);
                         if is_verifying {
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.weak("正在校验…");
+                            });
+                        } else if is_installing {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                match install_progress {
+                                    Some((d, t)) if t > 0 => ui.weak(format!(
+                                        "正在安装… {} / {}",
+                                        format_download_size(d),
+                                        format_download_size(t)
+                                    )),
+                                    _ => ui.weak("正在安装…"),
+                                }
                             });
                         } else {
                             let (text, color) = model_status_line(&row.status);
@@ -109,8 +141,9 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
 
                         ui.horizontal(|ui| {
                             let path = row.status.path();
+                            let busy = is_verifying || is_installing;
                             if ui
-                                .add_enabled(path.is_some() && !is_verifying, egui::Button::new("在文件夹中显示"))
+                                .add_enabled(path.is_some() && !busy, egui::Button::new("在文件夹中显示"))
                                 .clicked()
                                 && let Some(p) = path
                             {
@@ -119,7 +152,7 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                     .spawn();
                             }
                             if ui
-                                .add_enabled(path.is_some() && !is_verifying, egui::Button::new("复制路径"))
+                                .add_enabled(path.is_some() && !busy, egui::Button::new("复制路径"))
                                 .clicked()
                                 && let Some(p) = path
                             {
@@ -127,12 +160,23 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                             }
                             if is_verifying {
                                 if ui.button("取消").clicked() {
-                                    cancel_clicked = true;
+                                    cancel_verify_clicked = true;
                                 }
-                            } else if row.expected_sha256.is_some()
-                                && ui.button("定位…").clicked()
-                            {
-                                locate_clicked = Some(i);
+                            } else if is_installing {
+                                if ui.button("取消").clicked() {
+                                    cancel_install_clicked = true;
+                                }
+                            } else {
+                                if row.expected_sha256.is_some()
+                                    && ui.add_enabled(actions_enabled, egui::Button::new("定位…")).clicked()
+                                {
+                                    locate_clicked = Some(i);
+                                }
+                                if !row.status.is_ready()
+                                    && ui.add_enabled(actions_enabled, egui::Button::new("下载")).clicked()
+                                {
+                                    download_clicked = Some(i);
+                                }
                             }
                         });
                         ui.end_row();
@@ -140,10 +184,15 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                 });
         });
 
-    if cancel_clicked
+    if cancel_verify_clicked
         && let Some(pv) = &app.pending_verify
     {
         pv.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if cancel_install_clicked
+        && let Some(inst) = &app.inline_install
+    {
+        inst.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(i) = locate_clicked {
         let row = &rows[i];
@@ -160,5 +209,9 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                 row.extension_filter,
             );
         }
+    }
+    if let Some(i) = download_clicked {
+        let row = &rows[i];
+        app.begin_inline_install(row.component_key, row.label.clone(), row.whisper_model_arg.clone());
     }
 }

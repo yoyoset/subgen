@@ -1,4 +1,4 @@
-use crate::app::{SetupPhase, SubgenApp};
+use crate::app::SubgenApp;
 use crate::format::*;
 use crate::models::whisper;
 use crate::translate;
@@ -65,7 +65,6 @@ fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
             });
         if model_changed {
             app.config.save();
-            app.setup_phase = SetupPhase::Checking;
         }
     });
 
@@ -102,13 +101,13 @@ fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
     ui.separator();
     ui.add_space(4.0);
 
-    let mut needs_recheck = false;
+    let mut config_dirty = false;
     let mut translate = app.config.translate;
     // "本地模型"是给开发者看的实现细节;新手真正关心的是"要不要联网、内容会不会被
     // 传出去",直接把这个卖点说出来比暗示"用了本地模型"更直接。
     if ui.checkbox(&mut translate, "翻译成中文(在本机运行,不上传内容)").changed() {
         app.config.translate = translate;
-        needs_recheck = true;
+        config_dirty = true;
     }
 
     if app.config.translate {
@@ -129,7 +128,7 @@ fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
                         .clicked()
                     {
                         app.config.translate_model = "auto".to_string();
-                        needs_recheck = true;
+                        config_dirty = true;
                     }
                     for m in translate::MODELS {
                         if ui
@@ -137,7 +136,7 @@ fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
                             .clicked()
                         {
                             app.config.translate_model = m.key.to_string();
-                            needs_recheck = true;
+                            config_dirty = true;
                         }
                     }
                 });
@@ -150,8 +149,7 @@ fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
         }
     }
 
-    if needs_recheck {
+    if config_dirty {
         app.config.save();
-        app.setup_phase = SetupPhase::Checking;
     }
 }

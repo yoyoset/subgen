@@ -79,6 +79,16 @@ pub fn model_by_key(key: &str) -> Option<&'static TransModel> {
 
 /// 挑选翻译模型:`selected` 不是 "auto" 时尊重用户手动指定;否则按 `source_lang`
 /// 精确匹配某个模型的 `langs`,匹配不到就落到 `langs` 含 `"*"` 的兜底模型。
+/// 兜底/通用翻译模型(`langs` 含 `"*"` 的那个,目前是 Qwen3-4B)。除了 `pick_model` 自己用,
+/// `setup::missing_components` 也用它——"auto" 策略下不该强制要求所有翻译模型都在(见那边
+/// 的说明),只有这一个是必须的。
+pub fn fallback_model() -> &'static TransModel {
+    MODELS
+        .iter()
+        .find(|m| m.langs.contains(&"*"))
+        .expect("MODELS 中必须有一个兜底(langs 含 \"*\")模型")
+}
+
 pub fn pick_model(source_lang: &str, selected: &str) -> &'static TransModel {
     if selected != "auto"
         && let Some(m) = model_by_key(selected) {
@@ -88,12 +98,7 @@ pub fn pick_model(source_lang: &str, selected: &str) -> &'static TransModel {
     MODELS
         .iter()
         .find(|m| m.langs.contains(&lang.as_str()))
-        .unwrap_or_else(|| {
-            MODELS
-                .iter()
-                .find(|m| m.langs.contains(&"*"))
-                .expect("MODELS 中必须有一个兜底(langs 含 \"*\")模型")
-        })
+        .unwrap_or_else(fallback_model)
 }
 
 pub enum TranslateResult {
@@ -190,6 +195,13 @@ pub fn translate_srt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_model_is_qwen3_4b() {
+        // setup::missing_components 依赖这个返回值来决定"auto"策略下只要求哪一个翻译模型
+        // 齐全,固定断言具体是哪个,避免以后改注册表顺序时这个假设悄悄漂移。
+        assert_eq!(fallback_model().key, "qwen3-4b");
+    }
 
     #[test]
     fn pick_model_matches_japanese_to_sakura() {

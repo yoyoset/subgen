@@ -99,6 +99,9 @@ pub struct SubgenApp {
     /// 人收它的结果,静默结束——不需要显式互斥,`pending_verify` 被覆盖后旧的 `rx`/`cancel`
     /// 直接被丢弃,线程发送失败的 `Err` 会被忽略)。
     pub(crate) pending_verify: Option<PendingVerify>,
+    /// 模型清单里点"下载"正在装的那一项(同一时刻只有一个,和 `pending_verify` 同一种
+    /// 单槽设计)。见 `begin_inline_install`/`poll_inline_install`。
+    pub(crate) inline_install: Option<InlineInstall>,
 }
 
 /// 见 `SubgenApp::pending_verify` 字段说明。
@@ -109,6 +112,16 @@ pub(crate) struct PendingVerify {
     /// `Ok(true)` = 哈希匹配,应该绑定;`Ok(false)` = 哈希不匹配;`Err` = 读取失败或被取消。
     pub rx: mpsc::Receiver<Result<bool, String>>,
     pub cancel: Arc<AtomicBool>,
+}
+
+/// 见 `SubgenApp::inline_install` 字段说明。
+pub(crate) struct InlineInstall {
+    pub key: ComponentKey,
+    pub label: String,
+    pub rx: mpsc::Receiver<SetupEvent>,
+    pub cancel: Arc<AtomicBool>,
+    pub downloaded: u64,
+    pub total: u64,
 }
 
 /// 见 `SubgenApp::review` 字段说明。
@@ -157,6 +170,7 @@ impl SubgenApp {
             components_open: false,
             review: None,
             pending_verify: None,
+            inline_install: None,
         }
     }
 
@@ -641,6 +655,84 @@ impl SubgenApp {
         }
     }
 
+    /// 命中本地已有文件、决定绑定而不是复制/下载(见 `setup::install_or_bind`)——写进
+    /// config 才能跨进程记住,同步进程级绑定表才能这一轮立刻生效,不用等重启。两个来源
+    /// 共用:首次运行的整屏下载流程(`SetupEvent::ModelBound`)和清单里的"下载"内联安装
+    /// (`poll_inline_install`)。push_log 而不是静默处理——这是"省下了一次几 GB 下载"的
+    /// 用户可见事件,值得留痕。
+    fn apply_model_bound(&mut self, key: String, path: PathBuf) {
+        self.config.model_files.insert(key, path.to_string_lossy().to_string());
+        self.config.save();
+        paths::set_model_bindings(
+            self.config.model_files.iter().map(|(k, v)| (k.clone(), PathBuf::from(v))).collect(),
+        );
+        push_log(&mut self.log_lines, format!("已绑定到本地已有文件: {}", path.display()));
+    }
+
+    /// 模型清单里点"下载"的入口——不进整屏的 `SetupPhase::Downloading` 流程,单独起一个
+    /// 后台线程装这一个组件,用同一套 `setup::install_component`/`SetupEvent`,只是消费方
+    /// 换成 `poll_inline_install`。这样用户在设置里调整了某个用不上的选项(比如换了个还没
+    /// 下载的翻译模型)不会被强制拖回整屏下载页,只在真的想要那个模型时,就地点一下就装。
+    pub(crate) fn begin_inline_install(&mut self, key: ComponentKey, label: String, whisper_model: String) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let cancel_thread = cancel.clone();
+        std::thread::spawn(move || {
+            match setup::install_component(key, &whisper_model, &tx, &cancel_thread) {
+                Ok(()) => {
+                    let _ = tx.send(SetupEvent::AllReady);
+                }
+                Err(e) => {
+                    let _ = tx.send(SetupEvent::Failed(e));
+                }
+            }
+        });
+        self.inline_install = Some(InlineInstall { key, label, rx, cancel, downloaded: 0, total: 0 });
+    }
+
+    fn poll_inline_install(&mut self, ctx: &egui::Context) {
+        let mut logs: Vec<String> = Vec::new();
+        let mut bound: Option<(String, PathBuf)> = None;
+        let mut progress: Option<(u64, u64)> = None;
+        let mut finished: Option<Result<(), String>> = None;
+        if let Some(inst) = &self.inline_install {
+            while let Ok(ev) = inst.rx.try_recv() {
+                match ev {
+                    SetupEvent::Log(l) => logs.push(l),
+                    SetupEvent::Progress { downloaded, total, .. } => progress = Some((downloaded, total)),
+                    SetupEvent::ModelBound { key, path } => bound = Some((key, path)),
+                    SetupEvent::ComponentReady(_) | SetupEvent::AllReady => finished = Some(Ok(())),
+                    SetupEvent::Failed(e) => finished = Some(Err(e)),
+                }
+            }
+        }
+        for l in logs {
+            push_log(&mut self.log_lines, l);
+        }
+        if let Some((d, t)) = progress
+            && let Some(inst) = &mut self.inline_install
+        {
+            inst.downloaded = d;
+            inst.total = t;
+        }
+        if let Some((key, path)) = bound {
+            self.apply_model_bound(key, path);
+        }
+        if let Some(result) = finished {
+            let label = self.inline_install.take().map(|i| i.label).unwrap_or_default();
+            self.transient_notice = Some((
+                match &result {
+                    Ok(()) => format!("{label} 安装完成"),
+                    Err(e) => format!("{label} 安装失败: {e}"),
+                },
+                std::time::Instant::now(),
+            ));
+        }
+        if self.inline_install.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
     fn poll_verify(&mut self, ctx: &egui::Context) {
         let mut finished: Option<(String, String, PathBuf, Result<bool, String>)> = None;
         if let Some(pv) = &self.pending_verify
@@ -685,6 +777,7 @@ impl SubgenApp {
     fn poll_setup(&mut self, ctx: &egui::Context) {
         let mut done = false;
         let mut failed: Option<String> = None;
+        let mut bound: Vec<(String, PathBuf)> = Vec::new();
         if let Some(rx) = &self.setup_rx {
             while let Ok(ev) = rx.try_recv() {
                 match ev {
@@ -706,22 +799,7 @@ impl SubgenApp {
                             *t = total;
                         }
                     }
-                    SetupEvent::ModelBound { key, path } => {
-                        // 命中本地已有文件、决定绑定而不是复制/下载(见 setup::install_or_bind)
-                        // ——写进 config 才能跨进程记住,同步进程级绑定表才能这一轮立刻生效,
-                        // 不用等重启。push_log 而不是静默处理:这是"省下了一次几 GB 下载"的
-                        // 用户可见事件,值得留痕。
-                        self.config.model_files.insert(key, path.to_string_lossy().to_string());
-                        self.config.save();
-                        paths::set_model_bindings(
-                            self.config
-                                .model_files
-                                .iter()
-                                .map(|(k, v)| (k.clone(), PathBuf::from(v)))
-                                .collect(),
-                        );
-                        push_log(&mut self.log_lines, format!("已绑定到本地已有文件: {}", path.display()));
-                    }
+                    SetupEvent::ModelBound { key, path } => bound.push((key, path)),
                     SetupEvent::ComponentReady(label) => {
                         push_log(&mut self.log_lines, format!("{label} 安装完成"));
                         if let SetupPhase::Downloading {
@@ -744,6 +822,9 @@ impl SubgenApp {
                     SetupEvent::AllReady => done = true,
                 }
             }
+        }
+        for (key, path) in bound {
+            self.apply_model_bound(key, path);
         }
         if done {
             self.setup_phase = SetupPhase::Ready;
@@ -827,6 +908,7 @@ impl eframe::App for SubgenApp {
         self.poll_worker(&ctx);
         self.poll_migrate(&ctx);
         self.poll_verify(&ctx);
+        self.poll_inline_install(&ctx);
 
         // 记录当前窗口尺寸,在 on_exit 里一次性落盘(而不是每帧都写文件——拖拽调整窗口大小
         // 时每帧尺寸都在变,逐帧写盘没必要地增加磁盘 IO)。config.toml 里其实一直有这两个

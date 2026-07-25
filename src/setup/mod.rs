@@ -184,8 +184,11 @@ pub fn check_disk_space(missing: &[ComponentKey], whisper_model: &str, target_di
 }
 
 /// `translate_enabled` 为 false 时不检测/不下载任何翻译相关组件(不用的功能不该逼用户下载
-/// 几 GB 东西)。`translate_model` 为 "auto" 时两个翻译模型都要有(因为运行时按视频语言
-/// 动态选);指定具体模型时只需要那一个。
+/// 几 GB 东西)。`translate_model` 为 "auto" 时只要求兜底模型(`translate::fallback_model`)
+/// 齐全——不看日语的用户不该被迫留着 Sakura 的几个 GB。真遇到需要某个具体模型(比如日语
+/// 视频要 Sakura)但那个模型没装时,不在这里提前拦截,而是走 `job.rs` 已有的降级路径:
+/// `LlamaServer::start` 找不到文件会失败,这一个文件会带着"翻译引擎启动失败,已保留原文
+/// 字幕"的警告完成,不影响批次里其它文件,也不阻塞用户先把其它设置调好。
 pub fn missing_components(
     whisper_model: &str,
     translate_enabled: bool,
@@ -201,17 +204,13 @@ pub fn missing_components(
         keys.push(ComponentKey::Translator);
         // ComponentKey::TransModel 存的是 &'static str,不能直接塞调用方传入的 &str
         // (生命周期不够),所以从注册表里查出对应的 'static key 再用。查不到(比如配置文件
-        // 里存了个过期/拼错的 key)时按 "auto" 处理,把两个模型都要求齐全,run 时更保险。
-        let known = translate_model != "auto"
-            && crate::translate::model_by_key(translate_model).is_some();
-        if known {
-            let m = crate::translate::model_by_key(translate_model).unwrap();
-            keys.push(ComponentKey::TransModel(m.key));
+        // 里存了个过期/拼错的 key)时按 "auto" 处理,只要求兜底模型。
+        let m = if translate_model != "auto" {
+            crate::translate::model_by_key(translate_model).unwrap_or_else(crate::translate::fallback_model)
         } else {
-            for m in crate::translate::MODELS {
-                keys.push(ComponentKey::TransModel(m.key));
-            }
-        }
+            crate::translate::fallback_model()
+        };
+        keys.push(ComponentKey::TransModel(m.key));
     }
     keys.into_iter()
         .filter(|k| !is_present(*k, whisper_model))
