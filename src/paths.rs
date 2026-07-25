@@ -99,29 +99,44 @@ pub fn llama_server_exe() -> Option<PathBuf> {
     find_file_recursive(&translator_dir(), "llama-server.exe")
 }
 
-/// 和 `whisper_cli_exe`/`ffmpeg_exe`/`llama_server_exe` 一样递归查找,不假设 `models_dir()`
-/// 内部是平铺结构——这样 `models_dir_override` 可以直接指向用户自己的 HuggingFace 缓存目录
-/// (比如 `F:\hf_cache`,内部是 `hub/models--xxx/snapshots/<commit>/文件名` 这种嵌套结构,和
-/// 别的工具共用,不用再复制一份进 subgen 自己的目录)。找不到时退回原来那个平铺路径——这个
-/// 退回值同时也是 `setup.rs` 下载新模型时的写入目标,语义上依然正确,不需要另外维护一套
-/// "下载目标路径"。
+/// 在模型存放目录里查找 `file_name` 对应的实际文件,不假设 `models_dir()` 内部是平铺
+/// 结构(这样 `models_dir_override` 可以直接指向用户自己的 HuggingFace 缓存目录,比如
+/// `F:\hf_cache`,内部是 `hub/models--xxx/snapshots/<commit>/文件名` 这种嵌套结构,和
+/// 别的工具共用,不用再复制一份进 subgen 自己的目录)。只回答"现在在哪"这一个问题,
+/// 找不到返回 `None`——不像旧版 `model_path` 等函数那样在找不到时顺带算出一个"如果要
+/// 下载该放哪"的路径,那是 `store_path` 单独的职责(下面),两件事分开才不会在后面加
+/// "绑定路径"(见项目计划 B3)时把"解析"和"这个模型该被装到哪"这两件事继续混在一起。
+pub fn resolve_in_store(file_name: &str) -> Option<PathBuf> {
+    find_file_recursive(&models_dir(), file_name)
+}
+
+/// `file_name` 应该被写入(下载/复制)到的位置——不检查文件是否已存在,单纯是"新文件该
+/// 放哪"这个问题的答案。新装/更新模型时的写入目标用这个,不要和 `resolve_in_store` 的
+/// 返回值混用。
+pub fn store_path(file_name: &str) -> PathBuf {
+    models_dir().join(file_name)
+}
+
+/// whisper 语音识别模型路径:先在存放目录里找,找不到就退回"如果要下载该放哪"
+/// (`store_path`)——这个退回值同时也是 `setup.rs` 下载新模型时的写入目标,语义上依然
+/// 正确,不需要另外维护一套"下载目标路径"。
 pub fn model_path(model: &str) -> PathBuf {
     // 已注册的模型用注册表里的 file_name(单一事实来源);未注册的 key(比如配置文件里
     // 存了个过期/拼错的值)退回原来的模板,行为和收拢进注册表之前完全一致。
     let file_name = crate::models::whisper::by_key(model)
         .map(|m| m.file_name.to_string())
         .unwrap_or_else(|| format!("ggml-{model}.bin"));
-    find_file_recursive(&models_dir(), &file_name).unwrap_or_else(|| models_dir().join(file_name))
+    resolve_in_store(&file_name).unwrap_or_else(|| store_path(&file_name))
 }
 
 pub fn vad_model_path() -> PathBuf {
     let file_name = "ggml-silero-v5.1.2.bin";
-    find_file_recursive(&models_dir(), file_name).unwrap_or_else(|| models_dir().join(file_name))
+    resolve_in_store(file_name).unwrap_or_else(|| store_path(file_name))
 }
 
 /// 翻译模型(gguf)文件路径,文件名由调用方(translate.rs 的模型注册表)指定。
 pub fn trans_model_path(file_name: &str) -> PathBuf {
-    find_file_recursive(&models_dir(), file_name).unwrap_or_else(|| models_dir().join(file_name))
+    resolve_in_store(file_name).unwrap_or_else(|| store_path(file_name))
 }
 
 /// 视频文件名同名的字幕输出路径,如 EpisodeName.mkv -> EpisodeName.srt
@@ -173,6 +188,11 @@ mod tests {
         assert_eq!(model_path("large-v3"), custom.join("ggml-large-v3.bin"));
         assert_eq!(vad_model_path(), custom.join("ggml-silero-v5.1.2.bin"));
         assert_eq!(trans_model_path("qwen3.gguf"), custom.join("qwen3.gguf"));
+        // resolve_in_store/store_path 是上面几个函数拆出来的两块——目录不存在时,
+        // resolve_in_store 该老实返回 None(不是"猜"出一个路径),store_path 只管算写入
+        // 目标、不检查存在与否。
+        assert_eq!(resolve_in_store("ggml-large-v3.bin"), None);
+        assert_eq!(store_path("ggml-large-v3.bin"), custom.join("ggml-large-v3.bin"));
 
         // 模拟 HuggingFace 缓存那种嵌套结构(hub/models--xxx/snapshots/<commit>/文件),
         // 确认能在深层目录里找到文件,不要求平铺——这样 models_dir_override 才能直接指向
@@ -210,6 +230,11 @@ mod tests {
         );
         assert_eq!(model_path("large-v3"), large_v3_file, "应该在嵌套目录里找到语音模型");
         assert_eq!(vad_model_path(), vad_file, "应该在嵌套目录里找到 VAD 模型");
+        assert_eq!(
+            resolve_in_store("ggml-large-v3.bin"),
+            Some(large_v3_file.clone()),
+            "resolve_in_store 应该能直接在嵌套目录里找到文件"
+        );
         assert_eq!(
             trans_model_path("qwen3-not-downloaded-yet.gguf"),
             nested_root.join("qwen3-not-downloaded-yet.gguf"),
