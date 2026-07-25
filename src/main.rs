@@ -9,6 +9,7 @@ mod format;
 mod job;
 mod job_guard;
 mod paths;
+mod report;
 mod setup;
 mod translate;
 mod ui;

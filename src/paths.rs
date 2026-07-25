@@ -134,6 +134,15 @@ pub fn sidecar_srt_lang_path(video_path: &Path, lang: &str) -> PathBuf {
     video_path.with_file_name(format!("{stem}.{lang}.srt"))
 }
 
+/// 翻译复核报告的输出路径,如 EpisodeName.mkv -> EpisodeName.zh.review.txt
+pub fn sidecar_review_path(video_path: &Path) -> PathBuf {
+    let stem = video_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    video_path.with_file_name(format!("{stem}.zh.review.txt"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
