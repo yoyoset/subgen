@@ -90,6 +90,26 @@ pub struct SubgenApp {
     /// 模型存放目录这类"环境"信息在处理中依然可能想查看(比如确认这次到底用的是哪个
     /// 目录),不该和"改了要下一批才生效"的设置项混在一起。
     pub(crate) components_open: bool,
+    /// 详情区当前显示的翻译复核报告(见 report.rs)。只保存最近一次生成的这一份,而不是
+    /// 挂在 Job 结构体上长期持有——报告文本可能有几十 KB,只有正在查看的这一份需要留在
+    /// 内存里,切换到别的任务或重新生成会覆盖它。
+    pub(crate) review: Option<ReviewReportState>,
+}
+
+/// 见 `SubgenApp::review` 字段说明。
+pub(crate) struct ReviewReportState {
+    /// 这份报告对应界面列表里的哪个任务(原始下标)——用户切换选中的任务后,详情区不该
+    /// 继续显示上一个任务的报告。
+    pub job_index: usize,
+    pub text: String,
+    /// 生成报告时真正被粗筛标记为可疑的行下标(0-based)。粘贴修正回灌时只接受这些下标,
+    /// 不认识的编号一律忽略——不然一次误粘贴就可能覆盖没有问题的行。
+    pub suspect_indices: Vec<usize>,
+    pub saved_path: PathBuf,
+    /// "粘贴修正"输入框的内容。
+    pub correction_input: String,
+    /// 上一次点"应用修正"的结果文案(成功应用了几处/被忽略了哪些编号),None 表示还没点过。
+    pub correction_result: Option<String>,
 }
 
 impl SubgenApp {
@@ -120,6 +140,7 @@ impl SubgenApp {
             selected: None,
             settings_open: false,
             components_open: false,
+            review: None,
         }
     }
 
@@ -374,6 +395,166 @@ impl SubgenApp {
             tx,
             self.worker_cancel.clone(),
         );
+    }
+
+    /// 生成 `job_index` 对应任务的翻译复核报告:读原文/译文两份 srt、跑粗筛、格式化成文本、
+    /// 写到视频旁的 `.zh.review.txt`,同时存进 `self.review` 供详情面板显示/复制。
+    ///
+    /// 中文字幕文件可能是双语的("中文\n原文"两行一块)也可能是仅中文单行——不管哪种,
+    /// 写出时中文永远是每块的第一行(见 `translate::build_output_blocks`),所以这里用
+    /// `parse_srt_blocks_lines` 取每块的行数组、只拿第一行,而不是 `parse_srt_blocks`
+    /// (它会把多行块用空格拼接,双语文件会把中文和原文拼成一坨、失去边界)。
+    pub(crate) fn generate_review_report(&mut self, job_index: usize) {
+        let Some(job) = self.jobs.get(job_index) else {
+            return;
+        };
+        let video_path = job.video_path.clone();
+        let original_path = paths::sidecar_srt_path(&video_path);
+        let zh_path = paths::sidecar_srt_lang_path(&video_path, "zh");
+        let label = video_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let original_content = match std::fs::read_to_string(&original_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.transient_notice =
+                    Some((format!("找不到原文字幕: {e}"), std::time::Instant::now()));
+                return;
+            }
+        };
+        let zh_content = match std::fs::read_to_string(&zh_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.transient_notice =
+                    Some((format!("找不到中文字幕: {e}"), std::time::Instant::now()));
+                return;
+            }
+        };
+
+        let original_blocks = crate::engine::parse_srt_blocks(&original_content);
+        let zh_blocks: Vec<(String, String, String)> = crate::engine::parse_srt_blocks_lines(&zh_content)
+            .into_iter()
+            .map(|(start, end, lines)| (start, end, lines.into_iter().next().unwrap_or_default()))
+            .collect();
+
+        let suspects = match crate::report::detect_suspects(&original_blocks, &zh_blocks) {
+            Ok(s) => s,
+            Err(e) => {
+                self.transient_notice = Some((e, std::time::Instant::now()));
+                return;
+            }
+        };
+        let suspect_indices: Vec<usize> = suspects.iter().map(|s| s.index).collect();
+        let text = crate::report::format_review_report(&label, &original_blocks, &zh_blocks, &suspects);
+
+        let saved_path = paths::sidecar_review_path(&video_path);
+        let _ = std::fs::write(&saved_path, &text);
+
+        self.review = Some(ReviewReportState {
+            job_index,
+            text,
+            suspect_indices,
+            saved_path,
+            correction_input: String::new(),
+            correction_result: None,
+        });
+    }
+
+    /// 把用户粘贴回来的编号行("129. 修正后的译文")应用到对应任务的 `.zh.srt`。只接受
+    /// 这次生成报告时真正标记为可疑的下标(`self.review.suspect_indices`),不认识的编号
+    /// 一律忽略并在结果文案里列出来——不该让一次误粘贴覆盖到没有被标记过的行。
+    ///
+    /// 双语字幕每块有"中文\n原文"两行,只替换第一行(中文),保留后面的原文行不动;
+    /// 原文件先备份成 `.zh.srt.bak` 再覆盖写入。
+    pub(crate) fn apply_review_corrections(&mut self, job_index: usize) {
+        let Some(review) = &self.review else {
+            return;
+        };
+        if review.job_index != job_index {
+            return;
+        }
+        let pasted = review.correction_input.clone();
+        let allowed: std::collections::HashSet<usize> =
+            review.suspect_indices.iter().copied().collect();
+
+        let Some(job) = self.jobs.get(job_index) else {
+            return;
+        };
+        let zh_path = paths::sidecar_srt_lang_path(&job.video_path, "zh");
+
+        let zh_content = match std::fs::read_to_string(&zh_path) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(r) = &mut self.review {
+                    r.correction_result = Some(format!("读取中文字幕失败: {e}"));
+                }
+                return;
+            }
+        };
+        let mut blocks = crate::engine::parse_srt_blocks_lines(&zh_content);
+
+        let mut applied = 0usize;
+        let mut ignored: Vec<usize> = Vec::new();
+        for line in pasted.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((num, text)) = crate::translate::split_leading_number(line) else {
+                continue;
+            };
+            let index = num.saturating_sub(1);
+            if !allowed.contains(&index) {
+                ignored.push(num);
+                continue;
+            }
+            if let Some((_, _, lines)) = blocks.get_mut(index) {
+                if lines.is_empty() {
+                    lines.push(text.to_string());
+                } else {
+                    lines[0] = text.to_string();
+                }
+                applied += 1;
+            }
+        }
+
+        if applied == 0 {
+            if let Some(r) = &mut self.review {
+                r.correction_result = Some(if ignored.is_empty() {
+                    "没有识别到任何可应用的修正行(格式应为“编号. 修正后的译文”)".to_string()
+                } else {
+                    format!(
+                        "没有应用任何修正——这些编号不在本次报告标记的可疑行范围内: {}",
+                        ignored.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("、")
+                    )
+                });
+            }
+            return;
+        }
+
+        let backup_path = PathBuf::from(format!("{}.bak", zh_path.display()));
+        let _ = std::fs::write(&backup_path, &zh_content);
+
+        let out_blocks: Vec<(String, String, String)> = blocks
+            .into_iter()
+            .map(|(start, end, lines)| (start, end, lines.join("\n")))
+            .collect();
+        let _ = std::fs::write(&zh_path, crate::engine::write_srt_blocks(&out_blocks));
+
+        let msg = if ignored.is_empty() {
+            format!("已应用 {applied} 处修正(原文件已备份为 .bak)")
+        } else {
+            format!(
+                "已应用 {applied} 处修正(原文件已备份为 .bak);忽略了不在标记范围内的编号: {}",
+                ignored.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("、")
+            )
+        };
+        if let Some(r) = &mut self.review {
+            r.correction_result = Some(msg);
+            r.correction_input.clear();
+        }
     }
 
     fn poll_setup(&mut self, ctx: &egui::Context) {

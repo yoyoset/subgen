@@ -120,6 +120,7 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
     let mut open_folder_path: Option<PathBuf> = None;
     let mut toggle_preview = false;
     let mut jump_to_active = false;
+    let mut generate_report_clicked = false;
 
     {
         let job = &app.jobs[i];
@@ -176,6 +177,9 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
                     if ui.button(label).clicked() {
                         toggle_preview = true;
                     }
+                    if app.config.translate && ui.button("生成复核报告").clicked() {
+                        generate_report_clicked = true;
+                    }
                 }
             });
         });
@@ -192,6 +196,19 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
     if remove_clicked {
         app.jobs.remove(i);
         app.selected = reconcile_selection(app.selected, i, app.jobs.len());
+        // review.job_index 也是指向 app.jobs 的下标,和 selected 一样会被 remove 打乱
+        // (被移除项之后的下标全部要减一,指向被移除项本身的要清空)——不处理的话报告
+        // 面板下次渲染时可能悄悄挂在错误的任务上。
+        if let Some(job_index) = app.review.as_ref().map(|r| r.job_index) {
+            match reconcile_selection(Some(job_index), i, app.jobs.len()) {
+                Some(new_idx) => {
+                    if let Some(r) = app.review.as_mut() {
+                        r.job_index = new_idx;
+                    }
+                }
+                None => app.review = None,
+            }
+        }
     } else {
         if reprocess_clicked
             && let Some(j) = app.jobs.get_mut(i) {
@@ -201,10 +218,89 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
             && let Some(j) = app.jobs.get_mut(i) {
                 j.preview_open = !j.preview_open;
             }
+        if generate_report_clicked {
+            app.generate_review_report(i);
+        }
     }
     if let Some(path) = open_folder_path {
         let _ = std::process::Command::new("explorer")
             .arg(format!("/select,{}", path.display()))
             .spawn();
+    }
+    if !remove_clicked {
+        render_review_section(app, ui, i);
+    }
+}
+
+/// 翻译复核报告区:展示上一次为 `job_index` 生成的报告(见 `SubgenApp::generate_review_report`),
+/// 提供复制到剪贴板、可框选查看的文本区,以及粘贴修正回灌的入口。`app.review` 为 None 或
+/// 属于别的任务时不渲染任何东西——避免切换到别的文件时还残留上一个任务的报告。
+fn render_review_section(app: &mut SubgenApp, ui: &mut egui::Ui, job_index: usize) {
+    let (text, saved_path, suspect_count, correction_result) = match &app.review {
+        Some(r) if r.job_index == job_index => (
+            r.text.clone(),
+            r.saved_path.clone(),
+            r.suspect_indices.len(),
+            r.correction_result.clone(),
+        ),
+        _ => return,
+    };
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.heading("翻译复核报告");
+    ui.label(format!(
+        "标记 {suspect_count} 处疑似问题,已保存到 {}",
+        saved_path.display()
+    ));
+
+    let mut copy_clicked = false;
+    let mut regenerate_clicked = false;
+    ui.horizontal(|ui| {
+        if ui.button("复制到剪贴板").clicked() {
+            copy_clicked = true;
+        }
+        if ui.button("重新生成").clicked() {
+            regenerate_clicked = true;
+        }
+    });
+    if copy_clicked {
+        ui.ctx().copy_text(text.clone());
+    }
+
+    egui::ScrollArea::vertical()
+        .max_height(240.0)
+        .id_salt("review_report_scroll")
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(&text).selectable(true));
+        });
+
+    if suspect_count > 0 {
+        ui.add_space(6.0);
+        ui.label("粘贴修正(格式:“编号. 修正后的译文”,每行一条,只接受上面标记过的编号):");
+        if let Some(review) = app.review.as_mut() {
+            ui.add(
+                egui::TextEdit::multiline(&mut review.correction_input)
+                    .desired_rows(4)
+                    .hint_text("129. 修正后的译文"),
+            );
+        }
+        let mut apply_clicked = false;
+        ui.horizontal(|ui| {
+            if ui.button("应用修正").clicked() {
+                apply_clicked = true;
+            }
+            if let Some(msg) = &correction_result {
+                ui.weak(msg);
+            }
+        });
+        if apply_clicked {
+            app.apply_review_corrections(job_index);
+        }
+    }
+
+    if regenerate_clicked {
+        app.generate_review_report(job_index);
     }
 }
