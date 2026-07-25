@@ -57,7 +57,6 @@ const FFMPEG_SHA256: &str = "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12
 
 const VAD_URL: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
 const VAD_SHA256: &str = "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf";
-const VAD_SIZE_BYTES: u64 = 885_098;
 
 // llama.cpp release b10079,Windows CUDA 12.4 预编译版。哈希取自 GitHub Release API 返回的
 // 资产 digest 字段(下载前用 API 校验过,不是凭空写的)。不随附单独的 cudart 运行库包(那个
@@ -126,7 +125,7 @@ pub(crate) fn status_for(key: ComponentKey, model: &str) -> Option<crate::models
         }
         ComponentKey::Vad => {
             let path = paths::vad_model_path();
-            Some(crate::models::resolve_status(&path, crate::models::VAD_BINDING_KEY, VAD_SIZE_BYTES))
+            Some(crate::models::resolve_status(&path, crate::models::VAD_BINDING_KEY, crate::models::VAD_SIZE_BYTES))
         }
         ComponentKey::TransModel(key) => {
             let tm = crate::translate::model_by_key(key)?;
@@ -148,7 +147,7 @@ pub fn estimated_size_bytes(key: ComponentKey, model: &str) -> u64 {
         ComponentKey::Model => crate::models::whisper::by_key(model)
             .map(|m| m.size_bytes)
             .unwrap_or(3_000_000_000), // 未知档位,给一个保守估算,不影响功能只影响提示准确度
-        ComponentKey::Vad => VAD_SIZE_BYTES,
+        ComponentKey::Vad => crate::models::VAD_SIZE_BYTES,
         ComponentKey::Translator => 249_081_777,
         ComponentKey::TransModel(key) => crate::translate::model_by_key(key)
             .map(|m| m.size_bytes)

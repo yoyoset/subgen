@@ -138,10 +138,36 @@ pub fn format_download_size(bytes: u64) -> String {
     }
 }
 
-/// 把 ISO 639-1 语言代码翻成用户能看懂的中文名,覆盖界面语言下拉框里的选项(见
-/// Config::AVAILABLE_MODELS 旁边那个语言下拉的选项列表:auto/en/zh/ja/ko/fr/de/es)。
-/// 没覆盖到的代码原样返回而不是显示"未知"——保留原始信息总比丢掉信息更安全,万一以后
-/// whisper 检测出一个列表之外的语言代码,用户至少还能看到那串代码去查。
+/// 模型清单界面(`ui/model_manifest.rs`)每行的状态文案+颜色,和 `job_status_line` 是同一种
+/// "人话 + 颜色"配对风格。`Ready`/`SizeMismatch` 都带上大小信息(复用 `format_download_size`),
+/// 让用户不用另外去文件管理器里看属性就知道这个文件对不对。
+pub fn model_status_line(status: &crate::models::ModelStatus) -> (String, eframe::egui::Color32) {
+    use crate::models::ModelStatus;
+    match status {
+        ModelStatus::Ready { size, .. } => (
+            format!("已就绪 · {}", format_download_size(*size)),
+            eframe::egui::Color32::from_rgb(60, 170, 60),
+        ),
+        ModelStatus::Missing => ("未安装".to_string(), eframe::egui::Color32::GRAY),
+        ModelStatus::PathBroken { .. } => (
+            "绑定的文件已不在原位置(可能被移动或删除了)".to_string(),
+            eframe::egui::Color32::from_rgb(230, 150, 20),
+        ),
+        ModelStatus::SizeMismatch { expected, actual, .. } => (
+            format!(
+                "文件大小异常(期望 {},实际 {}),可能下载不完整",
+                format_download_size(*expected),
+                format_download_size(*actual)
+            ),
+            eframe::egui::Color32::RED,
+        ),
+    }
+}
+
+/// 把 ISO 639-1 语言代码翻成用户能看懂的中文名,覆盖 `ui/settings.rs` 语言下拉框的选项列表
+/// (auto/en/zh/ja/ko/fr/de/es)。没覆盖到的代码原样返回而不是显示"未知"——保留原始信息
+/// 总比丢掉信息更安全,万一以后 whisper 检测出一个列表之外的语言代码,用户至少还能看到
+/// 那串代码去查。
 pub fn lang_display(code: &str) -> &str {
     match code {
         "auto" => "自动检测",

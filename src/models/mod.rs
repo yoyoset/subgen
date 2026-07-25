@@ -26,6 +26,17 @@ impl ModelStatus {
     pub fn is_ready(&self) -> bool {
         matches!(self, ModelStatus::Ready { .. })
     }
+
+    /// 这个状态携带的路径,`Missing` 没有路径可言(从来没找到过任何候选)。清单界面用它
+    /// 决定"在文件夹中显示"/"复制路径"这两个操作要不要启用。
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            ModelStatus::Ready { path, .. }
+            | ModelStatus::PathBroken { path }
+            | ModelStatus::SizeMismatch { path, .. } => Some(path),
+            ModelStatus::Missing => None,
+        }
+    }
 }
 
 /// 纯函数:根据"解析到的路径"、"这个路径是不是来自显式绑定"、"文件当前实际大小(不存在则
@@ -68,6 +79,11 @@ pub const VAD_BINDING_KEY: &str = "vad";
 /// 注册表——但文件名之前在 paths.rs 和 setup/mod.rs 两处各写了一份字面量(见项目计划里
 /// 记录的这处重复),这里收成唯一一份,两边都改成引用它。
 pub const VAD_FILE_NAME: &str = "ggml-silero-v5.1.2.bin";
+
+/// VAD 模型的精确期望字节数,来自 HuggingFace LFS 指针核实过的真实值。之前在
+/// `setup::estimated_size_bytes` 里是个内联字面量,`ModelStatus` 需要同一个数字做精确
+/// 大小比对,收成一份常量,两处共用。
+pub const VAD_SIZE_BYTES: u64 = 885_098;
 
 #[cfg(test)]
 mod tests {
