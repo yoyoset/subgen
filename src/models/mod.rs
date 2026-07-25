@@ -122,6 +122,16 @@ pub enum PickOutcome {
     SizeMismatch { expected: u64, actual: u64 },
 }
 
+/// 这个文件名是不是"subgen 认得"的模型文件——判断依据是三个注册表(whisper::MODELS/
+/// VAD/translate::MODELS)本身,不是另外单独维护的一份名单,不会跟注册表脱节。
+/// `setup::migrate_models_dir` 用它决定"旧目录里哪些文件是 subgen 自己的、该跟着搬"
+/// ——目录可能是用户多个工具共用的缓存(比如指向 HF_HOME),不该把别的工具的文件也搬走。
+pub fn is_known_model_file_name(file_name: &str) -> bool {
+    whisper::MODELS.iter().any(|m| m.file_name == file_name)
+        || file_name == VAD_FILE_NAME
+        || crate::translate::MODELS.iter().any(|m| m.file_name == file_name)
+}
+
 /// 纯函数:根据选中文件的魔数+实际大小,和这一行模型期望的类型+大小比对。
 pub fn classify_picked_file(
     magic: [u8; 4],
@@ -205,6 +215,23 @@ mod tests {
     fn sniff_kind_returns_none_for_unknown_magic() {
         assert_eq!(sniff_kind([0, 0, 0, 0]), None);
         assert_eq!(sniff_kind(*b"RIFF"), None); // 比如误选了个 wav/avi 文件
+    }
+
+    #[test]
+    fn is_known_model_file_name_recognizes_all_three_registries() {
+        assert!(is_known_model_file_name("ggml-large-v3.bin"));
+        assert!(is_known_model_file_name(VAD_FILE_NAME));
+        assert!(is_known_model_file_name("sakura-7b-qwen2.5-v1.0-iq4xs.gguf"));
+        assert!(is_known_model_file_name("Qwen3-4B-Instruct-2507-Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn is_known_model_file_name_rejects_unrelated_files() {
+        // 真实场景:models_dir 可能指向用户多个工具共用的 HF 缓存(比如 HF_HOME),
+        // 里面会有别的工具的文件(这个会话里实测发现过一个漫画 OCR 模型),不该被
+        // 误认成 subgen 自己的东西。
+        assert!(!is_known_model_file_name("pytorch_model.bin")); // manga-ocr 用的文件名
+        assert!(!is_known_model_file_name("random_file.txt"));
     }
 
     #[test]

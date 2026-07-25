@@ -24,10 +24,14 @@ pub enum MigrateEvent {
     AllDone(Vec<String>),
 }
 
-/// 把 `old_dir` 下的所有文件搬到 `new_dir`。不针对具体文件名(不维护一份"已知模型文件名"
-/// 清单,那份清单容易漏、容易跟 translate::MODELS 等注册表脱节),而是"旧目录里有什么就搬
-/// 什么"——models_dir() 本来就是个平铺目录,不该有用户不认识的东西在里面,这样处理更通用,
-/// 也顺带覆盖了用户手动放进去的文件。
+/// 把 `old_dir` 下 subgen 认识的文件(见 `models::is_known_model_file_name`)搬到 `new_dir`。
+///
+/// 早期版本这里是"旧目录里有什么就搬什么",不按文件名过滤——当时的顾虑是"维护一份已知
+/// 文件名清单容易漏、容易跟注册表脱节"。这个顾虑现在不成立了:`is_known_model_file_name`
+/// 直接查三个注册表本身(whisper::MODELS/VAD/translate::MODELS),不是另外单独维护的名单,
+/// 不会脱节。而不过滤的真实代价被实测证实过:这位用户的模型目录指向多个 AI 工具共用的
+/// HF 缓存(HF_HOME),里面混着别的工具的文件(会话里实测发现过一个漫画 OCR 模型),不过滤
+/// 就会把这些不相干的文件也一起搬走。
 ///
 /// 目标目录如果已经有同名文件:大小相同就当作"已经搬过/本来就有效"跳过,不重新搬;大小不同
 /// 时为避免误覆盖一份可能是有效的文件,直接跳过并留在原地——这份文件的最终有效性由外层
@@ -50,7 +54,17 @@ pub fn migrate_models_dir(
     }
 
     let entries: Vec<PathBuf> = match std::fs::read_dir(old_dir) {
-        Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect(),
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(crate::models::is_known_model_file_name)
+                    .unwrap_or(false)
+            })
+            .collect(),
         Err(_) => Vec::new(), // 旧目录不存在/读不了,当作没有东西要搬,不算错误
     };
 
@@ -85,6 +99,37 @@ pub fn migrate_models_dir(
         }
     }
     issues
+}
+
+/// 搬迁完成后,把绑定表(`Config.model_files`)里指向旧目录的路径改写成新目录——绑定存的
+/// 是绝对路径,文件物理搬走后旧路径就失效了,不改写的话用户明明装着但界面会显示"绑定的
+/// 文件已不在原位置"。纯函数,不碰文件系统:`files_present_in_new_dir` 由调用方查好传
+/// 进来(新目录下实际有哪些文件名,决定"这个绑定对应的文件是不是真的到新目录了"——只有
+/// `dst.exists()` 分支跳过复制的情况,新旧目录会同时有这个文件,那种情况也该改写,判断
+/// 依据统一成"新目录下这个文件名在不在",不需要区分是复制过去的还是原本就在)。
+/// 只处理路径的**父目录精确等于** `old_dir` 的绑定(搬迁本身就只是平铺一层,不递归),
+/// 不在新目录里的文件名原样保留,大概率是搬迁时因为大小不一致被跳过、留在原地了。
+pub fn rewrite_bindings_after_migration(
+    bindings: &std::collections::BTreeMap<String, String>,
+    old_dir: &Path,
+    new_dir: &Path,
+    files_present_in_new_dir: &std::collections::HashSet<String>,
+) -> std::collections::BTreeMap<String, String> {
+    bindings
+        .iter()
+        .map(|(key, path_str)| {
+            let path = Path::new(path_str);
+            let rewritten = match (path.parent(), path.file_name().and_then(|f| f.to_str())) {
+                (Some(parent), Some(file_name))
+                    if parent == old_dir && files_present_in_new_dir.contains(file_name) =>
+                {
+                    new_dir.join(file_name).to_string_lossy().to_string()
+                }
+                _ => path_str.clone(),
+            };
+            (key.clone(), rewritten)
+        })
+        .collect()
 }
 
 fn migrate_one_file(
@@ -221,16 +266,16 @@ mod tests {
         let old_dir = temp_subdir("migrate_move_old");
         let new_dir = temp_subdir("migrate_move_new");
         std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::write(old_dir.join("model.bin"), b"hello model").unwrap();
+        std::fs::write(old_dir.join(crate::models::VAD_FILE_NAME), b"hello model").unwrap();
 
         let (tx, _rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let issues = migrate_models_dir(&old_dir, &new_dir, &tx, &cancel);
 
         assert!(issues.is_empty(), "正常搬迁不应该有问题: {issues:?}");
-        assert!(!old_dir.join("model.bin").exists(), "源文件应该被搬走");
+        assert!(!old_dir.join(crate::models::VAD_FILE_NAME).exists(), "源文件应该被搬走");
         assert_eq!(
-            std::fs::read(new_dir.join("model.bin")).unwrap(),
+            std::fs::read(new_dir.join(crate::models::VAD_FILE_NAME)).unwrap(),
             b"hello model",
             "新目录里的文件内容应该和原文件一致"
         );
@@ -245,17 +290,17 @@ mod tests {
         let new_dir = temp_subdir("migrate_skip_same_new");
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::create_dir_all(&new_dir).unwrap();
-        std::fs::write(old_dir.join("model.bin"), b"same size!!").unwrap(); // 11 bytes
-        std::fs::write(new_dir.join("model.bin"), b"already here").unwrap(); // 12 bytes,故意不同
+        std::fs::write(old_dir.join(crate::models::VAD_FILE_NAME), b"same size!!").unwrap(); // 11 bytes
+        std::fs::write(new_dir.join(crate::models::VAD_FILE_NAME), b"already here").unwrap(); // 12 bytes,故意不同
 
         // 先测大小不同的情况:应该跳过,两边都保留原样
         let (tx, _rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let issues = migrate_models_dir(&old_dir, &new_dir, &tx, &cancel);
         assert!(issues.is_empty(), "跳过不算错误,不应该出现在 issues 里");
-        assert!(old_dir.join("model.bin").exists(), "大小不一致时不应该删除源文件");
+        assert!(old_dir.join(crate::models::VAD_FILE_NAME).exists(), "大小不一致时不应该删除源文件");
         assert_eq!(
-            std::fs::read(new_dir.join("model.bin")).unwrap(),
+            std::fs::read(new_dir.join(crate::models::VAD_FILE_NAME)).unwrap(),
             b"already here",
             "大小不一致时不应该覆盖目标目录里已有的文件"
         );
@@ -272,19 +317,106 @@ mod tests {
         std::fs::create_dir_all(&new_dir).unwrap();
         // 大小相同(都是 11 字节),内容其实不同也没关系——这一步只用大小做"看起来已经
         // 搬过"的启发式判断,不做内容比对(见 migrate_one_file 的注释)。
-        std::fs::write(old_dir.join("model.bin"), b"source data").unwrap();
-        std::fs::write(new_dir.join("model.bin"), b"target data").unwrap();
+        std::fs::write(old_dir.join(crate::models::VAD_FILE_NAME), b"source data").unwrap();
+        std::fs::write(new_dir.join(crate::models::VAD_FILE_NAME), b"target data").unwrap();
 
         let (tx, _rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let issues = migrate_models_dir(&old_dir, &new_dir, &tx, &cancel);
         assert!(issues.is_empty());
         // 跳过时不会去删源文件(migrate_one_file 里"已存在"分支直接 return,不碰源文件)
-        assert!(old_dir.join("model.bin").exists());
-        assert_eq!(std::fs::read(new_dir.join("model.bin")).unwrap(), b"target data");
+        assert!(old_dir.join(crate::models::VAD_FILE_NAME).exists());
+        assert_eq!(std::fs::read(new_dir.join(crate::models::VAD_FILE_NAME)).unwrap(), b"target data");
 
         let _ = std::fs::remove_dir_all(&old_dir);
         let _ = std::fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn migrate_ignores_files_not_recognized_by_any_registry() {
+        // 真实场景:models_dir 可能指向多个工具共用的缓存目录(这位用户的 HF_HOME 就是
+        // 这样),里面混着别的工具的文件——不该被当成 subgen 自己的东西搬走。
+        let old_dir = temp_subdir("migrate_ignore_unknown_old");
+        let new_dir = temp_subdir("migrate_ignore_unknown_new");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("pytorch_model.bin"), b"not subgen's file").unwrap();
+        std::fs::write(old_dir.join(crate::models::VAD_FILE_NAME), b"this one is subgen's").unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let issues = migrate_models_dir(&old_dir, &new_dir, &tx, &cancel);
+
+        assert!(issues.is_empty(), "{issues:?}");
+        assert!(
+            old_dir.join("pytorch_model.bin").exists(),
+            "不认识的文件应该原样留在旧目录,不该被搬走"
+        );
+        assert!(
+            !new_dir.join("pytorch_model.bin").exists(),
+            "不认识的文件不该出现在新目录"
+        );
+        assert!(
+            !old_dir.join(crate::models::VAD_FILE_NAME).exists(),
+            "认识的文件应该照常搬走"
+        );
+        assert!(new_dir.join(crate::models::VAD_FILE_NAME).exists(), "认识的文件应该照常搬到新目录");
+
+        let _ = std::fs::remove_dir_all(&old_dir);
+        let _ = std::fs::remove_dir_all(&new_dir);
+    }
+
+    #[test]
+    fn rewrite_bindings_after_migration_updates_paths_under_old_dir() {
+        let old_dir = PathBuf::from(r"C:\old\models");
+        let new_dir = PathBuf::from(r"D:\new\models");
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert(
+            "trans:sakura-7b".to_string(),
+            old_dir.join("sakura.gguf").to_string_lossy().to_string(),
+        );
+        let mut present = std::collections::HashSet::new();
+        present.insert("sakura.gguf".to_string());
+
+        let rewritten = rewrite_bindings_after_migration(&bindings, &old_dir, &new_dir, &present);
+        assert_eq!(
+            rewritten.get("trans:sakura-7b"),
+            Some(&new_dir.join("sakura.gguf").to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_bindings_after_migration_leaves_paths_outside_old_dir_untouched() {
+        // 用户用"定位…"手动绑定的文件可能压根不在 models_dir 底下,搬迁跟它没关系。
+        let old_dir = PathBuf::from(r"C:\old\models");
+        let new_dir = PathBuf::from(r"D:\new\models");
+        let mut bindings = std::collections::BTreeMap::new();
+        let elsewhere = PathBuf::from(r"E:\somewhere\else\qwen.gguf").to_string_lossy().to_string();
+        bindings.insert("trans:qwen3-4b".to_string(), elsewhere.clone());
+        let present = std::collections::HashSet::new();
+
+        let rewritten = rewrite_bindings_after_migration(&bindings, &old_dir, &new_dir, &present);
+        assert_eq!(rewritten.get("trans:qwen3-4b"), Some(&elsewhere));
+    }
+
+    #[test]
+    fn rewrite_bindings_after_migration_leaves_path_when_file_not_present_in_new_dir() {
+        // 大小不一致被跳过、留在旧目录的文件——不该被改写指向一个实际上没有这个文件的
+        // 新目录。
+        let old_dir = PathBuf::from(r"C:\old\models");
+        let new_dir = PathBuf::from(r"D:\new\models");
+        let mut bindings = std::collections::BTreeMap::new();
+        bindings.insert(
+            "whisper:large-v3".to_string(),
+            old_dir.join("ggml-large-v3.bin").to_string_lossy().to_string(),
+        );
+        let present = std::collections::HashSet::new(); // 新目录里没有这个文件
+
+        let rewritten = rewrite_bindings_after_migration(&bindings, &old_dir, &new_dir, &present);
+        assert_eq!(
+            rewritten.get("whisper:large-v3"),
+            Some(&old_dir.join("ggml-large-v3.bin").to_string_lossy().to_string()),
+            "新目录里没有这个文件时不该改写绑定"
+        );
     }
 
     #[test]
@@ -310,16 +442,19 @@ mod tests {
         let old_dir = temp_subdir("migrate_cancel_old");
         let new_dir = temp_subdir("migrate_cancel_new");
         std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::write(old_dir.join("a.bin"), b"a").unwrap();
-        std::fs::write(old_dir.join("b.bin"), b"b").unwrap();
+        std::fs::write(old_dir.join(crate::models::VAD_FILE_NAME), b"a").unwrap();
+        std::fs::write(old_dir.join(crate::models::whisper::LARGE_V3.file_name), b"b").unwrap();
 
         let (tx, _rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(true)); // 从一开始就是取消状态
         let issues = migrate_models_dir(&old_dir, &new_dir, &tx, &cancel);
 
         assert!(!issues.is_empty(), "被取消应该在 issues 里留下说明,不能悄无声息");
-        assert!(old_dir.join("a.bin").exists(), "取消时源文件不应该丢失");
-        assert!(old_dir.join("b.bin").exists(), "取消时源文件不应该丢失");
+        assert!(old_dir.join(crate::models::VAD_FILE_NAME).exists(), "取消时源文件不应该丢失");
+        assert!(
+            old_dir.join(crate::models::whisper::LARGE_V3.file_name).exists(),
+            "取消时源文件不应该丢失"
+        );
 
         let _ = std::fs::remove_dir_all(&old_dir);
         let _ = std::fs::remove_dir_all(&new_dir);

@@ -36,7 +36,7 @@ pub enum SetupEvent {
 mod download;
 mod migrate;
 
-pub use migrate::{migrate_models_dir, MigrateEvent};
+pub use migrate::{migrate_models_dir, rewrite_bindings_after_migration, MigrateEvent};
 
 use download::{download_and_extract_zip, download_file, sha256_file};
 pub(crate) use download::{sha256_file_cancelable, to_hex};

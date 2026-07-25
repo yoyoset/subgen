@@ -349,6 +349,24 @@ impl SubgenApp {
             // 到新位置——已经搬过去的文件才是准确的当前状态,剩下的缺口交给现成的
             // missing_components() 首次下载流程去补齐,不需要为这个中间状态单独处理。
             if let Some(new_dir) = self.pending_models_dir.take() {
+                // 绑定表存的是绝对路径,文件物理搬走后旧路径就失效了——在切换生效目录之前
+                // (还能读到旧的 models_dir())把指向旧目录的绑定改写到新目录,不然界面会把
+                // 明明装着的模型显示成"绑定的文件已不在原位置"。
+                let old_dir = paths::models_dir();
+                let files_present_in_new_dir: std::collections::HashSet<String> = std::fs::read_dir(&new_dir)
+                    .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
+                    .unwrap_or_default();
+                self.config.model_files = setup::rewrite_bindings_after_migration(
+                    &self.config.model_files,
+                    &old_dir,
+                    &new_dir,
+                    &files_present_in_new_dir,
+                );
+                // 立刻同步进程级绑定表——不然改写只在 config.toml 里生效,这一次运行期间
+                // 界面读到的还是旧路径,得等重启才能看到效果。
+                paths::set_model_bindings(
+                    self.config.model_files.iter().map(|(k, v)| (k.clone(), PathBuf::from(v))).collect(),
+                );
                 self.commit_models_dir(new_dir);
             } else {
                 self.setup_phase = SetupPhase::Checking;
@@ -384,6 +402,23 @@ impl SubgenApp {
 
     pub(crate) fn start_processing(&mut self) {
         if self.jobs.is_empty() || self.processing {
+            return;
+        }
+        // 开工前预检:复用 missing_components 同一份"这批真正需要什么"的判断(B8 已经
+        // relax 过——"auto" 只要求兜底翻译模型),缺了就老实说清楚缺什么,不开工。不这样
+        // 做的话,20 个文件的批次可能在第 1 个文件语音识别跑完之后,翻译阶段才发现模型没装,
+        // 白白浪费识别那几分钟,而且用户设置改动已经不再触发整屏检查(见 B8),这里是
+        // 唯一还会主动拦一下的地方。
+        let missing = setup::missing_components(&self.config.model, self.config.translate, &self.config.translate_model);
+        if !missing.is_empty() {
+            let names: Vec<&str> = missing.iter().map(|k| k.label()).collect();
+            self.transient_notice = Some((
+                format!(
+                    "还差这些组件没装好,暂时无法开始:{}(可以在“组件与存放位置”里查看/下载)",
+                    names.join("、")
+                ),
+                std::time::Instant::now(),
+            ));
             return;
         }
         // 只重新处理还没成功完成的任务——重新点"开始处理"不应该把已经出字幕的文件再跑一遍
