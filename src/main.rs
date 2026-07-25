@@ -8,6 +8,7 @@ mod engine;
 mod format;
 mod job;
 mod job_guard;
+mod models;
 mod paths;
 mod report;
 mod setup;

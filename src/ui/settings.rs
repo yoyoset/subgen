@@ -1,6 +1,6 @@
 use crate::app::{SetupPhase, SubgenApp};
-use crate::config::Config;
 use crate::format::*;
+use crate::models::whisper;
 use crate::translate;
 use eframe::egui;
 
@@ -51,14 +51,14 @@ fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
         egui::ComboBox::from_id_salt("model")
             .selected_text(app.config.model.clone())
             .show_ui(ui, |ui| {
-                for (key, desc) in Config::AVAILABLE_MODELS {
-                    let selected = app.config.model == *key;
+                for m in whisper::MODELS {
+                    let selected = app.config.model == m.key;
                     if ui
-                        .selectable_label(selected, format!("{key} - {desc}"))
+                        .selectable_label(selected, format!("{} - {}", m.key, m.label))
                         .clicked()
                         && !selected
                     {
-                        app.config.model = key.to_string();
+                        app.config.model = m.key.to_string();
                         model_changed = true;
                     }
                 }

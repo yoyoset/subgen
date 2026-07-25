@@ -106,7 +106,11 @@ pub fn llama_server_exe() -> Option<PathBuf> {
 /// 退回值同时也是 `setup.rs` 下载新模型时的写入目标,语义上依然正确,不需要另外维护一套
 /// "下载目标路径"。
 pub fn model_path(model: &str) -> PathBuf {
-    let file_name = format!("ggml-{model}.bin");
+    // 已注册的模型用注册表里的 file_name(单一事实来源);未注册的 key(比如配置文件里
+    // 存了个过期/拼错的值)退回原来的模板,行为和收拢进注册表之前完全一致。
+    let file_name = crate::models::whisper::by_key(model)
+        .map(|m| m.file_name.to_string())
+        .unwrap_or_else(|| format!("ggml-{model}.bin"));
     find_file_recursive(&models_dir(), &file_name).unwrap_or_else(|| models_dir().join(file_name))
 }
 

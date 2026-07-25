@@ -60,18 +60,6 @@ const TRANSLATOR_URL: &str =
     "https://github.com/ggml-org/llama.cpp/releases/download/b10079/llama-b10079-bin-win-cuda-12.4-x64.zip";
 const TRANSLATOR_SHA256: &str = "3f94750a057e22e970e5fc6e4960dddd018baf4ed69829c84d1a2f09b5894bdd";
 
-fn model_url(model: &str) -> String {
-    format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model}.bin")
-}
-
-/// 完整下载 + 本地 sha256sum 验证过的哈希(large-v3 已复核,与 HF 响应头一致)。
-fn model_sha256_hint(model: &str) -> Option<&'static str> {
-    match model {
-        "large-v3" => Some("64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2"),
-        _ => None,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentKey {
     Engine,
@@ -132,12 +120,9 @@ pub fn estimated_size_bytes(key: ComponentKey, model: &str) -> u64 {
     match key {
         ComponentKey::Engine => 677_887_125,
         ComponentKey::Ffmpeg => 109_728_040,
-        ComponentKey::Model => match model {
-            "large-v3" => 3_095_033_483,
-            "large-v3-turbo" => 1_624_555_275,
-            "medium" => 1_533_763_059,
-            _ => 3_000_000_000, // 未知档位,给一个保守估算,不影响功能只影响提示准确度
-        },
+        ComponentKey::Model => crate::models::whisper::by_key(model)
+            .map(|m| m.size_bytes)
+            .unwrap_or(3_000_000_000), // 未知档位,给一个保守估算,不影响功能只影响提示准确度
         ComponentKey::Vad => 885_098,
         ComponentKey::Translator => 249_081_777,
         ComponentKey::TransModel(key) => crate::translate::model_by_key(key)
@@ -246,15 +231,11 @@ pub fn install_component(
             }
             Ok(())
         }
-        ComponentKey::Model => download_file(
-            key.label(),
-            &model_url(model),
-            model_sha256_hint(model),
-            true,
-            &paths::model_path(model),
-            tx,
-            cancel,
-        ),
+        ComponentKey::Model => {
+            let wm = crate::models::whisper::by_key(model)
+                .ok_or_else(|| format!("未知的语音识别模型标识: {model}"))?;
+            download_file(key.label(), wm.url, wm.sha256, true, &paths::model_path(model), tx, cancel)
+        }
         ComponentKey::Vad => download_file(
             key.label(),
             VAD_URL,
