@@ -154,8 +154,7 @@ pub fn vad_model_path() -> PathBuf {
     if let Some(bound) = model_binding(crate::models::VAD_BINDING_KEY) {
         return bound;
     }
-    let file_name = "ggml-silero-v5.1.2.bin";
-    resolve_in_store(file_name).unwrap_or_else(|| store_path(file_name))
+    resolve_in_store(crate::models::VAD_FILE_NAME).unwrap_or_else(|| store_path(crate::models::VAD_FILE_NAME))
 }
 
 /// 翻译模型(gguf)文件路径。`key` 是 translate::MODELS 里的模型标识(如 "sakura-7b"),

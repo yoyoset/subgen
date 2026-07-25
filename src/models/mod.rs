@@ -19,6 +19,11 @@ pub fn trans_binding_key(model_key: &str) -> String {
 
 pub const VAD_BINDING_KEY: &str = "vad";
 
+/// VAD(语音活动检测)模型是单例,不像 whisper/翻译模型那样有多个可选档位,不需要一整个
+/// 注册表——但文件名之前在 paths.rs 和 setup/mod.rs 两处各写了一份字面量(见项目计划里
+/// 记录的这处重复),这里收成唯一一份,两边都改成引用它。
+pub const VAD_FILE_NAME: &str = "ggml-silero-v5.1.2.bin";
+
 #[cfg(test)]
 mod tests {
     use super::*;

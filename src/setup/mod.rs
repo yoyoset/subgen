@@ -23,6 +23,12 @@ pub enum SetupEvent {
         total: u64,
     },
     ComponentReady(String),
+    /// 命中本地已有文件(HF 缓存,或者以后其它已知位置)且哈希校验通过,不用复制/下载,
+    /// 直接把这个模型绑定到那个文件——调用方(app.rs::poll_setup)据此更新
+    /// `Config.model_files` 并同步进程级绑定表(`paths::set_model_bindings`),不然要等
+    /// 重启才生效,而这个模型这一轮理应立刻可用。`key` 是 `models::*_binding_key` 生成的
+    /// 绑定表 key。
+    ModelBound { key: String, path: PathBuf },
     Failed(String),
     AllReady,
 }
@@ -234,14 +240,24 @@ pub fn install_component(
         ComponentKey::Model => {
             let wm = crate::models::whisper::by_key(model)
                 .ok_or_else(|| format!("未知的语音识别模型标识: {model}"))?;
-            download_file(key.label(), wm.url, wm.sha256, true, &paths::model_path(model), tx, cancel)
+            install_or_bind(
+                key.label(),
+                crate::models::whisper_binding_key(model),
+                wm.file_name,
+                wm.url,
+                wm.sha256,
+                &paths::store_path(wm.file_name),
+                tx,
+                cancel,
+            )
         }
-        ComponentKey::Vad => download_file(
+        ComponentKey::Vad => install_or_bind(
             key.label(),
+            crate::models::VAD_BINDING_KEY.to_string(),
+            crate::models::VAD_FILE_NAME,
             VAD_URL,
             Some(VAD_SHA256),
-            true,
-            &paths::vad_model_path(),
+            &paths::store_path(crate::models::VAD_FILE_NAME),
             tx,
             cancel,
         ),
@@ -265,58 +281,101 @@ pub fn install_component(
         ComponentKey::TransModel(model_key) => {
             let tm = crate::translate::model_by_key(model_key)
                 .ok_or_else(|| format!("未知的翻译模型标识: {model_key}"))?;
-            install_trans_model(tm, tx, cancel)
+            install_or_bind(
+                tm.label,
+                crate::models::trans_binding_key(tm.key),
+                tm.file_name,
+                tm.url,
+                Some(tm.sha256),
+                &paths::store_path(tm.file_name),
+                tx,
+                cancel,
+            )
         }
     }
 }
 
-/// 安装翻译模型:优先复用本地 HuggingFace 缓存(用户可能已经用别的工具下载过,比如
-/// SakuraLLM 这种几 GB 大小的模型,重新下载没必要),哈希校验通过才复制;缓存里没有或
-/// 哈希不对才走网络下载。
-pub(super) fn install_trans_model(
-    tm: &crate::translate::TransModel,
+/// 决定"在本地已知位置找到一份候选文件"之后该怎么办的纯逻辑,不碰文件系统——校验结果
+/// 由调用方(`install_or_bind`)算好传进来。哈希验证通过就绑定,不用复制/下载;没有候选、
+/// 或者有候选但校验不通过(哈希不一致、没有权威哈希可比对、读取失败),都老实走下载。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum InstallAction {
+    BindExisting(PathBuf),
+    Download,
+}
+
+pub(super) fn plan_install(candidate: Option<&Path>, hash_ok: bool) -> InstallAction {
+    match candidate {
+        Some(p) if hash_ok => InstallAction::BindExisting(p.to_path_buf()),
+        _ => InstallAction::Download,
+    }
+}
+
+/// 安装一个"存放目录里没有、但可能已经在本地其它已知位置(HF 缓存等)存在"的模型文件
+/// ——命中候选且哈希验证通过就发一个 `ModelBound` 事件绑定过去,不占用双份磁盘空间
+/// (真实踩过的坑:用户用别的工具已经下载过 Sakura 7B,之前的实现会不管三七二十一
+/// 复制一份进 subgen 自己的目录,同一个 3.96GB 的文件在磁盘上存两份)。缓存里没有、
+/// 或哈希对不上,才真正走网络下载。
+///
+/// `expected_sha256` 是 `None` 时(理论上不该再发生,现在三种模型都已经有权威哈希了,
+/// 保留这条分支给以后可能出现的、还没来得及核实哈希的模型)不采信任何本地候选,直接下载
+/// ——没有校验依据就绑定一个未知来源的文件,风险比多下载几 GB 更大。
+#[allow(clippy::too_many_arguments)]
+fn install_or_bind(
+    label: &str,
+    binding_key: String,
+    file_name: &str,
+    url: &str,
+    expected_sha256: Option<&str>,
+    download_target: &Path,
     tx: &Sender<SetupEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let target = paths::trans_model_path(tm.key, tm.file_name);
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
-    }
-
-    if let Some(cached) = find_in_hf_cache(tm.file_name) {
-        let _ = tx.send(SetupEvent::Log(format!(
-            "在本地 HuggingFace 缓存中找到 {},校验哈希中...",
-            tm.label
-        )));
-        match sha256_file(&cached) {
-            Ok(digest) if to_hex(&digest).eq_ignore_ascii_case(tm.sha256) => {
-                std::fs::copy(&cached, &target)
-                    .map_err(|e| format!("复制 {} 失败: {e}", tm.label))?;
-                let _ = tx.send(SetupEvent::ComponentReady(tm.label.to_string()));
-                return Ok(());
-            }
-            Ok(_) => {
-                let _ = tx.send(SetupEvent::Log(format!(
-                    "{} 本地缓存文件哈希不一致,改为重新下载",
-                    tm.label
-                )));
-            }
-            Err(e) => {
-                let _ = tx.send(SetupEvent::Log(format!(
-                    "读取 {} 本地缓存失败({e}),改为重新下载",
-                    tm.label
-                )));
+    let candidate = find_in_known_roots(file_name);
+    let hash_ok = match (&candidate, expected_sha256) {
+        (Some(p), Some(expected)) => {
+            let _ = tx.send(SetupEvent::Log(format!("在本地已有文件中找到 {label},校验哈希中...")));
+            match sha256_file(p) {
+                Ok(digest) => to_hex(&digest).eq_ignore_ascii_case(expected),
+                Err(e) => {
+                    let _ = tx.send(SetupEvent::Log(format!("读取 {label} 本地文件失败({e}),改为重新下载")));
+                    false
+                }
             }
         }
+        (Some(_), None) => {
+            let _ = tx.send(SetupEvent::Log(format!(
+                "{label} 没有可比对的权威哈希,本地文件不采信,改为重新下载"
+            )));
+            false
+        }
+        (None, _) => false,
+    };
+    if candidate.is_some() && !hash_ok {
+        let _ = tx.send(SetupEvent::Log(format!("{label} 本地文件哈希不一致,改为重新下载")));
     }
 
-    download_file(tm.label, tm.url, Some(tm.sha256), true, &target, tx, cancel)
+    match plan_install(candidate.as_deref(), hash_ok) {
+        InstallAction::BindExisting(path) => {
+            let _ = tx.send(SetupEvent::ModelBound { key: binding_key, path });
+            let _ = tx.send(SetupEvent::ComponentReady(label.to_string()));
+            Ok(())
+        }
+        InstallAction::Download => {
+            if let Some(parent) = download_target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+            }
+            download_file(label, url, expected_sha256, true, download_target, tx, cancel)
+        }
+    }
 }
 
-/// 在 HuggingFace 本地缓存里按文件名查找。依次检查 HF_HOME、HF_HUB_CACHE 环境变量指向的
-/// 目录,以及 huggingface_hub 默认位置(`~/.cache/huggingface/hub`),都是 huggingface_hub
-/// 官方文档记录的标准缓存位置解析顺序,不是猜的路径。
-fn find_in_hf_cache(file_name: &str) -> Option<PathBuf> {
+/// 在本地已知位置按文件名查找候选文件。目前只有一类已知位置:HuggingFace 本地缓存
+/// ——依次检查 HF_HOME、HF_HUB_CACHE 环境变量指向的目录,以及 huggingface_hub 默认位置
+/// (`~/.cache/huggingface/hub`),都是 huggingface_hub 官方文档记录的标准缓存位置解析
+/// 顺序,不是猜的路径。以前只有翻译模型会走这个查找,现在 whisper/VAD 模型也复用同一套
+/// (见项目计划 B4)——没道理翻译模型能省下重复下载,语音模型就不能。
+fn find_in_known_roots(file_name: &str) -> Option<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(hf_hub_cache) = std::env::var("HF_HUB_CACHE") {
         roots.push(PathBuf::from(hf_hub_cache));
@@ -355,6 +414,28 @@ mod tests {
         std::env::temp_dir().join("subgen_setup_test").join(unique)
     }
 
+
+    #[test]
+    fn plan_install_binds_when_candidate_found_and_hash_ok() {
+        let candidate = PathBuf::from(r"F:\hf_cache\sakura-7b.gguf");
+        assert_eq!(
+            plan_install(Some(&candidate), true),
+            InstallAction::BindExisting(candidate)
+        );
+    }
+
+    #[test]
+    fn plan_install_downloads_when_no_candidate() {
+        assert_eq!(plan_install(None, false), InstallAction::Download);
+        // hash_ok 在没有候选文件时没有意义,不该影响结果。
+        assert_eq!(plan_install(None, true), InstallAction::Download);
+    }
+
+    #[test]
+    fn plan_install_downloads_when_candidate_hash_mismatches() {
+        let candidate = PathBuf::from(r"F:\hf_cache\corrupted.gguf");
+        assert_eq!(plan_install(Some(&candidate), false), InstallAction::Download);
+    }
 
     #[test]
     fn check_disk_space_excludes_exe_relative_components() {

@@ -581,6 +581,22 @@ impl SubgenApp {
                             *t = total;
                         }
                     }
+                    SetupEvent::ModelBound { key, path } => {
+                        // 命中本地已有文件、决定绑定而不是复制/下载(见 setup::install_or_bind)
+                        // ——写进 config 才能跨进程记住,同步进程级绑定表才能这一轮立刻生效,
+                        // 不用等重启。push_log 而不是静默处理:这是"省下了一次几 GB 下载"的
+                        // 用户可见事件,值得留痕。
+                        self.config.model_files.insert(key, path.to_string_lossy().to_string());
+                        self.config.save();
+                        paths::set_model_bindings(
+                            self.config
+                                .model_files
+                                .iter()
+                                .map(|(k, v)| (k.clone(), PathBuf::from(v)))
+                                .collect(),
+                        );
+                        push_log(&mut self.log_lines, format!("已绑定到本地已有文件: {}", path.display()));
+                    }
                     SetupEvent::ComponentReady(label) => {
                         push_log(&mut self.log_lines, format!("{label} 安装完成"));
                         if let SetupPhase::Downloading {
