@@ -10,6 +10,7 @@
 //!   一致,不引入 FFI/CUDA 编译依赖。
 
 mod prompt;
+mod segment;
 mod server;
 
 pub use server::LlamaServer;
