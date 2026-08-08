@@ -232,6 +232,7 @@ mod tests {
 
         let first = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(&path)
             .expect("应该能创建/打开锁文件");
@@ -239,6 +240,7 @@ mod tests {
 
         let second = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(&path)
             .expect("应该能打开同一个文件(open 本身不受锁影响)");

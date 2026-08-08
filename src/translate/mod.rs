@@ -187,12 +187,6 @@ pub fn translate_srt(
     Ok(TranslateResult::Written { failed_indices })
 }
 
-/// 从这一批的 (原文, 译文) 和失败下标里,取最后(最多)2 行"成功翻译"的 pair,供下一批
-/// 当上下文参考(见 build_prompt 里 context 参数的说明)。跳过失败行——失败行的"译文"
-/// 就是原文的拷贝(见 translate_batch_with_retry 的单行兜底),拿去当"已确定的译文"
-/// 参考只会把这种错误带进下一批。抽成独立函数是因为这段"跳过失败下标"的逻辑本身就是
-/// 容易出 off-by-one 错误的地方,不该依赖真实的 llama-server 网络调用才能测到。
-
 #[cfg(test)]
 mod tests {
     use super::*;
