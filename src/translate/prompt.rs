@@ -72,7 +72,7 @@ pub(super) fn translate_batch_with_retry(
     if cancel.load(Ordering::Relaxed) {
         return Err("已取消".to_string());
     }
-    match translate_batch_once(server, model, texts, context) {
+    match translate_batch_once(server, model, texts, context, cancel) {
         Ok(results) if results.len() == texts.len() => {
             retry_untranslated_lines(server, model, texts, results, cancel, context)
         }
@@ -128,7 +128,7 @@ fn retry_untranslated_lines(
             return Err("已取消".to_string());
         }
         let single = [texts[i].clone()];
-        match translate_batch_once(server, model, &single, context) {
+        match translate_batch_once(server, model, &single, context, cancel) {
             Ok(retry) if retry.len() == 1 && !looks_untranslated(&texts[i], &retry[0]) => {
                 results[i] = retry.into_iter().next().unwrap();
             }
@@ -165,11 +165,45 @@ struct ChatRequest {
     cache_prompt: bool,
 }
 
+/// 发送阻塞式 HTTP 请求,期间每 100ms 检查一次取消标志——阻塞的 `send()` 放后台线程,
+/// 主线程轮询取消。没有这个机制的话,单次翻译请求最长要等 120 秒超时才能响应"取消"
+/// (旧实现就是这样,点完"取消"界面要干等最多两分钟,见 translate_srt 的注释)。
+///
+/// `client`/`url`/`body` 整体搬进请求线程(请求在那边构造并发送),取消时返回
+/// `Err("已取消")`,请求线程继续在后台直到完成/超时(有 reqwest 的 120 秒超时兜底,
+/// 线程不会无限存活;它的结果没人收,自然丢弃)。
+fn send_cancelable(
+    client: reqwest::blocking::Client,
+    url: String,
+    body: ChatRequest,
+    cancel: &Arc<AtomicBool>,
+) -> Result<reqwest::blocking::Response, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(client.post(&url).json(&body).send());
+    });
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".to_string());
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(Ok(resp)) => return Ok(resp),
+            Ok(Err(e)) => return Err(format!("翻译请求失败: {e}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // 请求线程 panic(理论罕见):给一个和超时同级别的错误,不让调用方以为卡死。
+                return Err("翻译请求内部错误(请求线程异常退出)".to_string());
+            }
+        }
+    }
+}
+
 fn translate_batch_once(
     server: &LlamaServer,
     model: &'static TransModel,
     texts: &[String],
     context: &[(String, String)],
+    cancel: &Arc<AtomicBool>,
 ) -> Result<Vec<String>, String> {
     let numbered: String = texts
         .iter()
@@ -200,11 +234,8 @@ fn translate_batch_once(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| format!("创建翻译请求客户端失败: {e}"))?;
-    let resp = client
-        .post(format!("http://127.0.0.1:{}/v1/chat/completions", server.port))
-        .json(&body)
-        .send()
-        .map_err(|e| format!("翻译请求失败: {e}"))?;
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
+    let resp = send_cancelable(client, url, body, cancel)?;
     if !resp.status().is_success() {
         return Err(format!("翻译请求失败: HTTP {}", resp.status()));
     }
@@ -505,5 +536,53 @@ mod tests {
     fn looks_untranslated_false_for_content_without_letters() {
         assert!(!looks_untranslated("♪♪♪", "♪♪♪"));
         assert!(!looks_untranslated("123", "123"));
+    }
+
+    /// 取消机制的真实行为:本地起一个"接受连接但不响应"的 TCP 服务让请求挂住,验证
+    /// 400ms 后置 cancel 能打断它(返回"已取消"),而不是干等 reqwest 超时。这是
+    /// `send_cancelable` 的核心承诺——翻译阶段点"取消"不必等最长 120 秒。
+    #[test]
+    fn send_cancelable_honors_cancel_while_request_in_flight() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // 接受连接但从不返回响应头,让 HTTP 请求一直挂住。
+        std::thread::spawn(move || {
+            while let Ok(stream) = listener.accept() {
+                let _ = stream;
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_t = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            cancel_t.store(true, Ordering::Relaxed);
+        });
+
+        let body = ChatRequest {
+            model: "test",
+            messages: Vec::new(),
+            temperature: 0.2,
+            max_tokens: 100,
+            cache_prompt: true,
+        };
+        let started = std::time::Instant::now();
+        let err = send_cancelable(
+            client,
+            format!("http://127.0.0.1:{port}/v1/chat/completions"),
+            body,
+            &cancel,
+        )
+        .expect_err("挂起的请求在取消后应返回 Err");
+        assert!(err.contains("已取消"), "应返回\"已取消\": {err}");
+        assert!(
+            started.elapsed().as_secs() < 3,
+            "取消应很快生效(400ms 内置位),不该等到 reqwest 超时"
+        );
     }
 }

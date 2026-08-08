@@ -61,6 +61,13 @@ impl LlamaServer {
         #[cfg(windows)]
         cmd.creation_flags(engine::CREATE_NO_WINDOW);
 
+        // 健康检查客户端在 spawn 之前构建好——构建失败时进程还没拉起,不会留下一个
+        // 已经 spawn、却因为后面的 ? 提前返回而没人管的 llama-server 占用端口。
+        let health_client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("创建健康检查客户端失败: {e}"))?;
+
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("无法启动本地翻译引擎: {e}"))?;
@@ -79,10 +86,6 @@ impl LlamaServer {
             });
         }
 
-        let health_client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("创建健康检查客户端失败: {e}"))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
         loop {
             if cancel.load(Ordering::Relaxed) {
