@@ -95,27 +95,7 @@ pub(crate) fn render_batch_bar(app: &mut SubgenApp, ui: &mut egui::Ui) {
         if let Some((text, _)) = &app.transient_notice {
             ui.colored_label(theme::WARN, text);
         }
-        // 启动时配置恢复的说明(配置文件损坏被重置)。用可关闭的横幅而不是 transient_notice
-        // ——transient_notice 几秒后自动消失,这种"你的设置被重置了"的信息值得一直显示到
-        // 用户明确看过。配置损坏是罕见的紧急情况,正常用户永远不会看到这条横幅。
-        let mut dismiss_warning = false;
-        if let Some(warning) = &app.startup_warning {
-            egui::Frame::default()
-                .inner_margin(egui::Margin::symmetric(8, 6))
-                .fill(theme::WARN.gamma_multiply(0.15))
-                .corner_radius(egui::CornerRadius::same(4))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(theme::WARN, warning);
-                        if ui.small_button("知道了").clicked() {
-                            dismiss_warning = true;
-                        }
-                    });
-                });
-        }
-        if dismiss_warning {
-            app.startup_warning = None;
-        }
+        crate::ui::setup_screens::render_startup_warning(app, ui);
         ui.add_space(6.0);
     });
 }

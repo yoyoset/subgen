@@ -6,9 +6,39 @@ use crate::ui::theme;
 use eframe::egui;
 use std::sync::atomic::Ordering;
 
+/// 启动时配置恢复的说明(配置文件损坏被重置)。用可关闭的横幅而不是 transient_notice
+/// ——transient_notice 几秒后自动消失,这种"你的设置被重置了"的信息值得一直显示到用户
+/// 明确看过。配置损坏是罕见的紧急情况,正常用户永远不会看到这条横幅。
+///
+/// 从 batch_bar 里抽出来复用:损坏配置的重灾场景恰恰是"models_dir_override 被重置回默认、
+/// 组件看起来全缺"——用户会落在首次下载页(SetupPhase::NeedsDownload)而不是主界面,如果
+/// 只在主界面 batch_bar 渲染,这个最需要解释"为什么又要我下载十几 GB"的时刻反而看不到
+/// 横幅。所以 render_phase 每个页面顶部和主界面 batch_bar 都要画。
+pub(crate) fn render_startup_warning(app: &mut SubgenApp, ui: &mut egui::Ui) {
+    let mut dismiss = false;
+    if let Some(warning) = &app.startup_warning {
+        egui::Frame::default()
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .fill(theme::WARN.gamma_multiply(0.15))
+            .corner_radius(egui::CornerRadius::same(4))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(theme::WARN, warning);
+                    if ui.small_button("知道了").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+    }
+    if dismiss {
+        app.startup_warning = None;
+    }
+}
+
 /// 按当前 `SetupPhase` 分发到对应页面。从 `eframe::App::ui` 抽出来,让 egui 生命周期方法
 /// 只负责轮询和全局交互,页面分发和页面本身同住一个模块(改页面结构不用动 app.rs)。
 pub(crate) fn render_phase(app: &mut SubgenApp, ui: &mut egui::Ui) {
+    render_startup_warning(app, ui);
     use crate::app::SetupPhase;
     match &app.setup_phase {
         SetupPhase::Checking => render_checking(ui),
