@@ -108,7 +108,13 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
     let mut cancel_cleanup_clicked = false;
 
     ui.horizontal(|ui| {
-        if ui.add_enabled(app.scan_rx.is_none(), egui::Button::new("扫描本机已有模型")).clicked() {
+        // 处理中禁用,和下面每行的定位/下载/清理一致——扫描虽然只读,但它会遍历用户可能
+        // 几十 GB 的缓存目录,和正在跑的批次抢磁盘 IO;而且扫完的"使用此文件"绑定操作
+        // 本来就是处理中禁用的,扫了也白扫。
+        if ui
+            .add_enabled(!app.processing && app.scan_rx.is_none(), egui::Button::new("扫描本机已有模型"))
+            .clicked()
+        {
             app.begin_scan_for_models();
         }
         if app.scan_rx.is_some() {
