@@ -89,6 +89,12 @@ pub fn rotate_log_file(path: &std::path::Path, max_bytes: u64) {
 /// 先 `if let Some(rx) = &self.xxx_rx { while ... }` 借着 `rx` 读事件、循环体里再要记日志,
 /// 如果写成 `&mut self` 方法,会和外层对 `self.xxx_rx` 的借用冲突(借用检查器认为方法调用
 /// 需要整个 `self` 的独占访问权);只借 `log_lines` 这一个字段就没有这个问题。
+/// 内存里保留的日志行数上限——`log_lines` 是给界面"详细信息"区看的,批量任务(几十个
+/// 文件)每处理一个都记若干行,不设上限会在一次长时间运行里无限膨胀。磁盘日志有体积轮转
+/// (rotate_log_file),内存这份也给出界:超出后从头部丢弃最旧的,界面看最近的够用了,
+/// 想要完整记录去 logs/app.log。
+pub const MAX_IN_MEMORY_LOG_LINES: usize = 2000;
+
 pub fn push_log(log_lines: &mut Vec<String>, line: String) {
     let _ = std::fs::create_dir_all(paths::logs_dir());
     let timestamp = std::time::SystemTime::now()
@@ -106,6 +112,9 @@ pub fn push_log(log_lines: &mut Vec<String>, line: String) {
         let _ = writeln!(file, "[unix {timestamp}] {line}");
     }
     log_lines.push(line);
+    if log_lines.len() > MAX_IN_MEMORY_LOG_LINES {
+        log_lines.drain(..log_lines.len() - MAX_IN_MEMORY_LOG_LINES);
+    }
 }
 
 /// 把秒数格式化成 "12秒" / "1分23秒" / "2小时5分" 这种人可读的形式,用于界面上的"已运行"
