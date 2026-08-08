@@ -150,6 +150,10 @@ fn render_clear_confirm_dialog(app: &mut SubgenApp, ui: &mut egui::Ui) {
         Some(true) => {
             app.jobs.clear();
             app.selected = None;
+            // 复核报告持有的是任务列表下标,列表清空后这些下标要么失效、要么被新加入的
+            // 文件重新占用——不清理的话,下次生成报告会基于清空前的残留状态,或者更糟,
+            // 新的第 0 个文件显示上一个文件的旧报告。
+            app.review = None;
             ui.ctx()
                 .data_mut(|d| d.insert_temp(egui::Id::new(CLEAR_CONFIRM_ID), false));
         }
