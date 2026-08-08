@@ -81,6 +81,10 @@ pub struct SubgenApp {
     /// 上一次写进标题的进度,值没变就不重复调用 send_viewport_cmd(避免每帧都发一次
     /// 相同的标题更新)。
     pub(crate) last_title_progress: Option<(usize, usize)>,
+    /// 上一次写进标题的下载进度文本(比如 "下载中 3/5 · 42%"),值没变就不重复发
+    /// ViewportCommand::Title。首次下载动辄几 GB、要跑很久,用户 alt-tab 去干别的时,
+    /// 任务栏悬停能直接看到下到哪了(和批次处理时标题带 "第 N/M 个" 是同一个考虑)。
+    pub(crate) last_setup_title: Option<String>,
     /// 当前批次开始处理的时刻,用来在结束时算总耗时(和单个任务的 started_at 是两码事)。
     pub(crate) batch_started_at: Option<std::time::Instant>,
     /// 上一批结束时生成的汇总文案("17 个成功、2 个建议核对、1 个失败"这种),下一批开始
@@ -237,6 +241,7 @@ impl SubgenApp {
             transient_notice: None,
             batch_indices: Vec::new(),
             last_title_progress: None,
+            last_setup_title: None,
             batch_started_at: None,
             last_summary: None,
             selected: None,
@@ -288,6 +293,9 @@ impl SubgenApp {
             total: 0,
             queue: missing.iter().skip(1).cloned().collect(),
         };
+        // 清掉上一次下载可能留下的任务栏进度标题(比如用户取消后再点开始下载),等新的
+        // Progress 事件来了再写新标题。
+        self.last_setup_title = None;
 
         spawn_guarded_thread(
             tx.clone(),
@@ -681,6 +689,8 @@ impl SubgenApp {
                     } => {
                         if let SetupPhase::Downloading {
                             current_label,
+                            current_index,
+                            total_count,
                             downloaded: d,
                             total: t,
                             ..
@@ -689,6 +699,25 @@ impl SubgenApp {
                             *current_label = component;
                             *d = downloaded;
                             *t = total;
+                            // 任务栏标题带上"下载中 第 N/M 项 · 百分比"——首次下载几 GB 要跑
+                            // 很久,用户 alt-tab 去别的窗口时不用切回来就能看到进度。只在
+                            // 文本真的变了才发 Title 命令(和批次标题同一个防抖思路)。
+                            let pct = if *t > 0 {
+                                format!("{:.0}%", *d as f32 / *t as f32 * 100.0)
+                            } else {
+                                String::new()
+                            };
+                            let title = format!(
+                                "{} 下载中 {}/{} · {}",
+                                crate::window_title(),
+                                *current_index,
+                                *total_count,
+                                pct
+                            );
+                            if self.last_setup_title.as_deref() != Some(title.as_str()) {
+                                self.last_setup_title = Some(title.clone());
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                            }
                         }
                     }
                     SetupEvent::ModelBound { key, path } => bound.push((key, path)),
@@ -721,12 +750,16 @@ impl SubgenApp {
         if done {
             self.setup_phase = SetupPhase::Ready;
             self.setup_rx = None;
+            self.last_setup_title = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(crate::window_title()));
         } else if let Some(e) = failed {
             self.setup_rx = None;
             if is_user_cancel(&e) {
                 // 用户主动取消下载,不是失败:回到"还缺什么"的清单界面(已下完的组件
                 // 会被 missing_components 重新算掉),而不是显示"下载失败,请检查网络"
                 // 这种误导文案——用户会以为自己网断了,其实只是自己点了取消。
+                self.last_setup_title = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(crate::window_title()));
                 self.begin_setup_check();
             } else {
                 self.setup_phase = SetupPhase::Error(e);
