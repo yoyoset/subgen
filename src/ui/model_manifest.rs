@@ -1,7 +1,7 @@
 use crate::app::SubgenApp;
 use crate::format::{format_download_size, model_status_line};
 use crate::models::{FileKind, ModelStatus};
-use crate::setup::{status_for, ComponentKey};
+use crate::setup::{self, status_for, ComponentKey};
 use crate::ui::theme;
 use eframe::egui;
 
@@ -25,11 +25,55 @@ struct Row {
     extension_filter: &'static str,
 }
 
+/// 给"可执行程序类组件"(语音识别引擎/ffmpeg/翻译引擎)合成一个状态行。它们不是单文件
+/// 模型,`setup::status_for` 对这些 key 返回 None(它们走 `is_present` 的存在性判定),但
+/// 清单要能显示"装没装"并提供下载入口——否则用户点了"开始处理"被告知"还差中文翻译组件
+/// (llama.cpp)"后,来"组件与存放位置"窗口却看不到也装不了这个组件,只能去翻 README 手动
+/// 装,这是堵死的路。可执行文件在不在 = 装没装,存在就用它的真实路径+大小当"已就绪"。
+fn binary_row_status(exe_path: Option<std::path::PathBuf>) -> ModelStatus {
+    match exe_path {
+        Some(path) => {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            ModelStatus::Ready { path, size }
+        }
+        None => ModelStatus::Missing,
+    }
+}
+
 /// 枚举所有已知模型(不止当前配置选中的那个)算出各自状态。用 `setup::status_for` 而不是
 /// 重新实现一遍路径解析——那是唯一一份"给定模型 key 该怎么判定状态"的逻辑,清单只是它的
-/// 第三个消费方(`is_present`/详情面板之外)。
+/// 第三个消费方(`is_present`/详情面板之外)。可执行程序类组件(引擎/ffmpeg/翻译引擎)不在
+/// `status_for` 的覆盖范围内(见 `binary_row_status`),单独追加进去。
 fn collect_rows() -> Vec<Row> {
     let mut rows = Vec::new();
+    for (key, exe, purpose) in [
+        (
+            ComponentKey::Engine,
+            crate::paths::whisper_cli_exe(),
+            "识别引擎",
+        ),
+        (ComponentKey::Ffmpeg, crate::paths::ffmpeg_exe(), "音频处理"),
+        (
+            ComponentKey::Translator,
+            crate::paths::llama_server_exe(),
+            "翻译引擎",
+        ),
+    ] {
+        // 这三个组件没有"定位…/复制路径"的语义(它们是解压出来的程序,不是单个模型文件),
+        // expected_sha256 置 None 会自然隐藏那些按钮;下载走 zip 解压,和模型下载是两条路。
+        rows.push(Row {
+            label: key.label().to_string(),
+            purpose,
+            status: binary_row_status(exe),
+            binding_key: String::new(),
+            component_key: key,
+            whisper_model_arg: String::new(),
+            expected_kind: FileKind::Ggml,
+            expected_size: setup::estimated_size_bytes(key, ""),
+            expected_sha256: None,
+            extension_filter: "exe",
+        });
+    }
     for wm in crate::models::whisper::MODELS {
         if let Some(status) = status_for(ComponentKey::Model, wm.key) {
             rows.push(Row {
