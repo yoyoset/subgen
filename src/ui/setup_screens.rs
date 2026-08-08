@@ -259,11 +259,16 @@ fn render_progress_screen(
             ui.add_space(4.0);
             let progress = downloaded as f32 / total as f32;
             ui.add(egui::ProgressBar::new(progress).show_percentage());
-            ui.label(format!(
-                "{:.1} MB / {:.1} MB",
-                downloaded as f64 / 1_048_576.0,
-                total as f64 / 1_048_576.0
-            ));
+            // 大文件(几个 GB 的模型)显示 MB 会变成"2950.0 MB / 3095.0 MB",又长又没
+            // 规模感;≥1GB 切成 GB 显示,进度条本身已经有精确百分比了,文本只要好读。
+            let size_text = |bytes: u64| {
+                if bytes >= 1_073_741_824 {
+                    format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+                } else {
+                    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+                }
+            };
+            ui.label(format!("{} / {}", size_text(downloaded), size_text(total)));
         }
         ui.add_space(theme::SECTION_SPACING);
         // 点击"取消"后立即变灰显示"正在取消…":下载线程可能正卡在两次重试之间的 2 秒
