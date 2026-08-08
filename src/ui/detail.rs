@@ -282,7 +282,15 @@ fn render_empty_detail(app: &mut SubgenApp, ui: &mut egui::Ui) {
             dialog = dialog.set_directory(dir);
         }
         if let Some(files) = dialog.pick_files() {
-            app.add_files(files);
+            let (added, _ignored) = app.add_files(files);
+            if added == 0 {
+                // 和左侧队列面板的"选择视频文件..."保持同一句反馈:全都没加进去时
+                // (选中非视频/都已在列表)不弹一句,用户会以为操作没成功、反复重试。
+                app.transient_notice = Some((
+                    "没有添加任务:选中的文件里没有可识别的视频,或都在列表中了".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
         }
     }
 }
