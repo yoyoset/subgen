@@ -775,6 +775,9 @@ impl SubgenApp {
             self.cancelling = false;
             self.worker_rx = None;
             self.last_title_progress = None;
+            // 批次已经跑完了,退出确认框里那句"正在处理中,退出将中止全部任务"就不成立了——
+            // 继续留着会误导用户以为还有东西在跑。没有在跑的任务要中止,直接关掉确认框。
+            self.close_confirm_open = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(crate::window_title()));
 
             let elapsed = self
