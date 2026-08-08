@@ -63,6 +63,7 @@ fn no_log(stage: Stage, msg: impl Into<String>) -> EngineError {
 #[cfg(windows)]
 pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[derive(Debug)]
 pub struct EngineOutcome {
     pub srt_path: PathBuf,
     /// None 表示这次没有真实观测(复用了之前识别好的结果,见"断点续跑"),不代表"没用上
@@ -107,6 +108,16 @@ pub fn process_video(
 ) -> Result<EngineOutcome, EngineError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(no_log(Stage::ExtractAudio, "已取消"));
+    }
+
+    // 先确认视频文件真的还在——加入队列后文件可能被移动/删除,如果不查,ffmpeg 会报一个
+    // 误导性的"音频提取失败(该文件可能损坏或无音轨)",用户以为文件坏了,实际只是找不到。
+    // 不存在的路径也无法生成 cache_key 对应的中间产物,提前失败是对的。
+    if !video_path.is_file() {
+        return Err(no_log(
+            Stage::ExtractAudio,
+            format!("找不到视频文件: {}", video_path.display()),
+        ));
     }
 
     let whisper_cli = paths::whisper_cli_exe()
@@ -161,23 +172,34 @@ pub fn process_video(
             .stderr(Stdio::piped());
         #[cfg(windows)]
         ff_cmd.creation_flags(CREATE_NO_WINDOW);
-        let ff_child = ff_cmd
+        let mut ff_child = ff_cmd
             .spawn()
             .map_err(|e| no_log(Stage::ExtractAudio, format!("无法启动 ffmpeg: {e}")))?;
         job_guard::bind_child_to_job(&ff_child);
-        let ff_output = ff_child
-            .wait_with_output()
-            .map_err(|e| no_log(Stage::ExtractAudio, format!("等待 ffmpeg 失败: {e}")))?;
 
-        if !ff_output.status.success() {
+        // 等待 ffmpeg 结束,期间持续响应取消并排空 stderr(见 wait_child_with_cancel)。
+        // 真实踩过的坑:旧实现用 `wait_with_output()` 阻塞等待子进程结束,期间完全不检查
+        // 取消标志——ffmpeg 万一卡住(极少见,比如某些损坏文件),用户点"取消"后批次永远
+        // 停在这一步,"正在取消…"会一直转下去。
+        let ff_stderr_handle = ff_child.stderr.take();
+        let (ff_status, ff_stderr) =
+            wait_child_with_cancel(&mut ff_child, ff_stderr_handle, cancel)
+                .map_err(|e| no_log(Stage::ExtractAudio, e))?;
+
+        if !ff_status.success() {
             // 完整 stderr 写进日志文件,界面只展示一行人话摘要——ffmpeg 的报错动辄十几行,
-            // 塞进状态栏会撑爆一行的高度,技术细节留给"查看日志"按钮的用户。
+            // 塞进状态栏会撑爆一行的高度,技术细节留给"查看日志"按钮的用户。失败原因不限于
+            // 文件损坏(还有缺解码组件/权限等),所以文案不把原因钉死在"文件损坏"上。
+            // 日志写盘失败时返回 None 而不是一个不存在的路径,避免界面出现点了打不开的
+            // "查看日志"按钮。
             let ffmpeg_log = paths::logs_dir().join(format!("{unique}_ffmpeg.log"));
-            let _ = std::fs::write(&ffmpeg_log, ff_output.stderr.as_slice());
+            let log_path = std::fs::write(&ffmpeg_log, ff_stderr.as_slice())
+                .ok()
+                .map(|_| ffmpeg_log);
             return Err((
                 Stage::ExtractAudio,
-                "音频提取失败(该文件可能损坏或无音轨)".to_string(),
-                Some(ffmpeg_log),
+                "音频提取失败,详见日志(可能是文件损坏/无音轨/缺解码组件)".to_string(),
+                log_path,
             ));
         }
         if !wav_path.is_file() {
@@ -346,7 +368,10 @@ pub fn process_video(
     // 当时完全没法知道具体是几号错误,只能干猜。
     let exit_desc = describe_exit_status(&status);
     let log_content = format!("{full_log}\n--- subgen 记录 ---\n{exit_desc}\n");
-    let _ = std::fs::write(&log_file, &log_content);
+    // 日志写盘失败时 log_path 为 None,失败任务不展示一个点不开的"查看日志"按钮。
+    let log_path = std::fs::write(&log_file, &log_content)
+        .ok()
+        .map(|_| log_file.clone());
 
     if !status.success() {
         // 完整输出(progress 行、CUDA 探测、原始报错)都在 log_file 里,界面只展示一行
@@ -355,7 +380,7 @@ pub fn process_video(
         return Err((
             Stage::Transcribe,
             format!("识别引擎出错({exit_desc})"),
-            Some(log_file.clone()),
+            log_path,
         ));
     }
 
@@ -365,7 +390,7 @@ pub fn process_video(
         return Err((
             Stage::Transcribe,
             "识别流程结束但未生成字幕文件".to_string(),
-            Some(log_file.clone()),
+            log_path,
         ));
     }
 
@@ -426,8 +451,15 @@ pub fn place_sidecar_srt(
             .unwrap_or_default();
         return Err(PlaceError::Skipped(format!("已有同名字幕,未覆盖({filename})")));
     }
-    std::fs::copy(generated_srt, &target)
+    // 覆盖已有字幕时,先复制到同目录临时名再原子改名——直接 fs::copy 覆盖的话,中途失败
+    // 会把用户已有的旧字幕截断成半截。改名是同一目录内的原子操作,失败时旧字幕保持完好。
+    let tmp_target = target.with_extension("srt.tmp");
+    std::fs::copy(generated_srt, &tmp_target)
         .map_err(|e| PlaceError::Failed(format!("写入字幕文件失败: {e}")))?;
+    std::fs::rename(&tmp_target, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_target);
+        PlaceError::Failed(format!("写入字幕文件失败: {e}"))
+    })?;
     let _ = std::fs::remove_file(generated_srt);
     Ok(target)
 }
@@ -473,6 +505,57 @@ fn generated_srt_path(unique: &str) -> PathBuf {
     paths::tmp_dir().join(format!("{unique}.srt"))
 }
 
+/// 等待子进程结束,期间持续响应取消信号并排空 stderr——不排空会撑满管道缓冲区把子进程
+/// 卡死。取消时 kill 子进程并返回 `Err("已取消")`。返回 `(退出状态, 收集到的完整 stderr)`。
+///
+/// 抽出成独立函数:提取音轨(ffmpeg)用的是同一个"轮询 + 取消响应 + 排空管道"模式,而且
+/// 这段逻辑可以脱离具体子进程单独验证(见测试里用真实 ffmpeg 跑真实视频的临时测试)。
+fn wait_child_with_cancel(
+    child: &mut std::process::Child,
+    stderr_handle: Option<std::process::ChildStderr>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    if let Some(handle) = stderr_handle {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut reader = handle;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = tx.send(buf[..n].to_vec());
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    let mut stderr = Vec::new();
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("已取消".to_string());
+        }
+        if let Ok(chunk) = rx.try_recv() {
+            stderr.extend_from_slice(&chunk);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("等待子进程失败: {e}")),
+        }
+    };
+    // 子进程已退出,把管道里剩余的 stderr 排空(reader 线程可能还有最后几块没送到)。
+    while let Ok(chunk) = rx.try_recv() {
+        stderr.extend_from_slice(&chunk);
+    }
+    Ok((status, stderr))
+}
 
 #[cfg(test)]
 mod tests {
@@ -552,5 +635,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new content");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 加入队列后视频文件被移动/删除时,应该明确报"找不到视频文件",而不是让 ffmpeg 报
+    /// 一个误导性的"音频提取失败(该文件可能损坏或无音轨)"。
+    #[test]
+    fn process_video_reports_missing_video_file_clearly() {
+        let missing = std::env::temp_dir().join("subgen_test_missing_video.mkv");
+        let _ = std::fs::remove_file(&missing);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = process_video(&missing, "large-v3", "auto", false, &cancel, |_, _, _| {});
+        let (stage, msg, log) = result.unwrap_err();
+        assert_eq!(stage, Stage::ExtractAudio);
+        assert!(
+            msg.contains("找不到视频文件"),
+            "应该明确指出文件不存在: {msg}"
+        );
+        assert!(log.is_none(), "这一步还没有子进程日志可看");
     }
 }
