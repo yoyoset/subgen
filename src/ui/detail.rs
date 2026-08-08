@@ -238,6 +238,11 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
                     "已标记,下次点“开始处理”时会重新处理该文件".to_string(),
                     std::time::Instant::now(),
                 ));
+                // 强制重跑后旧报告(针对上一版字幕)就是过期的了,清掉避免重跑完还挂着
+                // 旧任务的分析结果。
+                if app.review.as_ref().is_some_and(|r| r.job_index == i) {
+                    app.review = None;
+                }
             }
         if toggle_preview
             && let Some(j) = app.jobs.get_mut(i) {
