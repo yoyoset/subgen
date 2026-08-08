@@ -138,6 +138,38 @@ pub(crate) fn render_needs_download(app: &mut SubgenApp, ui: &mut egui::Ui, miss
     centered_card(ui, "首次使用需要下载必要组件", |ui| {
         ui.label("以下组件缺失,需要联网下载一次。下载完成后全部组件都在本机运行:");
         ui.add_space(4.0);
+        // 语音识别模型档位选择——首次下载页就能改,不用等下载完 large-v3 之后才在设置里
+        // 发现还有 medium/turbo。否则配置一般的电脑被迫先下 2.9GB 的 large-v3,等发现
+        // 换轻量模型还得再下一次 1.6GB,白费一次大下载。选完立刻重算缺什么、总大小也
+        // 跟着变。
+        ui.horizontal(|ui| {
+            ui.label("语音识别模型:");
+            let mut model_changed = false;
+            egui::ComboBox::from_id_salt("setup_model")
+                .selected_text(app.config.model.clone())
+                .show_ui(ui, |ui| {
+                    for wm in crate::models::whisper::MODELS {
+                        let selected = app.config.model == wm.key;
+                        if ui
+                            .selectable_label(
+                                selected,
+                                format!("{} - {}", wm.key, wm.label),
+                            )
+                            .clicked()
+                            && !selected
+                        {
+                            app.config.model = wm.key.to_string();
+                            model_changed = true;
+                        }
+                    }
+                });
+            if model_changed {
+                app.config.save();
+                // 重新判定缺什么:换模型后要下载的清单/总大小/磁盘提示都变了。
+                app.begin_setup_check();
+            }
+        });
+        ui.add_space(4.0);
         // 每项标大小、下面给总计——用户在不知情的情况下点"开始下载"其实是在做一个
         // "可能几十分钟、几个 GB 流量"的决定,不该让他们蒙在鼓里。
         let mut total_bytes: u64 = 0;
