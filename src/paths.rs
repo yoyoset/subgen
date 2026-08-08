@@ -110,7 +110,18 @@ pub fn find_all_matching_files(dir: &Path, file_name: &str) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // 不进入 `_trash` 子目录:那是"清理重复"移进去的软删除区(见 models::actions.rs
+            // 的 begin_cleanup_duplicates),里面是用户已经确认不要的副本,不该再被当作
+            // "存放目录里还有一份重复文件"的候选扫出来。不加这个排除的话,清理完再扫一次
+            // 会把 _trash 里的文件当成新发现的重复,用户点"清理"又把它们从 _trash 挪到
+            // _trash(加数字后缀),越清越多。
+            let is_trash_dir = path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n == "_trash")
+                    .unwrap_or(false);
+            if path.is_dir() && !is_trash_dir {
                 stack.push(path);
             } else if path
                 .file_name()
@@ -257,6 +268,33 @@ mod tests {
         // find_file_recursive 应该还是只返回其中一个(行为没变,只是现在是薄包装)。
         assert!(find_file_recursive(&dir, "model.gguf").is_some());
         assert_eq!(find_all_matching_files(&dir, "does-not-exist.gguf"), Vec::<PathBuf>::new());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "清理重复"把文件移进 `_trash` 之后,下次扫描不该再把 _trash 里的文件当成新发现的
+    /// 重复(否则清理一次 → 又发现一次 → 再清理,越清越多)。`find_all_matching_files`
+    /// 跳过 `_trash` 子目录。
+    #[test]
+    fn find_all_matching_files_skips_trash_subdirectory() {
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_trash_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let trash = dir.join("_trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        std::fs::write(dir.join("model.gguf"), b"in use").unwrap();
+        std::fs::write(trash.join("model.gguf"), b"cleaned up").unwrap();
+
+        let found = find_all_matching_files(&dir, "model.gguf");
+        assert_eq!(
+            found,
+            vec![dir.join("model.gguf")],
+            "_trash 里的副本不该被当成重复扫出来: {found:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
