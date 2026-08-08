@@ -48,7 +48,12 @@ fn render_about_footer(ui: &mut egui::Ui) {
 fn render_readonly_summary(app: &SubgenApp, ui: &mut egui::Ui) {
     ui.label("这批正在使用的设置(改动要等下一批才会生效):");
     ui.add_space(4.0);
-    ui.label(format!("· 模型:{}", app.config.model));
+    // 只读摘要里模型也用友好档位名(和可编辑表单/首次下载页的选项一致),别只显示
+    // "large-v3" 这种内部 key——处理中用户想确认"这批用的是什么模型"时,名字比 key 好懂。
+    let model_label = whisper::by_key(&app.config.model)
+        .map(|m| format!("{} - {}", m.key, m.label))
+        .unwrap_or_else(|| app.config.model.clone());
+    ui.label(format!("· 模型:{model_label}"));
     ui.label(format!("· 语言:{}", lang_display(&app.config.language)));
     ui.label(format!(
         "· 已有同名字幕:{}",
