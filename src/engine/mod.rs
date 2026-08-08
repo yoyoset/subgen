@@ -440,16 +440,9 @@ pub fn place_sidecar_srt(
     overwrite: bool,
 ) -> Result<PathBuf, PlaceError> {
     let target = paths::sidecar_srt_path(video_path);
-    if target.exists() && !overwrite {
+    if let Some(reason) = crate::format::existing_srt_skip_reason(video_path, overwrite) {
         let _ = std::fs::remove_file(generated_srt);
-        // 只显示文件名,不显示完整路径——界面上这条消息会被拼成"跳过: {这里}",裸露一整条
-        // 绝对路径又长又没必要,文件名已经足够说明"是哪个文件"(视频本身的完整路径已经在
-        // 任务行第一行,hover 能看到)。
-        let filename = target
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        return Err(PlaceError::Skipped(format!("已有同名字幕,未覆盖({filename})")));
+        return Err(PlaceError::Skipped(reason));
     }
     // 覆盖已有字幕时,先复制到同目录临时名再原子改名——直接 fs::copy 覆盖的话,中途失败
     // 会把用户已有的旧字幕截断成半截。改名是同一目录内的原子操作,失败时旧字幕保持完好。

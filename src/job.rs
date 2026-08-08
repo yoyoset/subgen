@@ -218,6 +218,17 @@ pub fn run_batch(
                 let force = *force;
                 // 用户点"重新处理"就是要覆盖旧结果,不该再被"已存在同名字幕,跳过"挡住。
                 let effective_overwrite = overwrite || force;
+                // 预检:目标 .srt 已存在且不覆盖时,整个任务直接跳过,不启动 ffmpeg/whisper。
+                // 否则用户会白等几分钟(提取音轨+识别全跑完),最后才在 place_sidecar_srt
+                // 那里被告知"已有同名字幕,跳过"——跳过本身不该花这么长时间。
+                if let Some(reason) = crate::format::existing_srt_skip_reason(video_path, effective_overwrite) {
+                    finished.insert(index);
+                    let _ = tx.send(WorkerEvent::JobUpdate {
+                        index,
+                        status: JobStatus::Skipped(reason),
+                    });
+                    continue;
+                }
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     finished.insert(index);
                     let _ = tx.send(WorkerEvent::JobUpdate {

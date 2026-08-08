@@ -18,6 +18,27 @@ pub fn should_include_in_batch(job: &Job) -> bool {
         || !matches!(job.status, JobStatus::Done(_) | JobStatus::DoneWithWarning(..))
 }
 
+/// 目标字幕(`Video.srt`)已存在且不允许覆盖时,返回跳过理由(`Some`);应该跳过时返回
+/// `None`。`overwrite` 为 false 且同名 .srt 已存在 → 直接跳过,不该把 ffmpeg 提取音轨 +
+/// whisper 识别整条流水线跑完几分钟之后,才在 `place_sidecar_srt` 那里发现"原来要跳过"。
+/// `job::run_batch` 开工前用这个做预检,`engine::place_sidecar_srt` 也用同一份判断和文案,
+/// 两处不会各说各话。
+pub fn existing_srt_skip_reason(video_path: &std::path::Path, overwrite: bool) -> Option<String> {
+    if overwrite {
+        return None;
+    }
+    let target = paths::sidecar_srt_path(video_path);
+    if target.is_file() {
+        let filename = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        Some(format!("已有同名字幕,未覆盖({filename})"))
+    } else {
+        None
+    }
+}
+
 /// "打开文件夹"要选中的文件:完成态(不管有没有警告)优先选中生成的字幕——双语/仅中文
 /// 场景下是 `Video.zh.srt`,没有翻译则是同名 `Video.srt`;其它状态(还没跑完/失败/跳过)
 /// 没有稳定可用的产物,选中视频本身本来就是用户想找的东西。
@@ -438,6 +459,37 @@ mod tests {
             None
         ))));
         assert!(should_include_in_batch(&job_with_status(JobStatus::Cancelled)));
+    }
+
+    /// 预检判定:目标 .srt 已存在且不覆盖时返回跳过理由(让 run_batch 不启动流水线),
+    /// 覆盖打开或目标不存在时都不跳过。文案和 place_sidecar_srt 的跳过消息一致。
+    #[test]
+    fn existing_srt_skip_reason_only_skips_when_present_and_not_overwriting() {
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_skip_reason_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("Episode.mkv");
+        std::fs::write(&video, b"v").unwrap();
+
+        // 目标 srt 不存在 → 不跳过
+        assert!(existing_srt_skip_reason(&video, false).is_none());
+
+        // 目标 srt 存在 + 不覆盖 → 跳过,文案带文件名(不是整条路径)
+        let srt = paths::sidecar_srt_path(&video);
+        std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:02,000\nHi\n").unwrap();
+        let reason = existing_srt_skip_reason(&video, false).expect("应该跳过");
+        assert!(reason.contains("Episode.srt"), "文案应含文件名: {reason}");
+        assert!(!reason.contains(dir.to_string_lossy().as_ref()), "文案不该含完整路径: {reason}");
+
+        // 目标 srt 存在 + 覆盖 → 不跳过
+        assert!(existing_srt_skip_reason(&video, true).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
