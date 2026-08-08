@@ -86,13 +86,24 @@ pub fn find_file_recursive(dir: &Path, file_name: &str) -> Option<PathBuf> {
 /// 和 `find_file_recursive` 一样递归搜索,但收集**全部**命中而不是找到第一个就停——用于
 /// 检测重复文件(见 `models` 模块的清单"清理重复"功能):同一个模型的文件如果在存放目录
 /// 树里出现不止一份,这是找出"除了正在用的那份之外还有哪些"的基础。
+///
+/// 用规范化后的目录路径去重,防止 Windows 符号链接/目录联接(Junction)构成环时无限遍历
+/// (真实的用户缓存目录里可能出现指向自身祖先的 junction,不加防护会让整个遍历死循环,
+/// 而遍历函数内部不检查取消标志——batch worker 会卡死且无法打断)。
 pub fn find_all_matching_files(dir: &Path, file_name: &str) -> Vec<PathBuf> {
     if !dir.exists() {
         return Vec::new();
     }
     let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
+    // 同一个真实目录无论从几条路径到达,只展开一次。
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     while let Some(current) = stack.pop() {
+        // 规范化失败(比如目录被并发删除)就退回原路径,不影响继续遍历。
+        let canonical = std::fs::canonicalize(&current).unwrap_or_else(|_| current.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
         let entries = match std::fs::read_dir(&current) {
             Ok(e) => e,
             Err(_) => continue,
@@ -204,6 +215,25 @@ pub fn sidecar_review_path(video_path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// 外挂字幕/复核报告的输出路径必须严格跟随视频文件名,这是播放器自动加载字幕的
+    /// 前提(同目录同名)。带点、带空格、无扩展名的文件都要有稳定的结果。
+    #[test]
+    fn sidecar_paths_follow_video_naming() {
+        let video = Path::new(r"E:\videos\Episode 5.mkv");
+        assert_eq!(sidecar_srt_path(video), Path::new(r"E:\videos\Episode 5.srt"));
+        assert_eq!(
+            sidecar_srt_lang_path(video, "zh"),
+            Path::new(r"E:\videos\Episode 5.zh.srt")
+        );
+        assert_eq!(
+            sidecar_review_path(video),
+            Path::new(r"E:\videos\Episode 5.zh.review.txt")
+        );
+
+        let bare = Path::new(r"E:\videos\noext");
+        assert_eq!(sidecar_srt_path(bare), Path::new(r"E:\videos\noext.srt"));
+    }
+
     /// 不碰 MODELS_DIR_OVERRIDE(参数直接传目录,不经过全局状态),可以独立成测试,
     /// 不用并进下面那个大测试函数里。
     #[test]
@@ -229,6 +259,46 @@ mod tests {
         assert_eq!(find_all_matching_files(&dir, "does-not-exist.gguf"), Vec::<PathBuf>::new());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows 目录联接(Junction)可能构成环(把子目录指回自己的祖先)。旧实现会无限遍历,
+    /// 让 batch worker 卡死且无法取消;现在用规范化路径去重,遇到环必须终止。真实创建
+    /// junction 验证(mklink /J 不需要管理员权限);环境不支持时跳过(逻辑正确性由 visited-set 保证)。
+    #[test]
+    fn find_all_matching_files_terminates_on_junction_cycle() {
+        let base = std::env::temp_dir().join(format!(
+            "subgen_junction_cycle_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("target.bin"), b"x").unwrap();
+        let loop_link = real.join("loop");
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&loop_link)
+            .arg(&base)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !created {
+            // junction 创建失败(受限环境),跳过——正常路径的行为由上面的测试覆盖。
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        // base/real/loop 指回 base,形成 base -> real -> loop(base) 的环。
+        // 遍历必须终止,而且 target.bin 仍然能找到。
+        let found = find_all_matching_files(&base, "target.bin");
+        assert!(!found.is_empty(), "穿过 junction 环也应该能找到 target.bin");
+
+        // 先拆掉 junction 再整体删除,避免 remove_dir_all 顺着环走。
+        let _ = std::fs::remove_dir(&loop_link);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 合并成一个测试而不是拆成好几个:MODELS_DIR_OVERRIDE 是进程级全局状态,cargo test
