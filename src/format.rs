@@ -1,4 +1,4 @@
-//! 人话格式化小函数 + 日志落盘助手:把数字/状态/枚举值转成界面显示用的人话字符串,或对
+﻿//! 人话格式化小函数 + 日志落盘助手:把数字/状态/枚举值转成界面显示用的人话字符串,或对
 //! 数据做简单的业务逻辑判断(比如"这条任务应不应该纳入这一批处理"),顺带负责应用日志
 //! 的落盘与轮转(见 `push_log`/`rotate_log_file`)。
 //! 这些函数不依赖 SubgenApp 的私有状态,搬家到独立文件不涉及可见性改动,也不涉及
@@ -372,20 +372,24 @@ pub fn reconcile_selection(selected: Option<usize>, removed: usize, new_len: usi
     }
 }
 
-/// 线性外推批次剩余时间:用"已完成 done 个用了 elapsed"的平均速度估算剩下 (total-done)
-/// 个还要多久。`done == 0` 时没有速度样本,不给出估算(强行外推第一个还没完成的样本
-/// 波动极大,没有参考价值,和 `job_status_line` 里单文件 ETA 至少要 5% 进度才显示是
-/// 同一个道理)。
+/// 线性外推批次剩余时间:用"已完成的真实工作用了 elapsed"的平均速度估算剩下的还要多久。
+///
+/// `work_done` 是已经跑完真实流水线的任务数(成功/失败/警告都算,但**不含跳过**)——跳过
+/// 的任务在开工前就被判掉、几乎不耗时(见 `existing_srt_skip_reason`),把它们算进"做了 X
+/// 个用了多久"的分母,会把平均速度拉到接近零,导致"9 个瞬间跳过 + 1 个真实跑 30 分钟的
+/// 文件"这种批次显示"预计剩 0 秒"。只有真实跑过的任务才是有效的速度样本。`total` 仍然
+/// 包含跳过项(它们确实占批次位置),`remaining = total - work_done` 里跳过项已经不在
+/// 其中(它们早就做完了)。
 pub fn estimate_batch_remaining(
     elapsed: std::time::Duration,
-    done: usize,
+    work_done: usize,
     total: usize,
 ) -> Option<std::time::Duration> {
-    if done == 0 || total <= done {
+    if work_done == 0 || total <= work_done {
         return None;
     }
-    let per_item = elapsed / done as u32;
-    Some(per_item * (total - done) as u32)
+    let per_item = elapsed / work_done as u32;
+    Some(per_item * (total - work_done) as u32)
 }
 
 /// 从 `jobs` + 这一批的原始下标列表算出"第几个/共几个":`total` 是批次大小,`done` 是
@@ -400,12 +404,31 @@ pub fn batch_progress_counts(jobs: &[Job], batch_indices: &[usize]) -> (usize, u
     (done, total)
 }
 
-/// 批次条上的一行进度文案,比如"第 7/20 个 · 预计剩 48 分钟 · 已用 31 分钟"。`done` 是
-/// 已经到终态(不管成功/失败/跳过/取消)的数量,`current` 是"正在进行的是第几个"
-/// (`done + 1`,封顶在 `total`)。
-pub fn format_batch_progress_line(current: usize, total: usize, elapsed: std::time::Duration, done: usize) -> String {
+/// 批次里真正跑过流水线的任务数 = 已到终态的 − 被跳过的。跳过在开工前就判掉、几乎不耗时
+/// (见 `existing_srt_skip_reason`),不能算进"平均每个做了多久"的速度样本,否则 9 个瞬间
+/// 跳过 + 1 个真跑 30 分钟的文件会算出"预计剩 0 秒"。窗口标题和批次条用同一个口径。
+pub fn batch_work_done_counts(jobs: &[Job], batch_indices: &[usize]) -> usize {
+    batch_indices
+        .iter()
+        .filter(|&&i| {
+            jobs.get(i)
+                .is_some_and(|j| j.status.is_terminal() && !matches!(j.status, JobStatus::Skipped(_)))
+        })
+        .count()
+}
+
+/// 批次条上的一行进度文案,比如"第 7/20 个 · 预计剩 48 分钟 · 已用 31 分钟"。`current` 是
+/// 正在进行的是第几个(`done + 1`,封顶在 `total`);`work_done` 是已经到终态且真正跑过
+/// 流水线的任务数(不含开工前就被判掉的跳过项),只用它做剩余时间的速度样本——见
+/// `estimate_batch_remaining` 的说明。
+pub fn format_batch_progress_line(
+    current: usize,
+    total: usize,
+    elapsed: std::time::Duration,
+    work_done: usize,
+) -> String {
     let mut line = format!("第 {current}/{total} 个 · 已用 {}", format_elapsed(elapsed.as_secs()));
-    if let Some(remaining) = estimate_batch_remaining(elapsed, done, total) {
+    if let Some(remaining) = estimate_batch_remaining(elapsed, work_done, total) {
         line = format!(
             "第 {current}/{total} 个 · 预计剩 {} · 已用 {}",
             format_elapsed(remaining.as_secs()),
@@ -827,6 +850,34 @@ mod tests {
     fn format_batch_progress_line_omits_eta_before_first_sample() {
         let line = format_batch_progress_line(1, 10, std::time::Duration::from_secs(5), 0);
         assert_eq!(line, "第 1/10 个 · 已用 5秒");
+    }
+
+    /// 跳过任务几乎不耗时(开工前就判掉),不该参与剩余时间的平均速度估算——否则
+    /// "9 个瞬间跳过 + 1 个真跑 30 分钟"的批次会算出"预计剩 0 秒"。这里 work_done=1
+    /// (只有 1 个真跑过)必须得到合理的剩余时间,而不是被 done=9 拉到零。
+    #[test]
+    fn format_batch_progress_line_uses_work_done_not_total_done_for_eta() {
+        // 第 10/10 个:done=9(9 个跳过),work_done=1(真跑的那个还没完成,但已有 60 秒
+        // 速度样本),total=10。剩 9 个(跳过项已不在其中,剩下的都是真任务……这里至少
+        // ETA 不该是 0)。60 秒 / 1 个 * 9 个 = 540 秒 = 9分0秒。
+        let line = format_batch_progress_line(10, 10, std::time::Duration::from_secs(60), 1);
+        assert_eq!(line, "第 10/10 个 · 预计剩 9分0秒 · 已用 1分0秒");
+    }
+
+    #[test]
+    fn batch_work_done_counts_excludes_skipped_jobs() {
+        let jobs = vec![
+            job_with(JobStatus::Done(crate::job::JobReport::default())), // 真跑过
+            job_with(JobStatus::Skipped("已有同名字幕".to_string())),     // 瞬间跳过
+            job_with(JobStatus::DoneWithWarning(
+                "w".to_string(),
+                crate::job::JobReport::default(),
+            )), // 真跑过
+            job_with(JobStatus::Running(crate::job::Stage::Transcribe, "x".to_string(), None)), // 未完成
+        ];
+        assert_eq!(batch_work_done_counts(&jobs, &[0, 1, 2, 3]), 2);
+        assert_eq!(batch_work_done_counts(&jobs, &[0, 1, 2]), 2);
+        assert_eq!(batch_work_done_counts(&jobs, &[1, 3]), 0, "只有跳过和未完成时没有速度样本");
     }
 
     #[test]

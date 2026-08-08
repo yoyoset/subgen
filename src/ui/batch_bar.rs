@@ -41,11 +41,14 @@ pub(crate) fn render_batch_bar(app: &mut SubgenApp, ui: &mut egui::Ui) {
             if app.processing && !app.batch_indices.is_empty() {
                 let (done, total) = batch_progress_counts(&app.jobs, &app.batch_indices);
                 let current = (done + 1).min(total);
+                // 剩余时间的速度样本只用"真跑过流水线"的任务,瞬间跳过的会污染平均速度
+                // (见 format::batch_work_done_counts 的说明)。
+                let work_done = batch_work_done_counts(&app.jobs, &app.batch_indices);
                 let elapsed = app
                     .batch_started_at
                     .map(|t| t.elapsed())
                     .unwrap_or_default();
-                ui.label(format_batch_progress_line(current, total, elapsed, done));
+                ui.label(format_batch_progress_line(current, total, elapsed, work_done));
             } else if let Some(summary) = &app.last_summary {
                 ui.label(summary);
             }
