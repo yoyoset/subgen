@@ -1,4 +1,4 @@
-//! 调用 ffmpeg 提取音轨、调用 whisper-cli 识别,产出 .srt。
+﻿//! 调用 ffmpeg 提取音轨、调用 whisper-cli 识别,产出 .srt。
 //!
 //! 关键事实(均已用真实二进制在本机 RTX 3060 上实测验证,不是猜测):
 //! - whisper-cli.exe 内部用 miniaudio 解码,只支持 flac/mp3/ogg/wav,**不支持 mp4/mkv 等视频容器**,
@@ -182,11 +182,22 @@ pub fn process_video(
         // 取消标志——ffmpeg 万一卡住(极少见,比如某些损坏文件),用户点"取消"后批次永远
         // 停在这一步,"正在取消…"会一直转下去。
         let ff_stderr_handle = ff_child.stderr.take();
-        let (ff_status, ff_stderr) =
-            wait_child_with_cancel(&mut ff_child, ff_stderr_handle, cancel)
-                .map_err(|e| no_log(Stage::ExtractAudio, e))?;
+        let (ff_status, ff_stderr) = match wait_child_with_cancel(&mut ff_child, ff_stderr_handle, cancel) {
+            Ok(v) => v,
+            Err(e) => {
+                // 取消时 ffmpeg 可能只写了半截 wav。删掉它——留着会被断点续跑误判成
+                // "已提取好的完整音轨"(wav_reused 只看 is_file && len>0)直接复用,喂给
+                // whisper 的是截断的音频,会产出一份静默丢失后半段的字幕。这和识别阶段
+                // 取消时删半成品 srt 是同一个道理:半成品不该被当成完整产物复用。
+                let _ = std::fs::remove_file(&wav_path);
+                return Err(no_log(Stage::ExtractAudio, e));
+            }
+        };
 
         if !ff_status.success() {
+            // ffmpeg 失败说明这次提取没成功,输出的 wav 不可靠(可能只写了一半)。删掉
+            // 以免下次运行误复用,重新提取一次比产出静默丢失内容的字幕便宜得多。
+            let _ = std::fs::remove_file(&wav_path);
             // 完整 stderr 写进日志文件,界面只展示一行人话摘要——ffmpeg 的报错动辄十几行,
             // 塞进状态栏会撑爆一行的高度,技术细节留给"查看日志"按钮的用户。失败原因不限于
             // 文件损坏(还有缺解码组件/权限等),所以文案不把原因钉死在"文件损坏"上。
