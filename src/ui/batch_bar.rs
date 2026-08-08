@@ -95,7 +95,8 @@ pub(crate) fn render_batch_bar(app: &mut SubgenApp, ui: &mut egui::Ui) {
         if let Some((text, _)) = &app.transient_notice {
             ui.colored_label(theme::WARN, text);
         }
-        crate::ui::setup_screens::render_startup_warning(app, ui);
+        // 启动时配置恢复的横幅在 render_phase 统一渲染(每个页面顶部),这里不再重复画——
+        // Ready 阶段也是从 render_phase 走进来,重复画会在主界面顶部出现两行一样的横幅。
         ui.add_space(6.0);
     });
 }

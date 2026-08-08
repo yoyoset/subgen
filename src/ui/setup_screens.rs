@@ -14,7 +14,9 @@ use std::sync::atomic::Ordering;
 /// 组件看起来全缺"——用户会落在首次下载页(SetupPhase::NeedsDownload)而不是主界面,如果
 /// 只在主界面 batch_bar 渲染,这个最需要解释"为什么又要我下载十几 GB"的时刻反而看不到
 /// 横幅。所以 render_phase 每个页面顶部和主界面 batch_bar 都要画。
-pub(crate) fn render_startup_warning(app: &mut SubgenApp, ui: &mut egui::Ui) {
+/// 画配置恢复横幅本身。返回是否点了"知道了"——由调用方决定怎么关掉它(render_phase 统一
+/// 处理),避免"谁调用谁负责关"的职责散落。
+pub(crate) fn render_startup_warning(app: &SubgenApp, ui: &mut egui::Ui) -> bool {
     let mut dismiss = false;
     if let Some(warning) = &app.startup_warning {
         egui::Frame::default()
@@ -30,15 +32,23 @@ pub(crate) fn render_startup_warning(app: &mut SubgenApp, ui: &mut egui::Ui) {
                 });
             });
     }
-    if dismiss {
-        app.startup_warning = None;
-    }
+    dismiss
 }
 
 /// 按当前 `SetupPhase` 分发到对应页面。从 `eframe::App::ui` 抽出来,让 egui 生命周期方法
 /// 只负责轮询和全局交互,页面分发和页面本身同住一个模块(改页面结构不用动 app.rs)。
 pub(crate) fn render_phase(app: &mut SubgenApp, ui: &mut egui::Ui) {
-    render_startup_warning(app, ui);
+    // 配置损坏横幅统一在这里渲染:用一个顶部面板包住,保证它永远出现在"每个阶段的内容面板"
+    // 之上、不会被 CentralPanel/左侧面板盖住。批次条(Ready 阶段)不再重复画同一行横幅。
+    let mut banner_dismissed = false;
+    if app.startup_warning.is_some() {
+        egui::Panel::top("startup_warning_banner").show(ui, |ui| {
+            banner_dismissed = render_startup_warning(app, ui);
+        });
+    }
+    if banner_dismissed {
+        app.startup_warning = None;
+    }
     use crate::app::SetupPhase;
     match &app.setup_phase {
         SetupPhase::Checking => render_checking(ui),
