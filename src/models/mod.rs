@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod whisper;
+pub(crate) mod actions;
 
 /// 一个模型现在处于什么状态,取代旧版 `setup::is_present` 的
 /// "`is_file() && len > 1_000_000`" 这种只挡得住"完全没文件"的粗糙判断——一个被截断到

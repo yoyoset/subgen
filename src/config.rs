@@ -22,14 +22,17 @@ pub struct Config {
     /// 保持便携行为;Some(path) = 用户在界面里显式指定过,不再跟着 exe 走(模型文件动辄
     /// 几个 GB 到十几个 GB,不应该被迫跟着 exe 放的位置走,比如很多人图方便把 exe 放 C 盘)。
     pub models_dir_override: Option<String>,
+    /// 上次添加视频时所在的目录,下次打开"选择视频文件"对话框默认跳到那里——批量处理
+    /// 一整个季的用户不用每次都从默认目录翻半天。None = 还没加过,对话框用系统默认位置。
+    pub last_dir: Option<String>,
     pub window_w: f32,
     pub window_h: f32,
     /// 模型绑定表:显式指定"某个模型(key 见 models::whisper_binding_key 等)对应磁盘上
     /// 哪个具体文件",绝对路径。空表(默认)= 完全退回 models_dir() 里递归搜索的旧行为,
-    /// 不影响任何现有用户。用户通过"定位…"手动选中一个文件、且哈希校验通过后才会写入
-    /// 一条绑定(见项目计划 B7,当前还没有 UI 会写入这张表)。声明在结构体最后一个字段,
-    /// 纯粹是为了让 TOML 输出把这张表(可能较长)放在文件末尾,不打断前面那些标量字段的
-    /// 可读性,不影响解析。
+    /// 不影响任何现有用户。用户通过"定位…"/"使用此文件"手动选中一个文件、且哈希校验
+    /// 通过后,UI 会写入一条绑定(见 `ui::model_manifest`/`app::apply_model_bound`)。
+    /// 声明在结构体最后一个字段,纯粹是为了让 TOML 输出把这张表(可能较长)放在文件末尾,
+    /// 不打断前面那些标量字段的可读性,不影响解析。
     pub model_files: std::collections::BTreeMap<String, String>,
 }
 
@@ -43,6 +46,7 @@ impl Default for Config {
             translate_model: "auto".to_string(),
             bilingual: true,
             models_dir_override: None,
+            last_dir: None,
             window_w: 760.0,
             window_h: 560.0,
             model_files: std::collections::BTreeMap::new(),
@@ -51,9 +55,8 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 尝试把 `text` 解析成 Config,失败时返回默认配置 + 一句人话说明原因(而不是像旧版
-    /// `load()` 那样直接 `unwrap_or_default()` 静默吞掉)。纯函数,不碰文件系统,方便单测
-    /// 覆盖"合法 TOML/未知字段容忍/彻底损坏"这几种情况。
+    /// 解析配置(可能损坏)并返回人类可读的恢复说明,`None` 表示解析成功没有异常。
+    /// 纯函数,不碰文件系统,方便单测覆盖"合法 TOML/未知字段容忍/彻底损坏"这几种情况。
     pub fn parse_or_recover(text: &str) -> (Config, Option<String>) {
         match toml::from_str::<Config>(text) {
             Ok(cfg) => (cfg, None),
@@ -67,29 +70,53 @@ impl Config {
     /// 下次打开程序会被要求重新下载十几个 GB,而不是提示"配置文件坏了"。这里解析失败时
     /// 先把坏文件另存一份 `.bak`,再返回默认配置——保留诊断线索,而不是让它在下一次
     /// `save()`(几乎任何设置变更都会触发)时被默认配置无声覆盖、永久丢失。
-    pub fn load() -> Self {
+    ///
+    /// 返回的 `Option<String>` 是给界面的恢复说明(比如"配置文件损坏,已备份并恢复默认"),
+    /// `None` 表示配置完好——之前这个信息只写进 logs/app.log,用户完全看不到自己的模型
+    /// 目录设置被重置了,属于"后台失败但界面看起来成功"。现在由 main.rs 把它带给界面,
+    /// 用一条可关闭的横幅告知用户。
+    pub fn load() -> (Self, Option<String>) {
         let path = crate::paths::config_path();
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             // 文件不存在是首次运行的正常情况,不是"损坏",不需要备份。
-            Err(_) => return Self::default(),
+            Err(_) => return (Self::default(), None),
         };
         let (config, warning) = Self::parse_or_recover(&text);
         if let Some(reason) = warning {
             let backup_path = path.with_extension("toml.bak");
-            let _ = std::fs::copy(&path, &backup_path);
-            crate::format::push_log(
-                &mut Vec::new(),
-                format!("{reason},已备份为 {} 并使用默认设置", backup_path.display()),
-            );
+            // 备份是否成功要如实告知:备份失败却告诉用户"已备份",下次 save() 就会把坏文件
+            // 无声覆盖掉,唯一的诊断线索就没了(这就是"界面声称成功、实际失败")。
+            let msg = if std::fs::copy(&path, &backup_path).is_ok() {
+                format!(
+                    "配置文件已损坏,已备份到 {} 并使用默认设置(模型位置等设置会恢复默认): {reason}",
+                    backup_path.display()
+                )
+            } else {
+                format!(
+                    "配置文件已损坏,且备份失败(原文件保留,但下次保存会被覆盖;建议手动复制备份): {reason}"
+                )
+            };
+            crate::format::push_log(&mut Vec::new(), msg.clone());
+            (config, Some(msg))
+        } else {
+            (config, None)
         }
-        config
     }
 
+    /// 原子写入配置:先写同目录的 `.tmp`,再改名覆盖正式文件——避免写入中途断电/崩溃
+    /// 留下半截的 config.toml。虽然 `load()` 对损坏文件有 `.bak` 恢复,但能不让它坏就
+    /// 不坏。改名是同一目录内的原子操作(Windows 的 MoveFileEx 带 REPLACE_EXISTING)。
     pub fn save(&self) {
         match toml::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(e) = std::fs::write(crate::paths::config_path(), text) {
+                let path = crate::paths::config_path();
+                let tmp = path.with_extension("toml.tmp");
+                if let Err(e) = std::fs::write(&tmp, &text) {
+                    crate::format::push_log(&mut Vec::new(), format!("保存配置失败: {e}"));
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &path) {
                     crate::format::push_log(&mut Vec::new(), format!("保存配置失败: {e}"));
                 }
             }
@@ -206,5 +233,44 @@ mod tests {
         assert_eq!(parsed.model, original.model);
         assert_eq!(parsed.models_dir_override, original.models_dir_override);
         assert_eq!(parsed.window_w, original.window_w);
+    }
+
+    /// 合并成一个测试:save()/load() 读写的是进程级固定的 config_path()(测试 exe 所在
+    /// 目录下的 config.toml),拆开写会互相踩文件导致偶发失败。这里把"正常保存→原子写入
+    /// 不残留临时文件→load 还原"和"损坏配置→load 返回恢复说明→坏文件被备份"两条路径
+    /// 放进同一个测试,先清理、后清理,不会和其它测试冲突。
+    #[test]
+    fn save_is_atomic_and_load_reports_corruption_recovery() {
+        let path = crate::paths::config_path();
+        let tmp = path.with_extension("toml.tmp");
+        let bak = path.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak);
+
+        // 1) 正常保存:原子写入(先 .tmp 再改名覆盖),临时文件不残留,load 原样还原。
+        let config = Config {
+            model: "medium".to_string(),
+            models_dir_override: Some(r"Z:\somewhere".to_string()),
+            ..Config::default()
+        };
+        config.save();
+        assert!(!tmp.exists(), "原子写入后 .tmp 临时文件不该残留");
+        let (loaded, warning) = Config::load();
+        assert!(warning.is_none(), "正常保存的配置不该有恢复说明: {warning:?}");
+        assert_eq!(loaded.model, "medium");
+        assert_eq!(loaded.models_dir_override, Some(r"Z:\somewhere".to_string()));
+
+        // 2) 配置损坏(比如写入中途断电留下的半截文件):load 返回恢复说明、退回默认值,
+        //    坏文件备份成 .bak——用户能通过界面知道"模型目录设置被重置了"而不是静默发生。
+        std::fs::write(&path, "this is not valid toml {{{").unwrap();
+        let (recovered, warning) = Config::load();
+        assert!(warning.is_some(), "损坏的配置应该返回恢复说明");
+        assert_eq!(recovered.model, Config::default().model, "损坏时退回默认值");
+        assert!(bak.exists(), "损坏的配置应该被备份成 .bak");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&bak);
     }
 }

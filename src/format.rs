@@ -1,10 +1,12 @@
-//! 纯格式化小函数:把数字/状态/枚举值转成界面显示用的人话字符串,或对数据做简单的业务
-//! 逻辑判断(比如"这条任务应不应该纳入这一批处理")。
+//! 人话格式化小函数 + 日志落盘助手:把数字/状态/枚举值转成界面显示用的人话字符串,或对
+//! 数据做简单的业务逻辑判断(比如"这条任务应不应该纳入这一批处理"),顺带负责应用日志
+//! 的落盘与轮转(见 `push_log`/`rotate_log_file`)。
 //! 这些函数不依赖 SubgenApp 的私有状态,搬家到独立文件不涉及可见性改动,也不涉及
 //! 新的跨文件依赖(只依赖既有的 job/paths 等模块)。
 
 use crate::job::{Job, JobStatus};
 use crate::paths;
+use crate::ui::theme;
 use std::path::PathBuf;
 
 /// 判断某个任务是否应该被这一次"开始处理"纳入批次:还没到成功终态的任务本来就该跑
@@ -33,6 +35,29 @@ pub fn reveal_path_for(job: &Job) -> PathBuf {
     job.video_path.clone()
 }
 
+/// 单个日志文件超过这个体积后,下次写入前把它改名成 `{name}.1`(丢弃更早的 .1),让日志
+/// 体积长期有界——`logs/app.log` 和 `logs/crash.log` 都是只增不删的追加写,时间长了会无限
+/// 膨胀(一台长期用的机器上攒几个 GB 的日志很常见)。
+pub const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 判断日志文件是否已经超过体积上限、需要轮转。纯函数,方便单测。
+pub fn should_rotate_log(current_len: u64, max_bytes: u64) -> bool {
+    current_len > max_bytes
+}
+
+/// 把超过体积上限的日志文件轮转:改名成 `{name}.1`,腾出位置让新日志从头写。
+/// 改名失败时静默忽略——日志只是附加的排障能力,轮转失败不该成为新的失败点。
+pub fn rotate_log_file(path: &std::path::Path, max_bytes: u64) {
+    if std::fs::metadata(path)
+        .map(|m| should_rotate_log(m.len(), max_bytes))
+        .unwrap_or(false)
+    {
+        let rotated = path.with_extension("log.1");
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(path, &rotated);
+    }
+}
+
 /// 追加一行日志:既存进界面日志区(`log_lines`),也同步落盘到 `logs/app.log`——`log_lines`
 /// 只在内存里,关窗即丢,用户报障时"把 logs 文件夹发我"这句话要成立,日志就得先落盘。
 /// 时间戳格式和 crash.log(见 install_panic_logger)保持一致,用 unix 时间戳而不是拼日历
@@ -49,10 +74,12 @@ pub fn push_log(log_lines: &mut Vec<String>, line: String) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let log_path = paths::logs_dir().join("app.log");
+    rotate_log_file(&log_path, MAX_LOG_BYTES);
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(paths::logs_dir().join("app.log"))
+        .open(&log_path)
     {
         use std::io::Write;
         let _ = writeln!(file, "[unix {timestamp}] {line}");
@@ -60,14 +87,20 @@ pub fn push_log(log_lines: &mut Vec<String>, line: String) {
     log_lines.push(line);
 }
 
-/// 把秒数格式化成 "12s" 或 "1分23秒" 这种人可读的形式,用于界面上的"已运行"计时。
+/// 把秒数格式化成 "12秒" / "1分23秒" / "2小时5分" 这种人可读的形式,用于界面上的"已运行"
+/// 计时。整小时以上的批量任务(几十集可能要跑一两个小时)显示"XX分YY秒"会失去规模感,
+/// 所以 ≥1 小时时切换成小时制。
 pub fn format_elapsed(total_secs: u64) -> String {
-    if total_secs < 60 {
-        format!("{total_secs}秒")
-    } else {
-        let m = total_secs / 60;
-        let s = total_secs % 60;
+    let s = total_secs % 60;
+    let total_min = total_secs / 60;
+    let m = total_min % 60;
+    let h = total_min / 60;
+    if h > 0 {
+        format!("{h}小时{m}分")
+    } else if total_secs >= 60 {
         format!("{m}分{s}秒")
+    } else {
+        format!("{s}秒")
     }
 }
 
@@ -146,12 +179,12 @@ pub fn model_status_line(status: &crate::models::ModelStatus) -> (String, eframe
     match status {
         ModelStatus::Ready { size, .. } => (
             format!("已就绪 · {}", format_download_size(*size)),
-            eframe::egui::Color32::from_rgb(60, 170, 60),
+            theme::SUCCESS,
         ),
-        ModelStatus::Missing => ("未安装".to_string(), eframe::egui::Color32::GRAY),
+        ModelStatus::Missing => ("未安装".to_string(), theme::NEUTRAL),
         ModelStatus::PathBroken { .. } => (
             "绑定的文件已不在原位置(可能被移动或删除了)".to_string(),
-            eframe::egui::Color32::from_rgb(230, 150, 20),
+            theme::WARN,
         ),
         ModelStatus::SizeMismatch { expected, actual, .. } => (
             format!(
@@ -159,7 +192,7 @@ pub fn model_status_line(status: &crate::models::ModelStatus) -> (String, eframe
                 format_download_size(*expected),
                 format_download_size(*actual)
             ),
-            eframe::egui::Color32::RED,
+            theme::ERROR,
         ),
     }
 }
@@ -210,7 +243,7 @@ pub fn format_job_report_suffix(report: &crate::job::JobReport) -> String {
 /// 取消后看到这一行还在正常显示进度百分比,会以为取消没生效。
 pub fn job_status_line(job: &Job, cancelling: bool) -> (String, eframe::egui::Color32) {
     match &job.status {
-        JobStatus::Pending => ("等待中".to_string(), eframe::egui::Color32::GRAY),
+        JobStatus::Pending => ("等待中".to_string(), theme::NEUTRAL),
         JobStatus::Running(_, text, pct) => {
             let elapsed = job.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             let elapsed_str = format_elapsed(elapsed);
@@ -238,25 +271,25 @@ pub fn job_status_line(job: &Job, cancelling: bool) -> (String, eframe::egui::Co
                 // 两个字,用户在播放器里加载不出字幕文件时,唯一的结论会是"这个软件坏了"。
                 (
                     "完成(未检测到对白,字幕为空)".to_string(),
-                    eframe::egui::Color32::from_rgb(60, 170, 60),
+                    theme::SUCCESS,
                 )
             } else {
                 (
                     format!("完成{}", format_job_report_suffix(report)),
-                    eframe::egui::Color32::from_rgb(60, 170, 60),
+                    theme::SUCCESS,
                 )
             }
         }
         JobStatus::DoneWithWarning(reason, report) => (
             format!("完成,但有提示: {reason}{}", format_job_report_suffix(report)),
-            eframe::egui::Color32::from_rgb(230, 150, 20),
+            theme::WARN,
         ),
-        JobStatus::Skipped(reason) => (format!("跳过: {reason}"), eframe::egui::Color32::GRAY),
+        JobStatus::Skipped(reason) => (format!("跳过: {reason}"), theme::NEUTRAL),
         JobStatus::Failed(stage, reason, _) => (
             format!("{}阶段失败: {reason}", stage.label()),
-            eframe::egui::Color32::RED,
+            theme::ERROR,
         ),
-        JobStatus::Cancelled => ("已取消".to_string(), eframe::egui::Color32::GRAY),
+        JobStatus::Cancelled => ("已取消".to_string(), theme::NEUTRAL),
     }
 }
 
@@ -266,14 +299,14 @@ pub fn job_status_line(job: &Job, cancelling: bool) -> (String, eframe::egui::Co
 /// 哪一条"的视觉元素,不能和"等待中"用同一个灰。
 pub fn status_dot_color(status: &JobStatus) -> eframe::egui::Color32 {
     match status {
-        JobStatus::Pending => eframe::egui::Color32::GRAY,
-        JobStatus::Running(..) => eframe::egui::Color32::from_rgb(90, 150, 230),
-        JobStatus::Done(report) if report.empty_subtitle() => eframe::egui::Color32::GRAY,
-        JobStatus::Done(_) => eframe::egui::Color32::from_rgb(60, 170, 60),
-        JobStatus::DoneWithWarning(..) => eframe::egui::Color32::from_rgb(230, 150, 20),
-        JobStatus::Skipped(_) => eframe::egui::Color32::GRAY,
-        JobStatus::Failed(..) => eframe::egui::Color32::RED,
-        JobStatus::Cancelled => eframe::egui::Color32::GRAY,
+        JobStatus::Pending => theme::NEUTRAL,
+        JobStatus::Running(..) => theme::ACCENT_LIGHT,
+        JobStatus::Done(report) if report.empty_subtitle() => theme::NEUTRAL,
+        JobStatus::Done(_) => theme::SUCCESS,
+        JobStatus::DoneWithWarning(..) => theme::WARN,
+        JobStatus::Skipped(_) => theme::NEUTRAL,
+        JobStatus::Failed(..) => theme::ERROR,
+        JobStatus::Cancelled => theme::NEUTRAL,
     }
 }
 
@@ -370,6 +403,17 @@ mod tests {
         assert_eq!(format_download_size(885_098), "0.8 MB");
         assert_eq!(format_download_size(1_073_741_824), "1.0 GB");
         assert_eq!(format_download_size(3_095_033_483), "2.9 GB");
+    }
+
+    #[test]
+    fn format_elapsed_handles_seconds_minutes_and_hours() {
+        assert_eq!(format_elapsed(0), "0秒");
+        assert_eq!(format_elapsed(12), "12秒");
+        assert_eq!(format_elapsed(60), "1分0秒");
+        assert_eq!(format_elapsed(83), "1分23秒");
+        // 一小时以上切成小时制:几十集的批次可能跑一两个小时,"60分5秒"没有规模感。
+        assert_eq!(format_elapsed(3600), "1小时0分");
+        assert_eq!(format_elapsed(7325), "2小时2分");
     }
 
     fn job_with_status(status: JobStatus) -> Job {
@@ -548,6 +592,23 @@ mod tests {
     }
 
     #[test]
+    fn job_status_line_appends_cancelling_suffix_when_cancelling() {
+        // 用户点了"取消"但批次还没停(worker 要等当前步骤结束),状态行必须附一句
+        // "正在取消",不然进度还在走会让用户以为取消没生效。
+        let job = running_job_with_elapsed(Some(50.0), 30);
+        let (text, _) = job_status_line(&job, true);
+        assert!(
+            text.contains("正在取消,等当前步骤结束"),
+            "取消中应附加提示: {text}"
+        );
+        let (normal, _) = job_status_line(&job, false);
+        assert!(
+            !normal.contains("正在取消"),
+            "非取消中不该出现取消提示: {normal}"
+        );
+    }
+
+    #[test]
     fn push_log_writes_to_app_log_and_in_memory_vec() {
         let app_log = paths::logs_dir().join("app.log");
         let _ = std::fs::remove_file(&app_log);
@@ -561,6 +622,40 @@ mod tests {
         assert!(content.contains("[unix "), "应该带时间戳前缀: {content}");
 
         let _ = std::fs::remove_file(&app_log);
+    }
+
+    #[test]
+    fn should_rotate_log_flips_only_after_the_threshold() {
+        assert!(!should_rotate_log(0, MAX_LOG_BYTES));
+        assert!(!should_rotate_log(MAX_LOG_BYTES, MAX_LOG_BYTES), "恰好等于上限不该轮转");
+        assert!(should_rotate_log(MAX_LOG_BYTES + 1, MAX_LOG_BYTES));
+        assert!(should_rotate_log(MAX_LOG_BYTES * 10, MAX_LOG_BYTES));
+    }
+
+    #[test]
+    fn rotate_log_file_renames_oversized_log_to_sibling() {
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_rotate_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        std::fs::write(&log, vec![b'x'; 100]).unwrap();
+
+        // 还没超过上限,不该轮转。
+        rotate_log_file(&log, 1000);
+        assert!(log.exists(), "未超限时原文件应该原样保留");
+        assert!(!dir.join("app.log.1").exists(), "未超限时不该产生轮转文件");
+
+        // 超过上限,轮转成 app.log.1,原位置腾出来让新日志从头写。
+        rotate_log_file(&log, 50);
+        assert!(!log.exists(), "轮转后原文件应该被改名走");
+        assert!(dir.join("app.log.1").exists(), "旧内容应该落在 app.log.1");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

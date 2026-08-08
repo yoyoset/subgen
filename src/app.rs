@@ -35,6 +35,9 @@ pub(crate) enum SetupPhase {
 
 pub struct SubgenApp {
     pub(crate) config: Config,
+    /// 启动时配置恢复的说明(配置文件损坏被重置时,用户必须知道自己的模型目录设置没了),
+    /// 以可关闭横幅的形式显示,直到用户点"知道了"或显式关闭。
+    pub(crate) startup_warning: Option<String>,
     pub(crate) jobs: Vec<Job>,
     pub(crate) setup_phase: SetupPhase,
     pub(crate) setup_rx: Option<mpsc::Receiver<SetupEvent>>,
@@ -169,10 +172,45 @@ pub(crate) struct ReviewReportState {
     pub correction_result: Option<String>,
 }
 
+/// 后台线程的通用兜底:线程体内部 panic 时,向 `tx` 补发 `on_panic()` 返回的终态消息,并
+/// 记一条日志——而不是让线程静默死掉、sender 被丢弃、界面的 poll 循环永远等不到终态
+/// 消息卡在"处理中/下载中/扫描中"。下载、搬迁、内联安装、哈希校验、扫描、清理这些后台
+/// 线程是同一个失败模式,统一走这里兜底。
+///
+/// `body` 正常结束时自己负责发送终态消息(现有逻辑不变);panic 时由这里补发。用
+/// `AssertUnwindSafe` 是显式接受"panic 可能把线程局部状态留在中间值"的风险——这些线程
+/// 的共享状态只有 cancel 标志和 channel,不会有跨线程读到的脏数据。
+/// 下载/搬迁失败的消息是否表示"用户主动取消"(而不是真实错误)。取消路径统一产生带
+/// "取消"字样的消息("用户取消" / "用户取消下载" / "已取消"),真实网络/IO/哈希错误不会
+/// 出现这个字眼。把判断抽成命名函数,方便单测锁住这个约定。
+pub(crate) fn is_user_cancel(msg: &str) -> bool {
+    msg.contains("取消")
+}
+
+pub(crate) fn spawn_guarded_thread<T: Send + 'static>(
+    tx: std::sync::mpsc::Sender<T>,
+    on_panic: impl FnOnce() -> T + Send + 'static,
+    body: impl FnOnce() + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+            crate::format::push_log(
+                &mut Vec::new(),
+                format!(
+                    "后台线程内部崩溃(详情见 logs/crash.log): {}",
+                    crate::job::panic_payload_message(&panic)
+                ),
+            );
+            let _ = tx.send(on_panic());
+        }
+    });
+}
+
 impl SubgenApp {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, startup_warning: Option<String>) -> Self {
         Self {
             config,
+            startup_warning,
             jobs: Vec::new(),
             setup_phase: SetupPhase::Checking,
             setup_rx: None,
@@ -243,19 +281,27 @@ impl SubgenApp {
             queue: missing.iter().skip(1).cloned().collect(),
         };
 
-        std::thread::spawn(move || {
-            for key in missing {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(SetupEvent::Failed("用户取消".to_string()));
-                    return;
+        spawn_guarded_thread(
+            tx.clone(),
+            || {
+                SetupEvent::Failed(
+                    "下载过程中发生内部错误,已中止(详情见 logs/crash.log)".to_string(),
+                )
+            },
+            move || {
+                for key in missing {
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = tx.send(SetupEvent::Failed("用户取消".to_string()));
+                        return;
+                    }
+                    if let Err(e) = setup::install_component(key, &model, &tx, &cancel) {
+                        let _ = tx.send(SetupEvent::Failed(e));
+                        return;
+                    }
                 }
-                if let Err(e) = setup::install_component(key, &model, &tx, &cancel) {
-                    let _ = tx.send(SetupEvent::Failed(e));
-                    return;
-                }
-            }
-            let _ = tx.send(SetupEvent::AllReady);
-        });
+                let _ = tx.send(SetupEvent::AllReady);
+            },
+        );
     }
 
     /// 打开文件夹选择框,让用户指定模型存放目录。模型文件动辄几个 GB 到十几个 GB,不该被迫
@@ -313,10 +359,18 @@ impl SubgenApp {
             total: 0,
         };
 
-        std::thread::spawn(move || {
-            let issues = setup::migrate_models_dir(&old_dir, &new_dir_for_thread, &tx, &cancel);
-            let _ = tx.send(setup::MigrateEvent::AllDone(issues));
-        });
+        spawn_guarded_thread(
+            tx.clone(),
+            || {
+                setup::MigrateEvent::AllDone(vec![
+                    "搬迁线程内部错误,已中止(详情见 logs/crash.log)".to_string(),
+                ])
+            },
+            move || {
+                let issues = setup::migrate_models_dir(&old_dir, &new_dir_for_thread, &tx, &cancel);
+                let _ = tx.send(setup::MigrateEvent::AllDone(issues));
+            },
+        );
     }
 
     /// 把 `new_dir` 设为生效的模型目录:写进程级覆盖值(paths.rs,立即对后续所有路径解析
@@ -407,7 +461,16 @@ impl SubgenApp {
     pub(crate) const VIDEO_EXTENSIONS: &'static [&'static str] =
         &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts"];
 
-    pub(crate) fn add_files(&mut self, paths: Vec<PathBuf>) {
+    /// 把文件加入任务列表。返回 `(实际添加了几个, 被忽略了几个)`——拖进来的文件常常是
+    /// 视频和别的文件混在一起(抓整季时 .nfo/.jpg 会一起拖进来),忽略非视频是预期行为;
+    /// 但调用方要知道有没有"全都被忽略"的情况,好给用户一句反馈而不是让界面毫无反应。
+    /// 顺带记住本次添加的第一个视频所在目录,下次"选择视频文件"默认跳到那。
+    /// 只改内存里的 config.last_dir,不在这里落盘——config 统一在 on_exit/设置变更时保存,
+    /// 这里做落盘会和 config 的测试在同一个 config 路径上产生竞争。
+    pub(crate) fn add_files(&mut self, paths: Vec<PathBuf>) -> (usize, usize) {
+        let mut added = 0usize;
+        let mut ignored = 0usize;
+        let mut last_dir: Option<PathBuf> = None;
         for p in paths {
             let is_video = p
                 .extension()
@@ -419,9 +482,21 @@ impl SubgenApp {
                 })
                 .unwrap_or(false);
             if is_video && !self.jobs.iter().any(|j| j.video_path == p) {
+                if last_dir.is_none()
+                    && let Some(parent) = p.parent()
+                {
+                    last_dir = Some(parent.to_path_buf());
+                }
                 self.jobs.push(Job::new(p));
+                added += 1;
+            } else {
+                ignored += 1;
             }
         }
+        if let Some(dir) = last_dir {
+            self.config.last_dir = Some(dir.to_string_lossy().to_string());
+        }
+        (added, ignored)
     }
 
     pub(crate) fn start_processing(&mut self) {
@@ -457,6 +532,13 @@ impl SubgenApp {
             .map(|(i, _)| i)
             .collect();
         if indices.is_empty() {
+            // 所有任务都已完成,按钮却还亮着——点了毫无反应是最差的情况。给一句说明,
+            // 并指出去哪重跑(任务行点"重新处理")。
+            self.transient_notice = Some((
+                "所有任务都已处理完成,没有需要重新处理的(想重跑某一集请在其任务行点“重新处理”)"
+                    .to_string(),
+                std::time::Instant::now(),
+            ));
             return;
         }
 
@@ -495,77 +577,39 @@ impl SubgenApp {
         );
     }
 
-    /// 生成 `job_index` 对应任务的翻译复核报告:读原文/译文两份 srt、跑粗筛、格式化成文本、
-    /// 写到视频旁的 `.zh.review.txt`,同时存进 `self.review` 供详情面板显示/复制。
-    ///
-    /// 中文字幕文件可能是双语的("中文\n原文"两行一块)也可能是仅中文单行——不管哪种,
-    /// 写出时中文永远是每块的第一行(见 `translate::build_output_blocks`),所以这里用
-    /// `parse_srt_blocks_lines` 取每块的行数组、只拿第一行,而不是 `parse_srt_blocks`
-    /// (它会把多行块用空格拼接,双语文件会把中文和原文拼成一坨、失去边界)。
+    /// 生成 `job_index` 对应任务的翻译复核报告。文件读取/粗筛/格式化/写盘都在
+    /// `report.rs`(见 `report::generate_review_report`),这里只负责把结果存进界面状态
+    /// `self.review`,失败时用 transient_notice 提示——之前文件写失败是静默吞掉的,
+    /// 用户看到界面有报告、实际视频旁边没有文件,属于"后台失败但看起来成功"。
     pub(crate) fn generate_review_report(&mut self, job_index: usize) {
         let Some(job) = self.jobs.get(job_index) else {
             return;
         };
         let video_path = job.video_path.clone();
-        let original_path = paths::sidecar_srt_path(&video_path);
-        let zh_path = paths::sidecar_srt_lang_path(&video_path, "zh");
         let label = video_path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-
-        let original_content = match std::fs::read_to_string(&original_path) {
-            Ok(c) => c,
-            Err(e) => {
-                self.transient_notice =
-                    Some((format!("找不到原文字幕: {e}"), std::time::Instant::now()));
-                return;
+        match crate::report::generate_review_report(&video_path, &label) {
+            Ok(data) => {
+                self.review = Some(ReviewReportState {
+                    job_index,
+                    text: data.text,
+                    suspect_indices: data.suspect_indices,
+                    saved_path: data.saved_path,
+                    correction_input: String::new(),
+                    correction_result: None,
+                });
             }
-        };
-        let zh_content = match std::fs::read_to_string(&zh_path) {
-            Ok(c) => c,
-            Err(e) => {
-                self.transient_notice =
-                    Some((format!("找不到中文字幕: {e}"), std::time::Instant::now()));
-                return;
-            }
-        };
-
-        let original_blocks = crate::engine::parse_srt_blocks(&original_content);
-        let zh_blocks: Vec<(String, String, String)> = crate::engine::parse_srt_blocks_lines(&zh_content)
-            .into_iter()
-            .map(|(start, end, lines)| (start, end, lines.into_iter().next().unwrap_or_default()))
-            .collect();
-
-        let suspects = match crate::report::detect_suspects(&original_blocks, &zh_blocks) {
-            Ok(s) => s,
             Err(e) => {
                 self.transient_notice = Some((e, std::time::Instant::now()));
-                return;
             }
-        };
-        let suspect_indices: Vec<usize> = suspects.iter().map(|s| s.index).collect();
-        let text = crate::report::format_review_report(&label, &original_blocks, &zh_blocks, &suspects);
-
-        let saved_path = paths::sidecar_review_path(&video_path);
-        let _ = std::fs::write(&saved_path, &text);
-
-        self.review = Some(ReviewReportState {
-            job_index,
-            text,
-            suspect_indices,
-            saved_path,
-            correction_input: String::new(),
-            correction_result: None,
-        });
+        }
     }
 
-    /// 把用户粘贴回来的编号行("129. 修正后的译文")应用到对应任务的 `.zh.srt`。只接受
-    /// 这次生成报告时真正标记为可疑的下标(`self.review.suspect_indices`),不认识的编号
-    /// 一律忽略并在结果文案里列出来——不该让一次误粘贴覆盖到没有被标记过的行。
-    ///
-    /// 双语字幕每块有"中文\n原文"两行,只替换第一行(中文),保留后面的原文行不动;
-    /// 原文件先备份成 `.zh.srt.bak` 再覆盖写入。
+    /// 把用户粘贴回来的编号行("129. 修正后的译文")应用到对应任务的 `.zh.srt`。
+    /// 文件重写逻辑在 `report::apply_corrections`,这里只负责编排:校验报告属于当前任务、
+    /// 取粘贴内容、把结果文案写回 `self.review`。
     pub(crate) fn apply_review_corrections(&mut self, job_index: usize) {
         let Some(review) = &self.review else {
             return;
@@ -576,436 +620,42 @@ impl SubgenApp {
         let pasted = review.correction_input.clone();
         let allowed: std::collections::HashSet<usize> =
             review.suspect_indices.iter().copied().collect();
-
         let Some(job) = self.jobs.get(job_index) else {
             return;
         };
         let zh_path = paths::sidecar_srt_lang_path(&job.video_path, "zh");
 
-        let zh_content = match std::fs::read_to_string(&zh_path) {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(r) = &mut self.review {
-                    r.correction_result = Some(format!("读取中文字幕失败: {e}"));
-                }
-                return;
-            }
-        };
-        let mut blocks = crate::engine::parse_srt_blocks_lines(&zh_content);
-
-        let mut applied = 0usize;
-        let mut ignored: Vec<usize> = Vec::new();
-        for line in pasted.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some((num, text)) = crate::translate::split_leading_number(line) else {
-                continue;
-            };
-            let index = num.saturating_sub(1);
-            if !allowed.contains(&index) {
-                ignored.push(num);
-                continue;
-            }
-            if let Some((_, _, lines)) = blocks.get_mut(index) {
-                if lines.is_empty() {
-                    lines.push(text.to_string());
-                } else {
-                    lines[0] = text.to_string();
-                }
-                applied += 1;
-            }
-        }
-
-        if applied == 0 {
-            if let Some(r) = &mut self.review {
-                r.correction_result = Some(if ignored.is_empty() {
+        let msg = match crate::report::apply_corrections(&zh_path, &allowed, &pasted) {
+            Ok((0, ignored)) => {
+                if ignored.is_empty() {
                     "没有识别到任何可应用的修正行(格式应为“编号. 修正后的译文”)".to_string()
                 } else {
                     format!(
                         "没有应用任何修正——这些编号不在本次报告标记的可疑行范围内: {}",
                         ignored.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("、")
                     )
-                });
+                }
             }
-            return;
-        }
-
-        let backup_path = PathBuf::from(format!("{}.bak", zh_path.display()));
-        let _ = std::fs::write(&backup_path, &zh_content);
-
-        let out_blocks: Vec<(String, String, String)> = blocks
-            .into_iter()
-            .map(|(start, end, lines)| (start, end, lines.join("\n")))
-            .collect();
-        let _ = std::fs::write(&zh_path, crate::engine::write_srt_blocks(&out_blocks));
-
-        let msg = if ignored.is_empty() {
-            format!("已应用 {applied} 处修正(原文件已备份为 .bak)")
-        } else {
-            format!(
-                "已应用 {applied} 处修正(原文件已备份为 .bak);忽略了不在标记范围内的编号: {}",
-                ignored.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("、")
-            )
+            Ok((applied, ignored)) => {
+                if let Some(r) = &mut self.review {
+                    r.correction_input.clear();
+                }
+                if ignored.is_empty() {
+                    format!("已应用 {applied} 处修正(原文件已备份为 .bak)")
+                } else {
+                    format!(
+                        "已应用 {applied} 处修正(原文件已备份为 .bak);忽略了不在标记范围内的编号: {}",
+                        ignored.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("、")
+                    )
+                }
+            }
+            Err(e) => e,
         };
         if let Some(r) = &mut self.review {
             r.correction_result = Some(msg);
-            r.correction_input.clear();
         }
     }
 
-    /// "定位…"按钮的入口:弹出文件选择框,选中后交给 `begin_verify_candidate` 做粗筛+
-    /// 哈希校验。
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn begin_locate_model(
-        &mut self,
-        binding_key: String,
-        label: String,
-        expected_kind: crate::models::FileKind,
-        expected_size: u64,
-        expected_sha256: &'static str,
-        extension_filter: &'static str,
-    ) {
-        let Some(picked) = rfd::FileDialog::new()
-            .add_filter(&label, &[extension_filter])
-            .pick_file()
-        else {
-            return; // 用户在选择框里按了取消
-        };
-        self.begin_verify_candidate(binding_key, label, picked, expected_kind, expected_size, expected_sha256);
-    }
-
-    /// 给定一个候选路径(来自文件选择框,或者"扫描本机已有模型"找到的候选),先做便宜的
-    /// 类型+大小粗筛(读文件开头 4 字节魔数 + 元数据,不用起线程),粗筛通过才起后台线程
-    /// 算哈希(见 `poll_verify`)——几 GB 的文件哈希要算几十秒,不能挡住 UI 线程。
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn begin_verify_candidate(
-        &mut self,
-        binding_key: String,
-        label: String,
-        candidate: PathBuf,
-        expected_kind: crate::models::FileKind,
-        expected_size: u64,
-        expected_sha256: &'static str,
-    ) {
-        let actual_size = match std::fs::metadata(&candidate) {
-            Ok(m) => m.len(),
-            Err(e) => {
-                self.transient_notice = Some((format!("读取文件信息失败: {e}"), std::time::Instant::now()));
-                return;
-            }
-        };
-        let magic = match read_magic(&candidate) {
-            Ok(m) => m,
-            Err(e) => {
-                self.transient_notice = Some((format!("读取文件失败: {e}"), std::time::Instant::now()));
-                return;
-            }
-        };
-
-        match crate::models::classify_picked_file(magic, actual_size, expected_kind, expected_size) {
-            crate::models::PickOutcome::WrongKind => {
-                self.transient_notice = Some((
-                    "这个文件看起来不是同一类模型,已忽略(只按文件头判断类型,不解析内容细节)"
-                        .to_string(),
-                    std::time::Instant::now(),
-                ));
-            }
-            crate::models::PickOutcome::SizeMismatch { expected, actual } => {
-                self.transient_notice = Some((
-                    format!(
-                        "文件大小不对(期望 {},实际 {}),已忽略",
-                        format_download_size(expected),
-                        format_download_size(actual)
-                    ),
-                    std::time::Instant::now(),
-                ));
-            }
-            crate::models::PickOutcome::Plausible => {
-                let cancel = Arc::new(AtomicBool::new(false));
-                let (tx, rx) = mpsc::channel();
-                let cancel_thread = cancel.clone();
-                let path_thread = candidate.clone();
-                std::thread::spawn(move || {
-                    let result = setup::sha256_file_cancelable(&path_thread, &cancel_thread)
-                        .map(|digest| setup::to_hex(&digest).eq_ignore_ascii_case(expected_sha256));
-                    let _ = tx.send(result);
-                });
-                self.pending_verify = Some(PendingVerify { binding_key, label, path: candidate, rx, cancel });
-            }
-        }
-    }
-
-    /// 命中本地已有文件、决定绑定而不是复制/下载(见 `setup::install_or_bind`)——写进
-    /// config 才能跨进程记住,同步进程级绑定表才能这一轮立刻生效,不用等重启。两个来源
-    /// 共用:首次运行的整屏下载流程(`SetupEvent::ModelBound`)和清单里的"下载"内联安装
-    /// (`poll_inline_install`)。push_log 而不是静默处理——这是"省下了一次几 GB 下载"的
-    /// 用户可见事件,值得留痕。
-    fn apply_model_bound(&mut self, key: String, path: PathBuf) {
-        self.config.model_files.insert(key, path.to_string_lossy().to_string());
-        self.config.save();
-        paths::set_model_bindings(
-            self.config.model_files.iter().map(|(k, v)| (k.clone(), PathBuf::from(v))).collect(),
-        );
-        push_log(&mut self.log_lines, format!("已绑定到本地已有文件: {}", path.display()));
-    }
-
-    /// 模型清单里点"下载"的入口——不进整屏的 `SetupPhase::Downloading` 流程,单独起一个
-    /// 后台线程装这一个组件,用同一套 `setup::install_component`/`SetupEvent`,只是消费方
-    /// 换成 `poll_inline_install`。这样用户在设置里调整了某个用不上的选项(比如换了个还没
-    /// 下载的翻译模型)不会被强制拖回整屏下载页,只在真的想要那个模型时,就地点一下就装。
-    pub(crate) fn begin_inline_install(&mut self, key: ComponentKey, label: String, whisper_model: String) {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let cancel_thread = cancel.clone();
-        std::thread::spawn(move || {
-            match setup::install_component(key, &whisper_model, &tx, &cancel_thread) {
-                Ok(()) => {
-                    let _ = tx.send(SetupEvent::AllReady);
-                }
-                Err(e) => {
-                    let _ = tx.send(SetupEvent::Failed(e));
-                }
-            }
-        });
-        self.inline_install = Some(InlineInstall { key, label, rx, cancel, downloaded: 0, total: 0 });
-    }
-
-    fn poll_inline_install(&mut self, ctx: &egui::Context) {
-        let mut logs: Vec<String> = Vec::new();
-        let mut bound: Option<(String, PathBuf)> = None;
-        let mut progress: Option<(u64, u64)> = None;
-        let mut finished: Option<Result<(), String>> = None;
-        if let Some(inst) = &self.inline_install {
-            while let Ok(ev) = inst.rx.try_recv() {
-                match ev {
-                    SetupEvent::Log(l) => logs.push(l),
-                    SetupEvent::Progress { downloaded, total, .. } => progress = Some((downloaded, total)),
-                    SetupEvent::ModelBound { key, path } => bound = Some((key, path)),
-                    SetupEvent::ComponentReady(_) | SetupEvent::AllReady => finished = Some(Ok(())),
-                    SetupEvent::Failed(e) => finished = Some(Err(e)),
-                }
-            }
-        }
-        for l in logs {
-            push_log(&mut self.log_lines, l);
-        }
-        if let Some((d, t)) = progress
-            && let Some(inst) = &mut self.inline_install
-        {
-            inst.downloaded = d;
-            inst.total = t;
-        }
-        if let Some((key, path)) = bound {
-            self.apply_model_bound(key, path);
-        }
-        if let Some(result) = finished {
-            let label = self.inline_install.take().map(|i| i.label).unwrap_or_default();
-            self.transient_notice = Some((
-                match &result {
-                    Ok(()) => format!("{label} 安装完成"),
-                    Err(e) => format!("{label} 安装失败: {e}"),
-                },
-                std::time::Instant::now(),
-            ));
-        }
-        if self.inline_install.is_some() {
-            ctx.request_repaint();
-        }
-    }
-
-    /// "扫描本机已有模型"入口。做两件事,同一趟遍历顺带做,不需要用户分别点两个按钮:
-    /// (1) 后台遍历已知的外部缓存位置(HF_HOME/HF_HUB_CACHE/`~/.cache/huggingface/hub`,
-    /// 见 `setup::find_in_known_roots`),按(文件名, 大小)粗筛候选——不做哈希,扫描要遍历
-    /// 用户可能几十 GB 的共享缓存目录,把每个候选都哈希一遍太慢。真正认定"是不是这个模型"
-    /// 留到用户点"使用此文件"时,复用 `begin_locate_model` 同一条哈希校验+绑定路径。
-    /// (2) 在存放目录树里找同一个文件名是否存在不止一份(见 `paths::find_all_matching_files`)
-    /// ——这是"清理重复"(用户明确要求"先不去重,方案完善好再删除",这里只探测、只在
-    /// 用户点"清理"时才真的动文件,见 `begin_cleanup_duplicates`)的前置扫描。
-    pub(crate) fn begin_scan_for_models(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut found: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
-            let mut duplicates: std::collections::BTreeMap<String, Vec<PathBuf>> = std::collections::BTreeMap::new();
-            let mut check = |binding_key: String, file_name: &str, expected_size: u64, kept: Option<PathBuf>| {
-                if let Some(p) = setup::find_in_known_roots(file_name)
-                    && std::fs::metadata(&p).map(|m| m.len()).ok() == Some(expected_size)
-                {
-                    found.insert(binding_key.clone(), p);
-                }
-                let all = paths::find_all_matching_files(&paths::models_dir(), file_name);
-                let extra: Vec<PathBuf> = all.into_iter().filter(|p| Some(p) != kept.as_ref()).collect();
-                if !extra.is_empty() {
-                    duplicates.insert(binding_key, extra);
-                }
-            };
-            for wm in crate::models::whisper::MODELS {
-                check(
-                    crate::models::whisper_binding_key(wm.key),
-                    wm.file_name,
-                    wm.size_bytes,
-                    Some(paths::model_path(wm.key)),
-                );
-            }
-            check(
-                crate::models::VAD_BINDING_KEY.to_string(),
-                crate::models::VAD_FILE_NAME,
-                crate::models::VAD_SIZE_BYTES,
-                Some(paths::vad_model_path()),
-            );
-            for tm in crate::translate::MODELS {
-                check(
-                    crate::models::trans_binding_key(tm.key),
-                    tm.file_name,
-                    tm.size_bytes,
-                    Some(paths::trans_model_path(tm.key, tm.file_name)),
-                );
-            }
-            let _ = tx.send((found, duplicates));
-        });
-        self.scan_rx = Some(rx);
-    }
-
-    fn poll_scan(&mut self, ctx: &egui::Context) {
-        let mut result = None;
-        if let Some(rx) = &self.scan_rx
-            && let Ok(r) = rx.try_recv()
-        {
-            result = Some(r);
-        }
-        if let Some((found, duplicates)) = result {
-            self.scan_rx = None;
-            self.scan_results = Some(found);
-            self.dup_results = Some(duplicates);
-        }
-        if self.scan_rx.is_some() {
-            ctx.request_repaint();
-        }
-    }
-
-    /// "清理"按钮的入口:对某个模型已知的重复文件逐个哈希校验(只处理确认过哈希和期望值
-    /// 一致的副本——用户要求"先不去重",这里再加一层保险,不匹配的文件原样不动),验证
-    /// 通过的移到 `models_dir/_trash/`(软删除,不是真删,用户想反悔还能从那里找回来)。
-    pub(crate) fn begin_cleanup_duplicates(
-        &mut self,
-        binding_key: String,
-        label: String,
-        candidates: Vec<PathBuf>,
-        expected_sha256: &'static str,
-    ) {
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_thread = cancel.clone();
-        std::thread::spawn(move || {
-            let trash_dir = paths::models_dir().join("_trash");
-            let _ = std::fs::create_dir_all(&trash_dir);
-            let already_in_trash: std::collections::HashSet<String> = std::fs::read_dir(&trash_dir)
-                .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).collect())
-                .unwrap_or_default();
-            let mut moved = 0usize;
-            let mut skipped: Vec<String> = Vec::new();
-            let mut trash_names = already_in_trash;
-            for candidate in candidates {
-                if cancel_thread.load(Ordering::Relaxed) {
-                    break;
-                }
-                let file_name = candidate
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                match setup::sha256_file_cancelable(&candidate, &cancel_thread) {
-                    Ok(digest) if setup::to_hex(&digest).eq_ignore_ascii_case(expected_sha256) => {
-                        let dst = crate::models::trash_destination(&trash_dir, &file_name, &trash_names);
-                        match std::fs::rename(&candidate, &dst) {
-                            Ok(()) => {
-                                trash_names.insert(
-                                    dst.file_name().and_then(|n| n.to_str()).unwrap_or(&file_name).to_string(),
-                                );
-                                moved += 1;
-                            }
-                            Err(e) => skipped.push(format!("{} 移动失败: {e}", candidate.display())),
-                        }
-                    }
-                    Ok(_) => skipped.push(format!("{} 哈希和预期不一致,未清理", candidate.display())),
-                    Err(e) => skipped.push(format!("{} 校验失败: {e}", candidate.display())),
-                }
-            }
-            let _ = tx.send((moved, skipped));
-        });
-        self.pending_cleanup = Some(PendingCleanup { binding_key, label, rx, cancel });
-    }
-
-    fn poll_cleanup(&mut self, ctx: &egui::Context) {
-        let mut finished: Option<(usize, Vec<String>)> = None;
-        if let Some(pc) = &self.pending_cleanup
-            && let Ok(result) = pc.rx.try_recv()
-        {
-            finished = Some(result);
-        }
-        if let Some((moved, skipped)) = finished {
-            let label = self.pending_cleanup.take().map(|p| p.label).unwrap_or_default();
-            for s in &skipped {
-                push_log(&mut self.log_lines, format!("{label} 清理: {s}"));
-            }
-            self.transient_notice = Some((
-                if skipped.is_empty() {
-                    format!("{label}:已清理 {moved} 份重复文件到 _trash")
-                } else {
-                    format!("{label}:已清理 {moved} 份,{} 份未处理(详见日志)", skipped.len())
-                },
-                std::time::Instant::now(),
-            ));
-            // 清理完之后候选列表已经不准了(文件挪走了),清掉避免用户对着过期的
-            // "发现候选"提示再点一次。
-            self.dup_results = None;
-        }
-        if self.pending_cleanup.is_some() {
-            ctx.request_repaint();
-        }
-    }
-
-    fn poll_verify(&mut self, ctx: &egui::Context) {
-        let mut finished: Option<(String, String, PathBuf, Result<bool, String>)> = None;
-        if let Some(pv) = &self.pending_verify
-            && let Ok(result) = pv.rx.try_recv()
-        {
-            finished = Some((pv.binding_key.clone(), pv.label.clone(), pv.path.clone(), result));
-        }
-        if let Some((binding_key, label, path, result)) = finished {
-            self.pending_verify = None;
-            match result {
-                Ok(true) => {
-                    self.config.model_files.insert(binding_key, path.to_string_lossy().to_string());
-                    self.config.save();
-                    paths::set_model_bindings(
-                        self.config
-                            .model_files
-                            .iter()
-                            .map(|(k, v)| (k.clone(), PathBuf::from(v)))
-                            .collect(),
-                    );
-                    push_log(&mut self.log_lines, format!("{label} 已绑定到 {}", path.display()));
-                    self.transient_notice = Some((format!("{label} 已绑定"), std::time::Instant::now()));
-                }
-                Ok(false) => {
-                    self.transient_notice = Some((
-                        format!("{label}:文件哈希和预期不一致,不是这个模型,已忽略"),
-                        std::time::Instant::now(),
-                    ));
-                }
-                Err(e) if e == "已取消" => {}
-                Err(e) => {
-                    self.transient_notice =
-                        Some((format!("{label}:校验失败: {e}"), std::time::Instant::now()));
-                }
-            }
-        }
-        if self.pending_verify.is_some() {
-            ctx.request_repaint();
-        }
-    }
 
     fn poll_setup(&mut self, ctx: &egui::Context) {
         let mut done = false;
@@ -1063,8 +713,15 @@ impl SubgenApp {
             self.setup_phase = SetupPhase::Ready;
             self.setup_rx = None;
         } else if let Some(e) = failed {
-            self.setup_phase = SetupPhase::Error(e);
             self.setup_rx = None;
+            if is_user_cancel(&e) {
+                // 用户主动取消下载,不是失败:回到"还缺什么"的清单界面(已下完的组件
+                // 会被 missing_components 重新算掉),而不是显示"下载失败,请检查网络"
+                // 这种误导文案——用户会以为自己网断了,其实只是自己点了取消。
+                self.begin_setup_check();
+            } else {
+                self.setup_phase = SetupPhase::Error(e);
+            }
         }
         if self.setup_rx.is_some() {
             ctx.request_repaint();
@@ -1204,7 +861,17 @@ impl eframe::App for SubgenApp {
                     std::time::Instant::now(),
                 ));
             } else {
-                self.add_files(dropped);
+                let (added, ignored) = self.add_files(dropped);
+                // 全都被忽略(比如拖进来的都是非视频/重复文件)时,界面不能毫无反应——
+                // 用户会以为操作没成功、反复重试。给一句说明;有部分成功就保持安静,
+                // 避免每次拖文件都弹提示制造噪音。
+                if added == 0 && ignored > 0 {
+                    self.transient_notice = Some((
+                        "没有添加任务:拖入的文件里没有可识别的视频(mp4/mkv/avi 等),或都在列表中了"
+                            .to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
             }
         }
         if let Some((_, shown_at)) = &self.transient_notice {
@@ -1215,67 +882,7 @@ impl eframe::App for SubgenApp {
             }
         }
 
-        match &self.setup_phase {
-            SetupPhase::Checking => {
-                crate::ui::setup_screens::render_checking(ui);
-            }
-            SetupPhase::NeedsDownload(missing) => {
-                let missing = missing.clone();
-                crate::ui::setup_screens::render_needs_download(self, ui, &missing);
-            }
-            SetupPhase::Downloading {
-                current_label,
-                current_index,
-                total_count,
-                downloaded,
-                total,
-                ..
-            } => {
-                let current_label = current_label.clone();
-                let current_index = *current_index;
-                let total_count = *total_count;
-                let downloaded = *downloaded;
-                let total = *total;
-                crate::ui::setup_screens::render_downloading(
-                    self,
-                    ui,
-                    current_label,
-                    current_index,
-                    total_count,
-                    downloaded,
-                    total,
-                );
-            }
-            SetupPhase::Migrating {
-                current_label,
-                current_index,
-                total_count,
-                copied,
-                total,
-            } => {
-                let current_label = current_label.clone();
-                let current_index = *current_index;
-                let total_count = *total_count;
-                let copied = *copied;
-                let total = *total;
-                crate::ui::setup_screens::render_migrating(
-                    self,
-                    ui,
-                    current_label,
-                    current_index,
-                    total_count,
-                    copied,
-                    total,
-                );
-            }
-            SetupPhase::Error(e) => {
-                let e = e.clone();
-                crate::ui::setup_screens::render_error(self, ui, e);
-            }
-            SetupPhase::Ready => {
-                self.show_main_ui(ui);
-            }
-        }
+        crate::ui::setup_screens::render_phase(self, ui);
     }
 
     // glow 后端的 App::on_exit 比 wgpu 后端多一个 Option<&glow::Context> 参数(用来在退出前
@@ -1285,11 +892,89 @@ impl eframe::App for SubgenApp {
     }
 }
 
-/// 读文件开头 4 个字节,给 `models::classify_picked_file` 做类型嗅探用。
-fn read_magic(path: &std::path::Path) -> std::io::Result<[u8; 4]> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = [0u8; 4];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 关键不变量:线程体内部 panic 时,`spawn_guarded_thread` 必须补发 on_panic 的终态
+    /// 消息——这是"后台线程死了但界面永远等不到结果"这类卡死的根治手段。
+    #[test]
+    fn spawn_guarded_thread_sends_fallback_instead_of_hanging_on_panic() {
+        let (tx, rx) = mpsc::channel();
+        spawn_guarded_thread(
+            tx.clone(),
+            || "panic fallback".to_string(),
+            move || {
+                panic!("测试用:模拟后台线程内部崩溃");
+            },
+        );
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(msg) => assert_eq!(msg, "panic fallback"),
+            Err(e) => panic!("应该收到 panic 兜底消息,而不是永远等不到: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_guarded_thread_passes_through_normal_terminal_message() {
+        let (tx, rx) = mpsc::channel();
+        spawn_guarded_thread(
+            tx.clone(),
+            || "panic fallback".to_string(),
+            move || {
+                let _ = tx.send("normal result".to_string());
+            },
+        );
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(msg) => assert_eq!(msg, "normal result"),
+            Err(e) => panic!("正常结束也应该收到结果: {e:?}"),
+        }
+    }
+
+    /// 拖入/选中的文件里混着非视频和重复项时,只加第一个,其余按"被忽略"计数返回,
+    /// 让调用方能据此给用户反馈;并记住第一个视频所在目录,供下次文件对话框默认跳转。
+    #[test]
+    fn add_files_counts_added_vs_ignored_and_remembers_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_add_files_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("Episode.mkv");
+        let image = dir.join("poster.jpg");
+        std::fs::write(&video, b"v").unwrap();
+        std::fs::write(&image, b"i").unwrap();
+
+        let mut app = SubgenApp::new(Config::default(), None);
+        let (added, ignored) = app.add_files(vec![video.clone(), image.clone(), video.clone()]);
+        assert_eq!(added, 1, "只有一个视频被加进列表");
+        assert_eq!(ignored, 2, "jpg 和重复的视频都被忽略");
+        assert_eq!(app.jobs.len(), 1);
+        assert_eq!(
+            app.config.last_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref()),
+            "应记住第一个视频所在目录,供下次对话框默认跳转"
+        );
+
+        // 全部被忽略时(没有视频可记),last_dir 保持不变。
+        let before = app.config.last_dir.clone();
+        let (added, _) = app.add_files(vec![image.clone()]);
+        assert_eq!(added, 0);
+        assert_eq!(app.config.last_dir, before, "没有添加任何视频时不该改动 last_dir");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 下载取消的判定约定:取消路径的消息都带"取消",真实失败(网络/IO/哈希)不带。
+    #[test]
+    fn is_user_cancel_only_matches_cancel_messages() {
+        assert!(is_user_cancel("用户取消"));
+        assert!(is_user_cancel("用户取消下载"));
+        assert!(is_user_cancel("已取消"));
+        assert!(!is_user_cancel("下载 whisper 多次重试后仍失败: 连接超时"));
+        assert!(!is_user_cancel("文件校验哈希不一致(期望 xxx,实际 yyy)"));
+    }
 }

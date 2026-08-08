@@ -68,10 +68,10 @@ pub(crate) fn render_stage_stepper(ui: &mut egui::Ui, status: &JobStatus, transl
         _ => return,
     };
 
-    const DONE_COLOR: egui::Color32 = egui::Color32::from_rgb(60, 170, 60);
-    const RUNNING_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 150, 230);
-    const FAIL_COLOR: egui::Color32 = egui::Color32::RED;
-    const PENDING_COLOR: egui::Color32 = egui::Color32::GRAY;
+    const DONE_COLOR: egui::Color32 = crate::ui::theme::SUCCESS;
+    const RUNNING_COLOR: egui::Color32 = crate::ui::theme::ACCENT_LIGHT;
+    const FAIL_COLOR: egui::Color32 = crate::ui::theme::ERROR;
+    const PENDING_COLOR: egui::Color32 = crate::ui::theme::NEUTRAL;
 
     ui.horizontal(|ui| {
         for (i, stage) in stages.iter().enumerate() {
@@ -102,13 +102,16 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
     let target = app.selected.or(active);
 
     let Some(i) = target.filter(|&i| i < app.jobs.len()) else {
-        ui.centered_and_justified(|ui| {
-            if app.jobs.is_empty() {
-                ui.weak("把视频文件拖到窗口里,或点左侧“选择视频文件”按钮开始");
-            } else {
-                ui.weak("点左侧一个文件查看详情");
-            }
-        });
+        if app.jobs.is_empty() {
+            render_empty_detail(app, ui);
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.colored_label(
+                    crate::ui::theme::TEXT_SECONDARY,
+                    "点左侧一个文件查看详情",
+                );
+            });
+        }
         return;
     };
 
@@ -132,7 +135,12 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            ui.heading(name);
+            // heading 用可截断的 Label 而不是 ui.heading():长文件名(真实剧集名经常几十
+            // 字符)会撑爆整行,把右边的按钮挤出屏幕外;截断 + hover 看完整名。
+            ui.add(
+                egui::Label::new(egui::RichText::new(&name).heading()).truncate(),
+            )
+            .on_hover_text(&name);
             // 钉住了别的文件、但批次还在跑另一个时,给一条能一键跳回去的路——不然用户
             // 查完一个失败文件后,还得自己去左边找回正在跑的那一行。
             if is_pinned && active.is_some() && active != Some(i)
@@ -145,7 +153,7 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
         render_stage_stepper(ui, &job.status, app.config.translate);
         ui.add_space(2.0);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if matches!(job.status, JobStatus::Running(..)) {
                 ui.spinner();
             }
@@ -162,7 +170,8 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
         ui.add_space(4.0);
 
         ui.add_enabled_ui(!app.processing, |ui| {
-            ui.horizontal(|ui| {
+            // 5 个按钮一行在窄窗口放不下,换行而不是溢出裁掉。
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("移除").clicked() {
                     remove_clicked = true;
                 }
@@ -213,6 +222,13 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
         if reprocess_clicked
             && let Some(j) = app.jobs.get_mut(i) {
                 j.force_reprocess = true;
+                // "重新处理"只登记为"下一批包含它并强制重跑",点击后当前行外观不变——
+                // 不给一句反馈的话,用户会以为点了没反应。批次还没开始,所以这里直接说清
+                // 它会在下一次"开始处理"时生效。
+                app.transient_notice = Some((
+                    "已标记,下次点“开始处理”时会重新处理该文件".to_string(),
+                    std::time::Instant::now(),
+                ));
             }
         if toggle_preview
             && let Some(j) = app.jobs.get_mut(i) {
@@ -229,6 +245,45 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
     }
     if !remove_clicked {
         render_review_section(app, ui, i);
+    }
+}
+
+/// 空状态的引导卡:首次打开程序时右侧详情区是一片空白,用户不知道下一步该做什么——
+/// 这里给一个明确的操作入口(选择视频文件)和一句最重要的说明(本地运行、不上传)。
+fn render_empty_detail(app: &mut SubgenApp, ui: &mut egui::Ui) {
+    let mut pick_requested = false;
+    ui.centered_and_justified(|ui| {
+        egui::Frame::default()
+            .inner_margin(egui::Margin::symmetric(24, 20))
+            .corner_radius(egui::CornerRadius::same(8))
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                ui.set_max_width(360.0);
+                ui.heading("给视频生成字幕");
+                ui.add_space(6.0);
+                ui.label("把视频文件拖进窗口,或点下面的按钮选择文件。");
+                ui.label("可以一次添加多个文件,程序会逐个处理。");
+                ui.add_space(14.0);
+                if ui.add(crate::ui::theme::primary_button("选择视频文件...")).clicked() {
+                    pick_requested = true;
+                }
+                ui.add_space(14.0);
+                ui.colored_label(
+                    crate::ui::theme::TEXT_SECONDARY,
+                    "所有处理都在本机完成,视频和字幕不会上传到任何服务器。",
+                );
+            });
+    });
+    if pick_requested {
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("视频", SubgenApp::VIDEO_EXTENSIONS)
+            .set_title("选择要生成字幕的视频文件");
+        if let Some(dir) = &app.config.last_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(files) = dialog.pick_files() {
+            app.add_files(files);
+        }
     }
 }
 

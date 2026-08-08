@@ -1,0 +1,4 @@
+# 统一行尾:仓库里存 LF,Windows 检出时转 CRLF。
+# 之前没有这个文件、又开着 core.autocrlf,每次 git status 都报 "LF will be replaced by CRLF",
+# 纯属噪音。声明 text=auto 后 git 按属性处理,不再对每个改动文件弹警告。
+* text=auto

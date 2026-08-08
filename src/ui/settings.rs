@@ -16,13 +16,33 @@ pub(crate) fn render_settings_window(app: &mut SubgenApp, ctx: &egui::Context) {
         .open(&mut open)
         .resizable(false)
         .show(ctx, |ui| {
+            ui.add_space(crate::ui::theme::PANEL_PADDING);
             if app.processing {
                 render_readonly_summary(app, ui);
             } else {
                 render_editable_form(app, ui);
             }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            render_about_footer(ui);
         });
     app.settings_open = open;
+}
+
+/// 底部"关于/帮助"脚注:版本号 + 排障信息去哪找。版本号同时出现在窗口标题里,但那里
+/// 处理中会被"第 N/M 个"后缀挤掉,这里是随时能确认自己用的是哪一版的地方——报障时
+/// "先报版本号"是最基本的第一步。手动安装组件/重装/卸载的说明在 README,这里只指路,
+/// 不复述内容(README 才是唯一事实来源)。
+fn render_about_footer(ui: &mut egui::Ui) {
+    ui.label(format!(
+        "字幕生成器 subgen v{} · 全部处理在本机完成,不上传内容",
+        env!("CARGO_PKG_VERSION")
+    ));
+    ui.weak(
+        "组件下载失败需要手动安装时,打开 exe 同目录下的 README.md 按说明操作;\
+         运行日志和崩溃记录在 exe 同目录的 logs/ 文件夹里。",
+    );
 }
 
 fn render_readonly_summary(app: &SubgenApp, ui: &mut egui::Ui) {
@@ -30,6 +50,10 @@ fn render_readonly_summary(app: &SubgenApp, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.label(format!("· 模型:{}", app.config.model));
     ui.label(format!("· 语言:{}", lang_display(&app.config.language)));
+    ui.label(format!(
+        "· 已有同名字幕:{}",
+        if app.config.overwrite_existing { "覆盖" } else { "跳过" }
+    ));
     if app.config.translate {
         let label = if app.config.translate_model == "auto" {
             "自动(按视频语言选择)".to_string()
@@ -39,6 +63,14 @@ fn render_readonly_summary(app: &SubgenApp, ui: &mut egui::Ui) {
                 .unwrap_or_else(|| app.config.translate_model.clone())
         };
         ui.label(format!("· 翻译:开启 · {label}"));
+        ui.label(format!(
+            "· 输出:{}",
+            if app.config.bilingual {
+                "双语(中文+原文)"
+            } else {
+                "仅中文"
+            }
+        ));
     } else {
         ui.label("· 翻译:关闭");
     }

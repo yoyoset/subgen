@@ -2,6 +2,7 @@ use crate::app::SubgenApp;
 use crate::format::{format_download_size, model_status_line};
 use crate::models::{FileKind, ModelStatus};
 use crate::setup::{status_for, ComponentKey};
+use crate::ui::theme;
 use eframe::egui;
 
 /// 清单一行:名称、用途、状态,以及"定位…"/"下载"需要的全部信息。故意不带"选中的那个"
@@ -94,6 +95,9 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
         && app.pending_verify.is_none()
         && app.inline_install.is_none()
         && app.pending_cleanup.is_none();
+    // 扫描进行中时,dup_results 还是上一次扫描的结果——"清理重复"要按结果挪文件,
+    // 拿过期结果动手会把文件搬错地方,所以扫描期间禁用清理(定位/下载不挪已有文件,不受影响)。
+    let scanning = app.scan_rx.is_some();
 
     let mut locate_clicked: Option<usize> = None;
     let mut download_clicked: Option<usize> = None;
@@ -190,7 +194,7 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                         .map(|m| m.len())
                                         .sum();
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(230, 150, 20),
+                                        theme::WARN,
                                         format!(
                                             "发现 {} 份重复副本(共 {}),占了双倍磁盘空间",
                                             duplicates.len(),
@@ -250,7 +254,12 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                                 }
                                 if !duplicates.is_empty()
                                     && row.expected_sha256.is_some()
-                                    && ui.add_enabled(actions_enabled, egui::Button::new("清理重复")).clicked()
+                                    && ui
+                                        .add_enabled(
+                                            actions_enabled && !scanning,
+                                            egui::Button::new("清理重复"),
+                                        )
+                                        .clicked()
                                 {
                                     cleanup_clicked = Some(i);
                                 }

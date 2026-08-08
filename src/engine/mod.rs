@@ -557,6 +557,43 @@ fn wait_child_with_cancel(
     Ok((status, stderr))
 }
 
+/// 启动时尽力而为地清理 `tmp/` 里长期无人复用的中间产物(.wav/.srt)。断点续跑依赖
+/// tmp/ 里的中间文件,但那些文件只在"中断后很快重跑同一个文件"的场景才有价值——隔了
+/// 很久(默认 7 天)还没被复用,基本可以确定用户不会再续,留着只会让 tmp/ 无限膨胀
+/// (每个处理过的视频都留一份 wav + 一份 srt,一批 20 集能占几个 GB)。只删超过期限的,
+/// 新鲜的绝不碰——单线程串行处理,启动时本来也没有正在跑的任务,不会误删进行中的产物。
+/// 返回清理掉的文件数;任何一步失败都静默跳过,清理只是维护性动作,不该影响启动。
+pub fn cleanup_stale_tmp(older_than: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(paths::tmp_dir()) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_artifact = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("wav") || e.eq_ignore_ascii_case("srt"))
+            .unwrap_or(false);
+        if is_artifact && is_stale(&path, older_than) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 判断文件最后修改时间是否已早于 `older_than` 之前。纯谓词,方便单测;元数据读不到时
+/// 一律判"不陈旧",绝不因为读不到时间就删掉一个可能还在用的文件。
+pub fn is_stale(path: &Path, older_than: std::time::Duration) -> bool {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age > older_than)
+        .unwrap_or(false)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +674,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn is_stale_false_for_missing_file() {
+        let missing = std::env::temp_dir().join("subgen_test_is_stale_missing.bin");
+        assert!(
+            !is_stale(&missing, std::time::Duration::ZERO),
+            "读不到元数据的文件不该被判定为陈旧(避免误删)"
+        );
+    }
+
     /// 加入队列后视频文件被移动/删除时,应该明确报"找不到视频文件",而不是让 ffmpeg 报
     /// 一个误导性的"音频提取失败(该文件可能损坏或无音轨)"。
     #[test]
@@ -652,5 +698,46 @@ mod tests {
             "应该明确指出文件不存在: {msg}"
         );
         assert!(log.is_none(), "这一步还没有子进程日志可看");
+    }
+
+    /// cleanup_stale_tmp 只删超过期限的 .wav/.srt,新鲜的和其他扩展名一律不动。
+    /// 用 set_modified 把文件修改时间拨回一小时前,模拟"很久以前留下的中间产物"。
+    #[test]
+    fn cleanup_stale_tmp_removes_only_expired_wav_and_srt() {
+        let dir = paths::tmp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let unique = format!(
+            "cleanup_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let stale_wav = dir.join(format!("{unique}_stale.wav"));
+        let stale_srt = dir.join(format!("{unique}_stale.srt"));
+        let fresh_wav = dir.join(format!("{unique}_fresh.wav"));
+        let unrelated = dir.join(format!("{unique}_note.txt"));
+        std::fs::write(&stale_wav, b"a").unwrap();
+        std::fs::write(&stale_srt, b"b").unwrap();
+        std::fs::write(&fresh_wav, b"c").unwrap();
+        std::fs::write(&unrelated, b"d").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for p in [&stale_wav, &stale_srt] {
+            // 用带写权限的句柄才能改修改时间(Windows 上只读句柄改 set_modified 会拒绝)。
+            let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(old).unwrap();
+        }
+
+        let removed = cleanup_stale_tmp(std::time::Duration::from_secs(300));
+
+        assert!(removed >= 2, "至少应该清掉自己造的两个过期产物: {removed}");
+        assert!(!stale_wav.exists(), "过期的 wav 应该被清掉");
+        assert!(!stale_srt.exists(), "过期的 srt 应该被清掉");
+        assert!(fresh_wav.exists(), "新鲜的中间产物不该被清掉");
+        assert!(unrelated.exists(), "不是 .wav/.srt 的文件不该被清掉");
+
+        for p in [stale_wav, stale_srt, fresh_wav, unrelated] {
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }

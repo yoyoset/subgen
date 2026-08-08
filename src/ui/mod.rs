@@ -6,3 +6,4 @@ pub(crate) mod model_manifest;
 pub(crate) mod queue;
 pub(crate) mod settings;
 pub(crate) mod setup_screens;
+pub(crate) mod theme;

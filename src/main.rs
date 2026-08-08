@@ -31,12 +31,12 @@ fn main() -> eframe::Result<()> {
     }
     install_panic_logger();
     job_guard::init_child_job_object();
-    let config = Config::load();
+    let (config, config_warning) = Config::load();
     // 模型目录覆盖值是进程级状态(见 paths.rs),用配置里读到的值设置一次;用户在界面里
     // 改存放位置时会再调用一次,让后续路径解析立刻用上新值。
     paths::set_models_dir_override(config.models_dir_override.clone().map(PathBuf::from));
-    // 模型绑定表同理是进程级状态(见 paths.rs);目前只有启动时读取这一条路径,
-    // 还没有 UI 会写入 config.model_files(见项目计划 B7),空表时行为完全不变。
+    // 模型绑定表同理是进程级状态(见 paths.rs):启动时用配置读到的值设置一次,用户在
+    // "组件与存放位置"里定位/绑定模型时会再更新(见 ui::model_manifest)。
     paths::set_model_bindings(
         config
             .model_files
@@ -44,8 +44,24 @@ fn main() -> eframe::Result<()> {
             .map(|(k, v)| (k.clone(), PathBuf::from(v)))
             .collect(),
     );
+    // 启动时清理 tmp/ 里超过 7 天没被复用的中间产物(见 engine::cleanup_stale_tmp),
+    // 防止长期使用后临时目录无限膨胀。尽力而为,失败不影响启动。
+    {
+        let removed = engine::cleanup_stale_tmp(std::time::Duration::from_secs(7 * 24 * 3600));
+        if removed > 0 {
+            crate::format::push_log(
+                &mut Vec::new(),
+                format!("已清理 {removed} 个过期的临时文件"),
+            );
+        }
+    }
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([config.window_w, config.window_h])
+        // 窗口尺寸来自 config.toml,用户可能手改出一个非法值(NaN/负数/巨大数)——直接喂给
+        // viewport 会得到难以预测的结果。做个"有限数值 + 夹到合理区间"的防御,非法值退回默认。
+        .with_inner_size([
+            sane_window_dimension(config.window_w, 760.0, 560.0, 6000.0),
+            sane_window_dimension(config.window_h, 560.0, 420.0, 4000.0),
+        ])
         .with_min_inner_size([560.0, 420.0])
         .with_drag_and_drop(true);
     // 窗口图标(任务栏/标题栏,程序运行中看到的那个)——exe 文件本身的图标由 build.rs 通过
@@ -69,7 +85,8 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             setup_chinese_fonts(&cc.egui_ctx);
-            Ok(Box::new(SubgenApp::new(config)))
+            crate::ui::theme::apply_theme(&cc.egui_ctx);
+            Ok(Box::new(SubgenApp::new(config, config_warning)))
         }),
     )
 }
@@ -120,6 +137,16 @@ fn acquire_single_instance_lock() -> bool {
     }
 }
 
+/// 读配置里的窗口尺寸:非有限值(NaN/±inf)退回默认,有限值夹到 `[min, max]` 区间。
+/// 配置是文本文件,用户可能手改出任何值,这是进 viewport 前的最后一道防御。
+fn sane_window_dimension(value: f32, default: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
+    }
+}
+
 /// 注册全局 panic hook,把 panic 信息(消息 + 代码位置)追加写进 logs/crash.log。
 ///
 /// 背景:release 构建用 `windows_subsystem = "windows"` 关掉了控制台(见文件顶部),这意味着
@@ -142,10 +169,12 @@ fn install_panic_logger() {
             .unwrap_or(0);
         let entry = format!("\n=== 崩溃(unix 时间戳 {timestamp})===\n{info}\n");
         use std::io::Write;
+        let crash_path = paths::logs_dir().join("crash.log");
+        crate::format::rotate_log_file(&crash_path, crate::format::MAX_LOG_BYTES);
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(paths::logs_dir().join("crash.log"))
+            .open(&crash_path)
         {
             let _ = file.write_all(entry.as_bytes());
         }
@@ -251,5 +280,17 @@ mod tests {
 
         drop(first);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 窗口尺寸来自用户可能手改坏的 config.toml,非有限值/越界值必须在进 viewport 前被
+    /// 夹回合理区间,不能把 NaN 之类直接喂给 eframe。
+    #[test]
+    fn sane_window_dimension_clamps_and_rejects_non_finite() {
+        assert_eq!(sane_window_dimension(800.0, 760.0, 560.0, 6000.0), 800.0, "正常值原样通过");
+        assert_eq!(sane_window_dimension(100.0, 760.0, 560.0, 6000.0), 560.0, "太小夹到最小值");
+        assert_eq!(sane_window_dimension(9000.0, 760.0, 560.0, 6000.0), 6000.0, "太大夹到最大值");
+        assert_eq!(sane_window_dimension(f32::NAN, 760.0, 560.0, 6000.0), 760.0, "NaN 退回默认");
+        assert_eq!(sane_window_dimension(f32::INFINITY, 760.0, 560.0, 6000.0), 760.0, "无穷退回默认");
+        assert_eq!(sane_window_dimension(f32::NEG_INFINITY, 760.0, 560.0, 6000.0), 760.0, "负无穷退回默认");
     }
 }

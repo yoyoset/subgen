@@ -15,10 +15,12 @@ pub struct WhisperModel {
     pub label: &'static str,
     pub file_name: &'static str,
     pub url: &'static str,
-    /// `None` 表示还没有核实过的权威哈希(下载后不做强校验)。目前只有 `large-v3` 核实过
-    /// (完整下载后本地 sha256sum 复核,与 HuggingFace 响应头 X-Linked-ETag 一致)。
-    /// `medium`/`large-v3-turbo` 待补(见项目计划 B1b),**不编造**——放一个猜测出来的哈希
-    /// 比放 `None` 更危险,前者会让用户误以为下载被校验过。
+    /// `None` 表示还没有核实过的权威哈希(下载后不做强校验)。目前三个模型(`large-v3`/
+    /// `medium`/`large-v3-turbo`)都已有核实过的哈希——来源为 HuggingFace LFS 指针文件的
+    /// oid 与响应头 X-Linked-ETag 两个独立来源交叉核对一致,`large-v3` 额外做过完整下载后
+    /// 本地 sha256sum 复核。保留 `Option` 类型是为了约束未来新增模型:没有核实过的哈希就
+    /// 必须写 `None`,**不编造**——放一个猜测出来的哈希比放 `None` 更危险,前者会让用户
+    /// 误以为下载被校验过。
     pub sha256: Option<&'static str>,
     /// 文件字节数,来自 GitHub Release API / HuggingFace LFS 指针文件核实过的真实值
     /// (不是估算),用于下载前的磁盘空间提示。

@@ -17,17 +17,28 @@ pub(crate) fn render_components_window(app: &mut SubgenApp, ctx: &egui::Context)
         .resizable(true)
         .default_size([560.0, 420.0])
         .show(ctx, |ui| {
+            ui.add_space(crate::ui::theme::PANEL_PADDING);
             // 常驻显示 + 可改,不止首次下载那一次机会——用了一段时间之后想搬家也应该
             // 随时能改,不应该被困在当初选的位置。处理中禁用:一批任务跑到一半时,
             // 后面文件的翻译阶段会用当时刚查到的模型路径去启动 llama-server,这时候
             // 换目录容易踩"模型文件还没搬过去"的空。
             ui.label(format!("模型位置: {}", paths::models_dir().display()));
-            if ui
-                .add_enabled(!app.processing, egui::Button::new("更改..."))
-                .clicked()
-            {
-                app.begin_change_models_dir();
-            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!app.processing, egui::Button::new("更改..."))
+                    .clicked()
+                {
+                    app.begin_change_models_dir();
+                }
+                // 排查问题时的常用入口:日志(含每个文件的识别/翻译过程日志和崩溃记录)
+                // 都在 exe 同目录的 logs/ 下,直接一键打开比让用户自己去找方便得多。
+                if ui.button("打开日志文件夹").clicked() {
+                    let _ = std::fs::create_dir_all(paths::logs_dir());
+                    let _ = std::process::Command::new("explorer")
+                        .arg(paths::logs_dir())
+                        .spawn();
+                }
+            });
             if let Some(e) = &app.models_dir_error {
                 ui.colored_label(egui::Color32::RED, e);
             }

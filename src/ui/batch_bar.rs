@@ -1,6 +1,7 @@
 use crate::app::SubgenApp;
 use crate::format::*;
 use crate::job;
+use crate::ui::theme;
 use eframe::egui;
 use std::sync::atomic::Ordering;
 
@@ -10,10 +11,13 @@ use std::sync::atomic::Ordering;
 pub(crate) fn render_batch_bar(app: &mut SubgenApp, ui: &mut egui::Ui) {
     egui::Panel::top("batch_bar").show(ui, |ui| {
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        // horizontal_wrapped 而不是 horizontal:窄窗口下按钮放不下时换行而不是溢出裁掉,
+        // 保证窄屏也全部可见可点。
+        ui.horizontal_wrapped(|ui| {
             let can_start = !app.jobs.is_empty() && !app.processing;
+            // "开始处理"是用户最想一眼看到、点击次数最高的操作,用主按钮样式强调。
             if ui
-                .add_enabled(can_start, egui::Button::new("▶ 开始处理"))
+                .add_enabled(can_start, theme::primary_button("▶ 开始处理"))
                 .clicked()
             {
                 app.start_processing();
@@ -57,6 +61,16 @@ pub(crate) fn render_batch_bar(app: &mut SubgenApp, ui: &mut egui::Ui) {
             });
         });
 
+        // 批次进度条:和上面的"第 N/M 个"文字互为补充——文字给数字和 ETA,进度条给一
+        // 眼扫过去的整体位置感(尤其一批 20 集时,数字不如一根有明确长度的条直观)。
+        if app.processing && !app.batch_indices.is_empty() {
+            let (done, total) = batch_progress_counts(&app.jobs, &app.batch_indices);
+            let fraction = done as f32 / total.max(1) as f32;
+            ui.add_space(2.0);
+            ui.add(egui::ProgressBar::new(fraction).desired_width(f32::INFINITY));
+            ui.add_space(2.0);
+        }
+
         if !app.gpu_warning_stages.is_empty() {
             // 按流水线顺序(识别在前、翻译在后)拼出受影响的阶段名,而不是笼统一句
             // "没用上 GPU"——识别和翻译是分别独立检测的,用户应该知道具体是哪一步慢。
@@ -71,7 +85,7 @@ pub(crate) fn render_batch_bar(app: &mut SubgenApp, ui: &mut egui::Ui) {
                 .collect::<Vec<_>>()
                 .join("和");
             ui.colored_label(
-                egui::Color32::from_rgb(230, 150, 20),
+                theme::WARN,
                 format!(
                     "⚠ {stages_text}阶段未能使用显卡加速,处理会慢很多。请到 NVIDIA 官网\
                      更新显卡驱动后重试;如果这台电脑没有 NVIDIA 显卡,只能使用较慢的模式。"
@@ -79,7 +93,28 @@ pub(crate) fn render_batch_bar(app: &mut SubgenApp, ui: &mut egui::Ui) {
             );
         }
         if let Some((text, _)) = &app.transient_notice {
-            ui.colored_label(egui::Color32::from_rgb(230, 150, 20), text);
+            ui.colored_label(theme::WARN, text);
+        }
+        // 启动时配置恢复的说明(配置文件损坏被重置)。用可关闭的横幅而不是 transient_notice
+        // ——transient_notice 几秒后自动消失,这种"你的设置被重置了"的信息值得一直显示到
+        // 用户明确看过。配置损坏是罕见的紧急情况,正常用户永远不会看到这条横幅。
+        let mut dismiss_warning = false;
+        if let Some(warning) = &app.startup_warning {
+            egui::Frame::default()
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .fill(theme::WARN.gamma_multiply(0.15))
+                .corner_radius(egui::CornerRadius::same(4))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(theme::WARN, warning);
+                        if ui.small_button("知道了").clicked() {
+                            dismiss_warning = true;
+                        }
+                    });
+                });
+        }
+        if dismiss_warning {
+            app.startup_warning = None;
         }
         ui.add_space(6.0);
     });
