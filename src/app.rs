@@ -42,6 +42,12 @@ pub struct SubgenApp {
     pub(crate) setup_phase: SetupPhase,
     pub(crate) setup_rx: Option<mpsc::Receiver<SetupEvent>>,
     pub(crate) setup_cancel: Arc<AtomicBool>,
+    /// 用户点了下载/搬迁页的"取消"、但后台线程还没真正停下来(下载线程可能正卡在两次
+    /// 重试之间的 2 秒 sleep,或正在解压 zip——这两个阶段都不检查取消标志)。只用来驱动
+    /// 界面反馈:按钮立即变灰显示"正在取消…",不然用户点击后界面纹丝不动,会怀疑按钮没
+    /// 反应而连点甚至直接关窗。和批次条上的 `cancelling` 是同一个设计,只是那个管批次、
+    /// 这个管首次下载/搬迁。
+    pub(crate) setup_cancelling: bool,
     pub(crate) worker_rx: Option<mpsc::Receiver<WorkerEvent>>,
     pub(crate) worker_cancel: Arc<AtomicBool>,
     pub(crate) processing: bool,
@@ -215,6 +221,7 @@ impl SubgenApp {
             setup_phase: SetupPhase::Checking,
             setup_rx: None,
             setup_cancel: Arc::new(AtomicBool::new(false)),
+            setup_cancelling: false,
             worker_rx: None,
             worker_cancel: Arc::new(AtomicBool::new(false)),
             processing: false,
@@ -266,6 +273,7 @@ impl SubgenApp {
         let (tx, rx) = mpsc::channel();
         self.setup_rx = Some(rx);
         self.setup_cancel = Arc::new(AtomicBool::new(false));
+        self.setup_cancelling = false;
         let cancel = self.setup_cancel.clone();
         let model = self.config.model.clone();
 
@@ -345,6 +353,7 @@ impl SubgenApp {
 
         // 旧目录有现成的文件,搬过去而不是让用户重新下载十几 GB。
         self.migrate_cancel = Arc::new(AtomicBool::new(false));
+        self.setup_cancelling = false;
         let (tx, rx) = mpsc::channel();
         self.migrate_rx = Some(rx);
         let cancel = self.migrate_cancel.clone();

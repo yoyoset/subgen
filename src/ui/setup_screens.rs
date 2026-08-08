@@ -256,8 +256,16 @@ fn render_progress_screen(
             ));
         }
         ui.add_space(theme::SECTION_SPACING);
-        if ui.button("取消").clicked() {
+        // 点击"取消"后立即变灰显示"正在取消…":下载线程可能正卡在两次重试之间的 2 秒
+        // sleep 或正在解压 zip(这两处都不检查取消标志),不会马上有反应。不给即时反馈的话
+        // 用户会怀疑按钮坏了连点、甚至直接关窗(和批次条"正在取消…"是同一个设计)。
+        let cancel_label = if app.setup_cancelling { "正在取消…" } else { "取消" };
+        if ui
+            .add_enabled(!app.setup_cancelling, egui::Button::new(cancel_label))
+            .clicked()
+        {
             cancel.store(true, Ordering::Relaxed);
+            app.setup_cancelling = true;
         }
         ui.add_space(12.0);
         ui.separator();
