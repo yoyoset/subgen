@@ -179,7 +179,7 @@ pub(crate) fn render_manifest_body(app: &mut SubgenApp, ui: &mut egui::Ui) {
                 .striped(true)
                 .spacing([16.0, 6.0])
                 .show(ui, |ui| {
-                    ui.strong("模型");
+                    ui.strong("组件");
                     ui.strong("用途");
                     ui.strong("状态");
                     ui.strong("操作");
