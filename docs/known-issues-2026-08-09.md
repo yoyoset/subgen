@@ -42,3 +42,27 @@
 
 `translate::build_prompt` 的 `context` 参数效果未在真机上确认,README TODO 已显式记录
 (P2 完成后仍未做真实模型对比),本轮不重复处理。
+
+## 4. 模型清单窗口每帧递归扫描存放目录(潜在性能问题,非正确性 bug)
+
+**真实行为**(读代码确认):`ui/model_manifest.rs` 的 `collect_rows()` 在窗口打开期间
+**每帧**调用 `setup::status_for` → `paths::model_path`/`vad_model_path`/`trans_model_path`,
+而这些函数在没有绑定表命中时,会对整个 `models_dir()` 做一次**递归文件搜索**
+(`find_all_matching_files`)。模型清单里有 6 行(3 个 whisper 档位 + VAD + 2 个翻译模型),
+等于窗口开着的时候每帧最多做 6 次全目录递归遍历。
+
+**为什么是问题**:`models_dir()` 可能指向用户自己的 HF 缓存(几千个文件的嵌套结构,README
+文档化了这个用法)。这种目录下每帧 6 次递归扫描会拖慢界面(下拉/滚动/任何交互触发重绘时
+都重扫)。这是第 4 轮走查发现的,不是回归。
+
+**为什么暂不处理**:
+
+- 修法需要给模型状态加缓存(文件大小/存在性会随下载/清理变化,缓存要带失效条件,比如
+  "本轮有后台模型操作时强制重查"),复杂度明显超过"这是个小毛病"的量级,而且模型清单
+  是低频打开的辅助窗口,不是主界面常驻面板。
+- 想彻底解决应该让 `status_for` 接受"已解析路径"而不是自己再去搜(路径解析和状态判定
+  分离),但那会改动 `status_for` 的调用面(`setup::missing_components`/首次下载页也在用)。
+
+**如果以后要修**:给 `models/` 加一层"模型状态缓存 + 失效标记"或者把 `resolve_in_store`
+的结果缓存起来,在 `pending_verify`/`inline_install`/`pending_cleanup`/`scan` 任一活动时
+跳过缓存强制重查。
