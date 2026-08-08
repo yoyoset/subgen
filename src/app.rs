@@ -707,13 +707,24 @@ impl SubgenApp {
                             } else {
                                 String::new()
                             };
-                            let title = format!(
-                                "{} 下载中 {}/{} · {}",
-                                crate::window_title(),
-                                *current_index,
-                                *total_count,
-                                pct
-                            );
+                            // total 还没拿到(首次 Progress 事件可能只有 downloaded)时 pct 为空,
+                            // 标题不带" · "尾巴,免得出现 "下载中 1/5 · " 这种残句。
+                            let title = if pct.is_empty() {
+                                format!(
+                                    "{} 下载中 {}/{}",
+                                    crate::window_title(),
+                                    *current_index,
+                                    *total_count,
+                                )
+                            } else {
+                                format!(
+                                    "{} 下载中 {}/{} · {}",
+                                    crate::window_title(),
+                                    *current_index,
+                                    *total_count,
+                                    pct
+                                )
+                            };
                             if self.last_setup_title.as_deref() != Some(title.as_str()) {
                                 self.last_setup_title = Some(title.clone());
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
