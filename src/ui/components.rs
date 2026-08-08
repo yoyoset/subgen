@@ -40,7 +40,7 @@ pub(crate) fn render_components_window(app: &mut SubgenApp, ctx: &egui::Context)
                 }
             });
             if let Some(e) = &app.models_dir_error {
-                ui.colored_label(egui::Color32::RED, e);
+                ui.colored_label(crate::ui::theme::ERROR, e);
             }
 
             ui.add_space(8.0);
