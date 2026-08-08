@@ -23,3 +23,7 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Check source line budgets
+        shell: pwsh
+        run: ./scripts/check-line-budgets.ps1
