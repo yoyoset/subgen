@@ -263,7 +263,10 @@ pub fn format_job_report_suffix(report: &crate::job::JobReport) -> String {
         format!(" · {}", parts.join(" · "))
     };
     if report.reused_transcript {
-        suffix.push_str("(复用了上次的识别结果)");
+        // 前面有语言/模型信息时,复用提示和它们之间留一个空格,不然会黏在模型名后面
+        // (比如 "…Sakura 7B(日→中,轻小说风格)(复用了上次的识别结果)" 读起来没有呼吸感)。
+        let sep = if suffix.is_empty() { "" } else { " " };
+        suffix.push_str(&format!("{sep}(复用了上次的识别结果)"));
     }
     suffix
 }
@@ -763,7 +766,7 @@ mod tests {
         };
         assert_eq!(
             format_job_report_suffix(&report),
-            " · 日语 · Sakura 7B(日→中,轻小说风格)(复用了上次的识别结果)"
+            " · 日语 · Sakura 7B(日→中,轻小说风格) (复用了上次的识别结果)"
         );
     }
 
@@ -789,6 +792,19 @@ mod tests {
             repetition_at: None,
         };
         assert_eq!(format_job_report_suffix(&report), " · 英语");
+    }
+
+    #[test]
+    fn format_job_report_suffix_reuse_note_alone_has_no_leading_space() {
+        // 只有复用提示、前面没有任何语言/模型信息时,不该多出个行首空格。
+        let report = crate::job::JobReport {
+            detected_language: None,
+            translate_model_label: None,
+            subtitle_count: 10,
+            reused_transcript: true,
+            repetition_at: None,
+        };
+        assert_eq!(format_job_report_suffix(&report), "(复用了上次的识别结果)");
     }
 
     fn job_with(status: JobStatus) -> Job {
