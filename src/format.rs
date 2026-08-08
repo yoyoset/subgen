@@ -372,24 +372,26 @@ pub fn reconcile_selection(selected: Option<usize>, removed: usize, new_len: usi
     }
 }
 
-/// 线性外推批次剩余时间:用"已完成的真实工作用了 elapsed"的平均速度估算剩下的还要多久。
+/// 线性外推批次剩余时间:用"已完成 `work_done` 个真实任务用了 elapsed"的平均速度估算
+/// 剩下 `remaining` 个还要多久。
 ///
-/// `work_done` 是已经跑完真实流水线的任务数(成功/失败/警告都算,但**不含跳过**)——跳过
-/// 的任务在开工前就被判掉、几乎不耗时(见 `existing_srt_skip_reason`),把它们算进"做了 X
-/// 个用了多久"的分母,会把平均速度拉到接近零,导致"9 个瞬间跳过 + 1 个真实跑 30 分钟的
-/// 文件"这种批次显示"预计剩 0 秒"。只有真实跑过的任务才是有效的速度样本。`total` 仍然
-/// 包含跳过项(它们确实占批次位置),`remaining = total - work_done` 里跳过项已经不在
-/// 其中(它们早就做完了)。
+/// 两个数必须分开传,不能用一个总数倒推:
+/// - `work_done`:已经跑完真实流水线的任务数(成功/失败/警告都算,但**不含跳过**)。跳过
+///   的任务在开工前就被判掉、几乎不耗时(见 `existing_srt_skip_reason`),把它们算进"做了
+///   X 个用了多久"的分母,会把平均速度拉到接近零,导致"9 个瞬间跳过 + 1 个真实跑 30
+///   分钟的文件"这种批次显示"预计剩 0 秒"。只有真实跑过的任务才是有效的速度样本。
+/// - `remaining`:还没到终态的任务数(= 总数 − 已到终态数)。已跳过的是终态,本来就不在
+///   剩余队列里;拿"总数 − work_done"算会让跳过项变成"还要做的任务",高估剩余时间。
 pub fn estimate_batch_remaining(
     elapsed: std::time::Duration,
     work_done: usize,
-    total: usize,
+    remaining: usize,
 ) -> Option<std::time::Duration> {
-    if work_done == 0 || total <= work_done {
+    if work_done == 0 || remaining == 0 {
         return None;
     }
     let per_item = elapsed / work_done as u32;
-    Some(per_item * (total - work_done) as u32)
+    Some(per_item * remaining as u32)
 }
 
 /// 从 `jobs` + 这一批的原始下标列表算出"第几个/共几个":`total` 是批次大小,`done` 是
@@ -419,16 +421,17 @@ pub fn batch_work_done_counts(jobs: &[Job], batch_indices: &[usize]) -> usize {
 
 /// 批次条上的一行进度文案,比如"第 7/20 个 · 预计剩 48 分钟 · 已用 31 分钟"。`current` 是
 /// 正在进行的是第几个(`done + 1`,封顶在 `total`);`work_done` 是已经到终态且真正跑过
-/// 流水线的任务数(不含开工前就被判掉的跳过项),只用它做剩余时间的速度样本——见
-/// `estimate_batch_remaining` 的说明。
+/// 流水线的任务数(不含开工前就被判掉的跳过项,只用它做剩余时间的速度样本);`remaining`
+/// 是还没到终态的任务数(= `total − done`)。两者的区别见 `estimate_batch_remaining`。
 pub fn format_batch_progress_line(
     current: usize,
     total: usize,
     elapsed: std::time::Duration,
     work_done: usize,
+    remaining: usize,
 ) -> String {
     let mut line = format!("第 {current}/{total} 个 · 已用 {}", format_elapsed(elapsed.as_secs()));
-    if let Some(remaining) = estimate_batch_remaining(elapsed, work_done, total) {
+    if let Some(remaining) = estimate_batch_remaining(elapsed, work_done, remaining) {
         line = format!(
             "第 {current}/{total} 个 · 预计剩 {} · 已用 {}",
             format_elapsed(remaining.as_secs()),
@@ -831,37 +834,42 @@ mod tests {
             estimate_batch_remaining(std::time::Duration::from_secs(60), 0, 10),
             None
         );
+        // 没有剩余任务时不外推(全都已完成)。
+        assert_eq!(
+            estimate_batch_remaining(std::time::Duration::from_secs(60), 4, 0),
+            None
+        );
     }
 
     #[test]
     fn estimate_batch_remaining_extrapolates_linearly_from_average_pace() {
-        // 4 个用了 60 秒(每个 15 秒),剩 6 个 → 90 秒。
-        let remaining = estimate_batch_remaining(std::time::Duration::from_secs(60), 4, 10).unwrap();
+        // 4 个用了 60 秒(每个 15 秒),还剩 6 个 → 90 秒。
+        let remaining = estimate_batch_remaining(std::time::Duration::from_secs(60), 4, 6).unwrap();
         assert_eq!(remaining, std::time::Duration::from_secs(90));
     }
 
     #[test]
     fn format_batch_progress_line_includes_eta_once_available() {
-        let line = format_batch_progress_line(5, 10, std::time::Duration::from_secs(60), 4);
+        let line = format_batch_progress_line(5, 10, std::time::Duration::from_secs(60), 4, 6);
         assert_eq!(line, "第 5/10 个 · 预计剩 1分30秒 · 已用 1分0秒");
     }
 
     #[test]
     fn format_batch_progress_line_omits_eta_before_first_sample() {
-        let line = format_batch_progress_line(1, 10, std::time::Duration::from_secs(5), 0);
+        let line = format_batch_progress_line(1, 10, std::time::Duration::from_secs(5), 0, 9);
         assert_eq!(line, "第 1/10 个 · 已用 5秒");
     }
 
     /// 跳过任务几乎不耗时(开工前就判掉),不该参与剩余时间的平均速度估算——否则
-    /// "9 个瞬间跳过 + 1 个真跑 30 分钟"的批次会算出"预计剩 0 秒"。这里 work_done=1
-    /// (只有 1 个真跑过)必须得到合理的剩余时间,而不是被 done=9 拉到零。
+    /// "9 个瞬间跳过 + 1 个真跑 30 分钟"的批次会算出"预计剩 0 秒"。work_done=1(只有
+    /// 1 个真跑过)必须得到合理的剩余时间,而不是被 done=9 拉到零。
     #[test]
     fn format_batch_progress_line_uses_work_done_not_total_done_for_eta() {
-        // 第 10/10 个:done=9(9 个跳过),work_done=1(真跑的那个还没完成,但已有 60 秒
-        // 速度样本),total=10。剩 9 个(跳过项已不在其中,剩下的都是真任务……这里至少
-        // ETA 不该是 0)。60 秒 / 1 个 * 9 个 = 540 秒 = 9分0秒。
-        let line = format_batch_progress_line(10, 10, std::time::Duration::from_secs(60), 1);
-        assert_eq!(line, "第 10/10 个 · 预计剩 9分0秒 · 已用 1分0秒");
+        // done=9(9 个跳过),work_done=1(真跑的那个是当前项,已有 60 秒速度样本),
+        // remaining = total - done = 10 - 9 = 1(还没到终态的只剩当前这一个)。
+        // 60 秒 / 1 个 * 1 个 = 60 秒 = 1分0秒。
+        let line = format_batch_progress_line(10, 10, std::time::Duration::from_secs(60), 1, 1);
+        assert_eq!(line, "第 10/10 个 · 预计剩 1分0秒 · 已用 1分0秒");
     }
 
     #[test]
