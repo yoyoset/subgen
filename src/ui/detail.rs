@@ -12,15 +12,14 @@ use std::path::PathBuf;
 /// 读不到文件(比如用户手动删了、移动了)显示一句人话而不是静默空白或 panic。
 pub(crate) fn render_subtitle_preview(ui: &mut egui::Ui, job: &Job) {
     let zh = paths::sidecar_srt_lang_path(&job.video_path, "zh");
-    let path = if zh.is_file() {
-        Some(zh)
+    let srt = paths::sidecar_srt_path(&job.video_path);
+    // 优先读中文翻译字幕,没有就退回原文字幕。
+    let (path, is_zh) = if zh.is_file() {
+        (Some(zh), true)
+    } else if srt.is_file() {
+        (Some(srt), false)
     } else {
-        let srt = paths::sidecar_srt_path(&job.video_path);
-        if srt.is_file() {
-            Some(srt)
-        } else {
-            None
-        }
+        (None, false)
     };
 
     egui::Frame::default()
@@ -28,7 +27,17 @@ pub(crate) fn render_subtitle_preview(ui: &mut egui::Ui, job: &Job) {
         .fill(ui.visuals().faint_bg_color)
         .show(ui, |ui| match path.and_then(|p| std::fs::read_to_string(&p).ok()) {
             Some(content) => {
-                let blocks = engine::parse_srt_blocks(&content);
+                // 双语 .zh.srt 每块是"中文\n原文"两行,预览的目的是看翻译质量,只显示第一行
+                // (中文)就够了——整块拼起来会把中文和原文糊成一行,既占地方又分不清哪个
+                // 是译文。纯原文 .srt 没有双语结构,直接显示整块文本。
+                let blocks = if is_zh {
+                    engine::parse_srt_blocks_lines(&content)
+                        .into_iter()
+                        .map(|(start, end, lines)| (start, end, lines.into_iter().next().unwrap_or_default()))
+                        .collect::<Vec<_>>()
+                } else {
+                    engine::parse_srt_blocks(&content)
+                };
                 if blocks.is_empty() {
                     ui.label("(字幕为空,没有识别出对白)");
                 } else {
