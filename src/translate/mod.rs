@@ -18,6 +18,7 @@ pub use server::LlamaServer;
 use crate::engine;
 use crate::paths;
 use prompt::{build_output_blocks, compute_context_tail, translate_batch_with_retry};
+use segment::{group_fragments, merge_group, split_by_weights};
 pub(crate) use prompt::{looks_untranslated, split_leading_number};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,38 @@ use std::sync::Arc;
 /// 每批喂给模型的字幕行数。数值来自实测权衡:太大容易在长输出中丢行/错位编号,
 /// 太小则 HTTP 往返开销主导总耗时、拖慢整体处理速度。
 const BATCH_SIZE: usize = 15;
+
+/// 把一批合并句的译文按原始字幕块展开。返回值的第一个元素是
+/// `(原始块下标, 译文)`，第二个元素是失败组对应的所有原始块下标，第三个元素是本批覆盖的
+/// 原始块数。这个映射不依赖模型或文件 IO，避免 `translate_srt` 里的分组/切回逻辑只能靠
+/// 真实 llama-server 才能检查。
+fn expand_group_results(
+    source_texts: &[String],
+    groups: &[Vec<usize>],
+    group_offset: usize,
+    results: &[String],
+    failed_groups: &[usize],
+) -> (Vec<(usize, String)>, Vec<usize>, usize) {
+    let mut expanded = Vec::new();
+    let mut failed_indices = Vec::new();
+    let mut block_count = 0usize;
+
+    for (local_group, result) in results.iter().enumerate() {
+        let group = &groups[group_offset + local_group];
+        let weights: Vec<usize> = group
+            .iter()
+            .map(|&i| source_texts[i].split_whitespace().count().max(1))
+            .collect();
+        let parts = split_by_weights(result, &weights);
+        expanded.extend(group.iter().copied().zip(parts));
+        block_count += group.len();
+    }
+    for &failed_group in failed_groups {
+        failed_indices.extend(groups[group_offset + failed_group].iter().copied());
+    }
+
+    (expanded, failed_indices, block_count)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
@@ -149,33 +182,48 @@ pub fn translate_srt(
     }
 
     let total = blocks.len();
-    let mut translated: Vec<String> = Vec::with_capacity(total);
+    let mut translated: Vec<String> = vec![String::new(); total];
     let mut failed_indices: Vec<usize> = Vec::new();
-    let mut done = 0usize;
+    let mut done_blocks = 0usize;
     // 上一批最后几行(原文, 译文)——现在每批是独立翻译的,人称/称呼/术语在批边界处经常
     // 漂移(比如上一批刚确定用"她",这一批又变回泛指)。把上一批的结尾喂给下一批当参考
     // 上下文(不要求模型翻译或复述它),是这类问题里最便宜也最有效的缓解办法,不需要改动
     // 批量大小或对齐解析逻辑。
     let mut prev_tail: Vec<(String, String)> = Vec::new();
 
-    for chunk in blocks.chunks(BATCH_SIZE) {
+    let source_texts: Vec<String> = blocks.iter().map(|(_, _, text)| text.clone()).collect();
+    let groups = group_fragments(&source_texts);
+    let grouped_texts: Vec<String> = groups
+        .iter()
+        .map(|indices| {
+            let fragments: Vec<&str> = indices.iter().map(|&i| source_texts[i].as_str()).collect();
+            merge_group(&fragments)
+        })
+        .collect();
+    let mut done_groups = 0usize;
+
+    for chunk in grouped_texts.chunks(BATCH_SIZE) {
         if cancel.load(Ordering::Relaxed) {
+            // 取消:批边界之外,正在请求中的单次 HTTP 请求也会被 send_cancelable 每 100ms
+            // 检查一次取消标志并立即中断(见 prompt.rs),所以这里能很快走到。
             return Err("已取消".to_string());
         }
-        let texts: Vec<String> = chunk.iter().map(|(_, _, t)| t.clone()).collect();
         let (results, failed) =
-            translate_batch_with_retry(server, model, &texts, cancel, &prev_tail)?;
+            translate_batch_with_retry(server, model, chunk, cancel, &prev_tail)?;
 
-        prev_tail = compute_context_tail(&texts, &results, &failed);
+        prev_tail = compute_context_tail(chunk, &results, &failed);
 
-        // failed 是这一批内部(0-based)的下标,加上 done(这一批开始前已经处理过的行数)
-        // 才是相对整份字幕的全局下标。
-        failed_indices.extend(failed.iter().map(|&i| done + i));
-        translated.extend(results);
-        done += chunk.len();
+        let (expanded, failed_blocks, block_count) =
+            expand_group_results(&source_texts, &groups, done_groups, &results, &failed);
+        for (block_index, text) in expanded {
+            translated[block_index] = text;
+        }
+        failed_indices.extend(failed_blocks);
+        done_groups += chunk.len();
+        done_blocks += block_count;
         progress_cb(
             "正在翻译字幕...".to_string(),
-            Some((done as f32 / total as f32) * 100.0),
+            Some((done_blocks as f32 / total as f32) * 100.0),
         );
     }
 
@@ -190,6 +238,26 @@ pub fn translate_srt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_group_results_restores_original_block_indices() {
+        let source = vec![
+            "what do your eyes".to_string(),
+            "lock in as a target?".to_string(),
+            "Next sentence.".to_string(),
+        ];
+        let groups = group_fragments(&source);
+        let results = vec!["你的目光会锁定在什么目标上吗？".to_string(), "下一句。".to_string()];
+
+        let (expanded, failed, block_count) =
+            expand_group_results(&source, &groups, 0, &results, &[1]);
+
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(failed, vec![2]);
+        assert_eq!(block_count, source.len());
+        assert_eq!(expanded[0].1.clone() + &expanded[1].1, "你的目光会锁定在什么目标上吗？");
+    }
 
     #[test]
     fn fallback_model_is_qwen3_4b() {

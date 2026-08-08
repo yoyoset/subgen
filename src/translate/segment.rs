@@ -7,9 +7,8 @@
 //! `translation_quality_status`)。与其反复要求模型"别合并",不如在送去翻译之前就把
 //! 该合并的碎片合并好,合并的判断权从模型手里收回到这里的确定性规则。
 //!
-//! 这个文件目前只有纯函数,还没有接入 `translate_srt` 的实际批量翻译流程(见
-//! `plan-sonnet-jazzy-stardust.md` 第 2 步)——先拿真实素材验证分组/切分准不准,数据不
-//! 好看就不用往下走。
+//! 分组/切分规则先用纯函数单测,再由 `translate_srt` 接入实际批量翻译流程。真实模型验证
+//! 仍需单独对比接入前后的字幕结果。
 
 /// 一句话结尾的标点(结合真实素材:英文台词几乎不会用中文标点收尾,这里只列英文/通用符号)。
 /// 命中说明这一行本身就是完整句子的结尾,不该往下一行合并。
@@ -44,7 +43,6 @@ fn is_fragment_boundary(cur: &str, next: &str) -> bool {
 /// 把逐行原文分组:组内下标是同一句话的碎片,应该合并翻译。行数或字符数超过硬上限时
 /// 强制断开,即使 `is_fragment_boundary` 判定还该继续合并——见上面两个常量的说明。
 /// 无法安全合并的地方每组只有 1 行,和今天逐行翻译的行为完全一致,不会有回归。
-#[allow(dead_code)] // 见 plan-sonnet-jazzy-stardust.md 第 2 步,尚未接入 translate_srt
 pub(super) fn group_fragments(lines: &[String]) -> Vec<Vec<usize>> {
     if lines.is_empty() {
         return Vec::new();
@@ -72,7 +70,6 @@ pub(super) fn group_fragments(lines: &[String]) -> Vec<Vec<usize>> {
 
 /// 组内几条原文拼成一句完整的话给模型翻译。用空格连接——这些本来就是英文句子的碎片,
 /// 空格是正确的词间分隔。
-#[allow(dead_code)] // 见 plan-sonnet-jazzy-stardust.md 第 2 步,尚未接入 translate_srt
 pub(super) fn merge_group(lines: &[&str]) -> String {
     lines
         .iter()
@@ -88,7 +85,6 @@ const SPLIT_ANCHORS: &[char] = &['，', '。', '、', '；', '：', '！', '？'
 /// 切点先按比例算出大致位置,再在前后各 4 个字符内找最近的标点吸附,找不到就用比例位置
 /// 硬切。**段数恒等于 `weights.len()`**,不管切得好不好看——这是保证 `translate_srt`
 /// 里 N 进 N 出的前提,`build_output_blocks` 依赖这个不变量。
-#[allow(dead_code)] // 见 plan-sonnet-jazzy-stardust.md 第 2 步,尚未接入 translate_srt
 pub(super) fn split_by_weights(translated: &str, weights: &[usize]) -> Vec<String> {
     if weights.is_empty() {
         return Vec::new();
