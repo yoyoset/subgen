@@ -66,6 +66,10 @@ pub(super) fn collapse_repetitions(srt_path: &Path) -> Result<Option<String>, St
 /// 双语还是仅中文模式,写出时中文永远是每块的第一行)时就需要这份没拼接过的版本。
 pub(crate) fn parse_srt_blocks_lines(content: &str) -> Vec<(String, String, Vec<String>)> {
     let mut out = Vec::new();
+    // 去掉开头的 UTF-8 BOM(\u{feff})——Windows 记事本"另存为 UTF-8"会在文件头写 BOM,
+    // 不清掉的话第一行的 "1"(块编号)会变成 "\u{feff}1",`parse::<u64>()` 失败,第一个字幕
+    // 块被整个跳过。真实踩过:带 BOM 的两块 srt 只解析出 1 块。
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -231,6 +235,23 @@ mod tests {
         let repetition_at = collapse_repetitions(&tmp).unwrap();
         assert_eq!(repetition_at, None, "正常内容不应该被判定为复读故障");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn parse_srt_blocks_strips_utf8_bom_on_first_block() {
+        // Windows 记事本"另存为 UTF-8"会在文件头写 BOM,不清掉会让第一块编号 "\u{feff}1"
+        // 解析失败、第一个字幕块被整个跳过。两块的字幕只解析出 1 块是真实踩过的现象。
+        let mut content = String::from('\u{feff}');
+        content.push_str("1\n00:00:01,000 --> 00:00:02,000\nHello\n\n");
+        content.push_str("2\n00:00:02,000 --> 00:00:03,000\nWorld\n\n");
+        let blocks = parse_srt_blocks(&content);
+        assert_eq!(
+            blocks.len(),
+            2,
+            "带 BOM 的两块字幕应该完整解析出 2 块,而不是第一块被跳过: {blocks:?}"
+        );
+        assert_eq!(blocks[0].2, "Hello");
+        assert_eq!(blocks[1].2, "World");
     }
 
     #[test]
