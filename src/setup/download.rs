@@ -46,7 +46,6 @@ pub(super) fn download_file(
     label: &str,
     url: &str,
     sha256_hex: Option<&str>,
-    strict: bool,
     target: &Path,
     tx: &Sender<SetupEvent>,
     cancel: &Arc<AtomicBool>,
@@ -56,7 +55,7 @@ pub(super) fn download_file(
     }
     let tmp_path = target.with_extension("part");
     let digest = download_to_file(label, url, &tmp_path, tx, cancel)?;
-    verify_hash_or_warn(label, &digest, sha256_hex, strict, &tmp_path, tx)?;
+    verify_hash_or_warn(label, &digest, sha256_hex, &tmp_path)?;
 
     std::fs::rename(&tmp_path, target).map_err(|e| format!("安装 {label} 失败: {e}"))?;
     let _ = tx.send(SetupEvent::ComponentReady(label.to_string()));
@@ -67,7 +66,6 @@ pub(super) fn download_and_extract_zip(
     label: &str,
     url: &str,
     sha256_hex: Option<&str>,
-    strict: bool,
     extract_dir: &Path,
     tx: &Sender<SetupEvent>,
     cancel: &Arc<AtomicBool>,
@@ -75,7 +73,7 @@ pub(super) fn download_and_extract_zip(
     std::fs::create_dir_all(extract_dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let tmp_zip = paths::app_dir().join(format!("_dl_{}.zip.part", sanitize(label)));
     let digest = download_to_file(label, url, &tmp_zip, tx, cancel)?;
-    verify_hash_or_warn(label, &digest, sha256_hex, strict, &tmp_zip, tx)?;
+    verify_hash_or_warn(label, &digest, sha256_hex, &tmp_zip)?;
 
     let _ = tx.send(SetupEvent::Log(format!("正在解压 {label} ...")));
     let file = std::fs::File::open(&tmp_zip).map_err(|e| format!("打开压缩包失败: {e}"))?;
@@ -88,26 +86,21 @@ pub(super) fn download_and_extract_zip(
     Ok(())
 }
 
-/// 校验下载文件的哈希。strict=true 且不匹配时删除文件并返回错误(阻断安装);
-/// strict=false 且不匹配时只发一条警告日志,继续安装。
+/// 校验下载文件的哈希,不匹配就删除文件并返回错误(阻断安装)。
+/// 所有下载都必须通过强校验,没有"哈希对不上也继续用"的降级路径——那是拿完整性换
+/// 便利,一旦命中就是拿到一个错的文件。
 fn verify_hash_or_warn(
     label: &str,
     digest: &[u8; 32],
     expected_hex: Option<&str>,
-    strict: bool,
     file_to_remove_on_fail: &Path,
-    tx: &Sender<SetupEvent>,
 ) -> Result<(), String> {
     if let Some(expected) = expected_hex {
         let actual = to_hex(digest);
         if !actual.eq_ignore_ascii_case(expected) {
             let msg = format!("{label} 文件校验哈希不一致(期望 {expected}, 实际 {actual})");
-            if strict {
-                let _ = std::fs::remove_file(file_to_remove_on_fail);
-                return Err(msg);
-            } else {
-                let _ = tx.send(SetupEvent::Log(format!("警告: {msg}, 仍继续使用")));
-            }
+            let _ = std::fs::remove_file(file_to_remove_on_fail);
+            return Err(msg);
         }
     }
     Ok(())

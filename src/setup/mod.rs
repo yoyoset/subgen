@@ -230,7 +230,6 @@ pub fn install_component(
                 key.label(),
                 ENGINE_URL,
                 Some(ENGINE_SHA256),
-                true,
                 &paths::engine_dir(),
                 tx,
                 cancel,
@@ -245,7 +244,6 @@ pub fn install_component(
                 key.label(),
                 FFMPEG_URL,
                 Some(FFMPEG_SHA256),
-                true,
                 &paths::ffmpeg_dir(),
                 tx,
                 cancel,
@@ -284,7 +282,6 @@ pub fn install_component(
                 key.label(),
                 TRANSLATOR_URL,
                 Some(TRANSLATOR_SHA256),
-                true,
                 &paths::translator_dir(),
                 tx,
                 cancel,
@@ -383,7 +380,7 @@ fn install_or_bind(
             if let Some(parent) = download_target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
             }
-            download_file(label, url, expected_sha256, true, download_target, tx, cancel)
+            download_file(label, url, expected_sha256, download_target, tx, cancel)
         }
     }
 }
