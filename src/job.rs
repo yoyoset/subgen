@@ -366,12 +366,13 @@ pub fn run_batch(
                         }
                         // 括号里的预期时长同 engine.rs 的提取音轨文案——启动翻译引擎要把几 GB
                         // 的模型文件加载进显存,这一步没有百分比可显示,不给个"大概多久"的
-                        // 参照,长达一分钟的停顿会被当成卡死。
+                        // 参照,长达一分钟的停顿会被当成卡死。不写"首次"——同批次里日语→英语
+                        // 切模型时也会走到这里,不是只有第一次加载。
                         let _ = tx.send(WorkerEvent::JobUpdate {
                             index,
                             status: JobStatus::Running(
                                 Stage::Translate,
-                                "正在加载翻译模型(文件较大,首次约需一分钟)...".to_string(),
+                                "正在加载翻译模型(文件较大,一般需一分钟左右)...".to_string(),
                                 None,
                             ),
                         });
