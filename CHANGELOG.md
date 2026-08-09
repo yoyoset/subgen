@@ -49,6 +49,10 @@
 - 删除下载哈希校验的"警告放行"分支——所有组件哈希校验不过一律阻断安装(拿完整性换便利不可取)
 - app.rs 治理拆出 report/actions + config 原子写与损坏恢复横幅 + UI 主题收拢与体验重构 + 启动清理过期 tmp
 - docs:记录模型清单窗口每帧递归扫描存放目录的性能隐患(非正确性 bug,暂不处理)
+- **启动同时清理 logs/ 里过期的每视频识别/失败日志**(`{unique}.log` 等)——之前只轮转 app.log/crash.log,每个处理过的视频在 logs/ 留一份几十 KB 的日志只增不删,长期使用会无限膨胀;现与 tmp 清理共用同一 7 天过期窗口联动删除,系统日志不受影响,见 `engine::cleanup_stale_logs`
+- 语言下拉框选项与中文名映射收拢成单一常量 `format::LANGUAGES`——此前 `ui/settings.rs` 的选项列表和 `format::lang_display` 的映射两处各自维护,加语言要改两处、改漏只露 ISO 码;现只有一处事实来源,并加测试防漂移
+- 翻译阶段去掉 `server.as_ref().unwrap()`/`warning.unwrap()` 等可能 panic 的写法——`run_batch` 里"翻译引擎未就绪"这类理论上走不到的路径也统一走 DoneWithWarning 终态,不变式被破坏时给用户人话失败而不是崩溃
+- README 硬件要求:修正过时的"翻译阶段 GPU 检测还没做"说法(2026-08-09 已支持),并把"无 N 卡也能跑"如实标注为未在真实无 GPU 机器上实测
 
 ## 2026-08-08
 

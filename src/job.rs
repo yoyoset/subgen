@@ -404,7 +404,9 @@ pub fn run_batch(
                                 let _ = tx.send(WorkerEvent::JobUpdate {
                                     index,
                                     status: JobStatus::DoneWithWarning(
-                                        warning.unwrap(),
+                                        // append_warning 刚写过值,这里必然 Some;take + 默认值
+                                        // 只是为了不变式被破坏时也不 panic,而是给一条空警告。
+                                        warning.take().unwrap_or_default(),
                                         build_report(None),
                                     ),
                                 });
@@ -413,22 +415,42 @@ pub fn run_batch(
                         }
                     }
 
-                    let tx_progress = tx.clone();
-                    let translate_outcome = crate::translate::translate_srt(
-                        server.as_ref().unwrap(),
-                        model_def,
-                        &placed,
-                        video_path,
-                        bilingual,
-                        effective_overwrite,
-                        &cancel,
-                        move |text, pct| {
-                            let _ = tx_progress.send(WorkerEvent::JobUpdate {
+                    // 按需重启用后 server 必然已就绪:need_restart 分支里启动失败/取消都已
+                    // continue,没 continue 就一定赋值了 server。这里不直接 `unwrap()`,而是
+                    // 用 match 把"理论上到不了的 None"也走成一条和启动失败一致的终态——不变式
+                    // 一旦被将来的改动破坏,用户看到的是人话失败信息而不是一个 panic 崩溃。
+                    let translate_outcome = match server.as_ref() {
+                        Some(s) => {
+                            let tx_progress = tx.clone();
+                            crate::translate::translate_srt(
+                                s,
+                                model_def,
+                                &placed,
+                                video_path,
+                                bilingual,
+                                effective_overwrite,
+                                &cancel,
+                                move |text, pct| {
+                                    let _ = tx_progress.send(WorkerEvent::JobUpdate {
+                                        index,
+                                        status: JobStatus::Running(Stage::Translate, text, pct),
+                                    });
+                                },
+                            )
+                        }
+                        None => {
+                            append_warning(&mut warning, "翻译引擎未就绪,已保留原文字幕".to_string());
+                            finished.insert(index);
+                            let _ = tx.send(WorkerEvent::JobUpdate {
                                 index,
-                                status: JobStatus::Running(Stage::Translate, text, pct),
+                                status: JobStatus::DoneWithWarning(
+                                    warning.take().unwrap_or_default(),
+                                    build_report(None),
+                                ),
                             });
-                        },
-                    );
+                            continue;
+                        }
+                    };
 
                     match translate_outcome {
                         Ok(crate::translate::TranslateResult::Written { failed_indices }) => {
