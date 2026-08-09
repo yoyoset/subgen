@@ -18,6 +18,9 @@ pub struct Config {
     pub translate_model: String,
     /// 中文翻译字幕是否双语(中文在上、原文在下);false = 仅中文
     pub bilingual: bool,
+    /// 单条字幕的显示宽度上限(列,CJK/全角计 2 列、其余 1 列),超过则写盘前折行;
+    /// 0 = 关闭折行。默认 42(≈ 中文 21 字),见 engine::srt::DEFAULT_SUBTITLE_MAX_WIDTH。
+    pub subtitle_max_width: usize,
     /// 模型存放目录的用户覆盖值(绝对路径)。None = 用默认值(exe 同目录下的 models/),
     /// 保持便携行为;Some(path) = 用户在界面里显式指定过,不再跟着 exe 走(模型文件动辄
     /// 几个 GB 到十几个 GB,不应该被迫跟着 exe 放的位置走,比如很多人图方便把 exe 放 C 盘)。
@@ -45,6 +48,7 @@ impl Default for Config {
             translate: false,
             translate_model: "auto".to_string(),
             bilingual: true,
+            subtitle_max_width: crate::engine::DEFAULT_SUBTITLE_MAX_WIDTH,
             models_dir_override: None,
             last_dir: None,
             window_w: 760.0,
@@ -239,6 +243,21 @@ mod tests {
     /// 目录下的 config.toml),拆开写会互相踩文件导致偶发失败。这里把"正常保存→原子写入
     /// 不残留临时文件→load 还原"和"损坏配置→load 返回恢复说明→坏文件被备份"两条路径
     /// 放进同一个测试,先清理、后清理,不会和其它测试冲突。
+    /// 折行宽度是新增字段:默认 42,0 表示关闭,两种值都要能存能读(老用户的 config.toml
+    /// 里没有这个键,靠 #[serde(default)] 落到默认值,见上面的旧配置兼容测试)。
+    #[test]
+    fn subtitle_max_width_defaults_and_round_trips() {
+        assert_eq!(Config::default().subtitle_max_width, 42);
+        let (parsed, warning) =
+            Config::parse_or_recover(&toml::to_string_pretty(&Config::default()).unwrap());
+        assert!(warning.is_none());
+        assert_eq!(parsed.subtitle_max_width, 42);
+
+        let off = Config { subtitle_max_width: 0, ..Config::default() };
+        let (parsed, _) = Config::parse_or_recover(&toml::to_string_pretty(&off).unwrap());
+        assert_eq!(parsed.subtitle_max_width, 0);
+    }
+
     #[test]
     fn save_is_atomic_and_load_reports_corruption_recovery() {
         let path = crate::paths::config_path();

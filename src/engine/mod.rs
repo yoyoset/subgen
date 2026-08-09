@@ -28,7 +28,10 @@
 mod srt;
 mod whisper_log;
 
-pub(crate) use srt::{parse_srt_blocks, parse_srt_blocks_lines, write_srt_blocks};
+pub(crate) use srt::{
+    parse_srt_blocks, parse_srt_blocks_lines, wrap_subtitle_text, write_srt_blocks,
+    DEFAULT_SUBTITLE_MAX_WIDTH,
+};
 use srt::{collapse_repetitions, count_subtitle_blocks, srt_looks_complete};
 use whisper_log::{describe_exit_status, parse_detected_language, parse_progress_percent, recover_detected_language_from_log};
 
@@ -445,20 +448,47 @@ pub enum PlaceError {
 
 /// 把生成的 srt 从临时目录移动到视频同目录、同名(标准外挂字幕命名规则)。
 /// overwrite=false 且目标已存在时返回 Skipped 而不是覆盖。
+/// `max_subtitle_width` 传给折行(0 关闭);`generated_srt` 是 whisper 的原文产物,
+/// 单语言模式不经过翻译直接落到这里,它的超宽行同样要被排版层处理,不能只处理翻译路径。
 pub fn place_sidecar_srt(
     video_path: &Path,
     generated_srt: &Path,
     overwrite: bool,
+    max_subtitle_width: usize,
 ) -> Result<PathBuf, PlaceError> {
     let target = paths::sidecar_srt_path(video_path);
     if let Some(reason) = crate::format::existing_srt_skip_reason(video_path, overwrite) {
         let _ = std::fs::remove_file(generated_srt);
         return Err(PlaceError::Skipped(reason));
     }
-    // 覆盖已有字幕时,先复制到同目录临时名再原子改名——直接 fs::copy 覆盖的话,中途失败
-    // 会把用户已有的旧字幕截断成半截。改名是同一目录内的原子操作,失败时旧字幕保持完好。
+    if max_subtitle_width == 0 {
+        // 关闭折行时退化成原来的纯复制行为,产物逐字节不变,不引入 parse→write 往返。
+        let tmp_target = target.with_extension("srt.tmp");
+        std::fs::copy(generated_srt, &tmp_target)
+            .map_err(|e| PlaceError::Failed(format!("写入字幕文件失败: {e}")))?;
+        std::fs::rename(&tmp_target, &target).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_target);
+            PlaceError::Failed(format!("写入字幕文件失败: {e}"))
+        })?;
+        let _ = std::fs::remove_file(generated_srt);
+        return Ok(target);
+    }
+    // 覆盖已有字幕时,先写同目录临时名再原子改名——直接覆盖的话,中途失败会把用户已有的
+    // 旧字幕截断成半截。改名是同一目录内的原子操作,失败时旧字幕保持完好。
+    // 用 parse_srt_blocks_lines 保留块内原有的多行结构(whisper 的 srt 块通常单行,
+    // 万一多行也别把行边界丢掉),再逐块折行后写出,而不是直接复制临时文件。
+    let content = std::fs::read_to_string(generated_srt)
+        .map_err(|e| PlaceError::Failed(format!("读取字幕文件失败: {e}")))?;
+    let blocks = parse_srt_blocks_lines(&content);
+    let wrapped: Vec<(String, String, String)> = blocks
+        .into_iter()
+        .map(|(start, end, lines)| {
+            let text = lines.join("\n");
+            (start, end, wrap_subtitle_text(&text, max_subtitle_width))
+        })
+        .collect();
     let tmp_target = target.with_extension("srt.tmp");
-    std::fs::copy(generated_srt, &tmp_target)
+    std::fs::write(&tmp_target, write_srt_blocks(&wrapped))
         .map_err(|e| PlaceError::Failed(format!("写入字幕文件失败: {e}")))?;
     std::fs::rename(&tmp_target, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_target);
@@ -688,7 +718,7 @@ mod tests {
         let generated = dir.join("generated.srt");
         std::fs::write(&generated, "new content").unwrap();
 
-        let result = place_sidecar_srt(&video_path, &generated, false);
+        let result = place_sidecar_srt(&video_path, &generated, false, 42);
         assert!(matches!(result, Err(PlaceError::Skipped(_))));
         // 跳过时不应该改动已有的目标文件内容
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "existing");
@@ -704,11 +734,56 @@ mod tests {
         let target = dir.join("Episode.srt");
         std::fs::write(&target, "old").unwrap();
         let generated = dir.join("generated.srt");
-        std::fs::write(&generated, "new content").unwrap();
+        // 超宽行在落盘前应被折行,而不是原样复制到视频同目录(不翻译的路径也要排版)。
+        let long_line = "This is a fairly long English sentence that will wrap.";
+        std::fs::write(
+            &generated,
+            format!("1\n00:00:01,000 --> 00:00:05,000\n{long_line}\n\n"),
+        )
+        .unwrap();
 
-        let result = place_sidecar_srt(&video_path, &generated, true);
+        let result = place_sidecar_srt(&video_path, &generated, true, 20);
         assert!(result.is_ok());
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new content");
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(written.contains('\n'), "超宽行应该被折行: {written:?}");
+        for line in written.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.contains("-->") && trimmed.parse::<u64>().is_err() {
+                assert!(
+                    crate::engine::srt::display_width(trimmed) <= 20,
+                    "折行后仍有超宽行: {line:?} (written={written:?})"
+                );
+            }
+        }
+        // 内容不丢:把文本行(非空、非编号、非时间戳)抽出来,去掉空白后和原文一致。
+        let text_lines: Vec<&str> = written
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.contains("-->") && t.parse::<u64>().is_err()
+            })
+            .collect();
+        let norm = |s: &str| s.chars().filter(|c| *c != '\n' && *c != ' ').collect::<String>();
+        assert_eq!(norm(&text_lines.join("\n")), norm(long_line));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// max_subtitle_width=0 时退化回纯复制,输出与临时文件逐字节一致——"关闭折行"不该
+    /// 顺带把文件重新排版一遍。
+    #[test]
+    fn place_sidecar_srt_with_zero_width_copies_byte_identically() {
+        let dir = std::env::temp_dir().join("subgen_test_place_zero_width");
+        std::fs::create_dir_all(&dir).unwrap();
+        let video_path = dir.join("Episode.mkv");
+        let target = dir.join("Episode.srt");
+        let generated = dir.join("generated.srt");
+        let content = "1\n00:00:01,000 --> 00:00:02,000\n  A line with a leading space\n\n";
+        std::fs::write(&generated, content).unwrap();
+
+        let result = place_sidecar_srt(&video_path, &generated, true, 0);
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), content);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -195,6 +195,7 @@ pub fn run_batch(
     translate: bool,
     translate_model: String,
     bilingual: bool,
+    max_subtitle_width: usize,
     tx: Sender<WorkerEvent>,
     cancel: Arc<AtomicBool>,
 ) {
@@ -283,6 +284,7 @@ pub fn run_batch(
                     video_path,
                     &result.srt_path,
                     effective_overwrite,
+                    max_subtitle_width,
                 ) {
                     Ok(p) => p,
                     Err(crate::engine::PlaceError::Skipped(e)) => {
@@ -430,6 +432,7 @@ pub fn run_batch(
                                 bilingual,
                                 effective_overwrite,
                                 &cancel,
+                                max_subtitle_width,
                                 move |text, pct| {
                                     let _ = tx_progress.send(WorkerEvent::JobUpdate {
                                         index,
@@ -590,6 +593,7 @@ mod tests {
             false,
             "auto".to_string(),
             true,
+            42,
             tx,
             cancel,
         );

@@ -589,6 +589,7 @@ impl SubgenApp {
             self.config.translate,
             self.config.translate_model.clone(),
             self.config.bilingual,
+            self.config.subtitle_max_width,
             tx,
             self.worker_cancel.clone(),
         );

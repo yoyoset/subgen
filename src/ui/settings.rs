@@ -79,6 +79,14 @@ fn render_readonly_summary(app: &SubgenApp, ui: &mut egui::Ui) {
     } else {
         ui.label("· 翻译:关闭");
     }
+    ui.label(format!(
+        "· 字幕折行:{}",
+        if app.config.subtitle_max_width == 0 {
+            "关闭".to_string()
+        } else {
+            format!("每行不超过 {} 列", app.config.subtitle_max_width)
+        }
+    ));
 }
 
 fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
@@ -134,6 +142,20 @@ fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
         app.config.overwrite_existing = overwrite;
         app.config.save();
     }
+
+    // 单条字幕的显示宽度上限:同一时刻屏幕上字太多靠折行缓解,不碰识别/翻译结果。
+    // 0 = 关闭折行(把旧行为交给想保持的用户)。
+    ui.horizontal(|ui| {
+        ui.label("字幕每行宽度:");
+        let mut width = app.config.subtitle_max_width;
+        let resp = ui
+            .add(egui::DragValue::new(&mut width).range(0..=200).suffix(" 列"))
+            .on_hover_text("按显示列计,CJK/全角字符算 2 列(即中文每行 21 字);0 = 关闭折行");
+        if resp.changed() {
+            app.config.subtitle_max_width = width;
+            app.config.save();
+        }
+    });
 
     ui.add_space(4.0);
     ui.separator();

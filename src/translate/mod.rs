@@ -155,6 +155,7 @@ pub fn translate_srt(
     bilingual: bool,
     overwrite: bool,
     cancel: &Arc<AtomicBool>,
+    max_subtitle_width: usize,
     mut progress_cb: impl FnMut(String, Option<f32>),
 ) -> Result<TranslateResult, String> {
     let target = paths::sidecar_srt_lang_path(video_path, "zh");
@@ -228,8 +229,17 @@ pub fn translate_srt(
     }
 
     let out_blocks = build_output_blocks(&blocks, &translated, &failed_indices, bilingual);
+    // 排版层折行:双语块文本是 `中文\n原文` 两行一块,wrap_subtitle_text 对每行独立折、
+    // 不会把两种语言混在一起重排。宽度上限 0 表示关闭,原样返回。
+    let wrapped: Vec<(String, String, String)> = out_blocks
+        .into_iter()
+        .map(|(start, end, text)| {
+            let wrapped_text = engine::wrap_subtitle_text(&text, max_subtitle_width);
+            (start, end, wrapped_text)
+        })
+        .collect();
 
-    std::fs::write(&target, engine::write_srt_blocks(&out_blocks))
+    std::fs::write(&target, engine::write_srt_blocks(&wrapped))
         .map_err(|e| format!("写入字幕文件失败: {e}"))?;
 
     Ok(TranslateResult::Written { failed_indices })
