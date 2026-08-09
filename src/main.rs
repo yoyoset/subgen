@@ -44,14 +44,19 @@ fn main() -> eframe::Result<()> {
             .map(|(k, v)| (k.clone(), PathBuf::from(v)))
             .collect(),
     );
-    // 启动时清理 tmp/ 里超过 7 天没被复用的中间产物(见 engine::cleanup_stale_tmp),
-    // 防止长期使用后临时目录无限膨胀。尽力而为,失败不影响启动。
+    // 启动时清理 tmp/ 里超过 7 天没被复用的中间产物,以及 logs/ 里对应的每视频识别/失败
+    // 日志(见 engine::cleanup_stale_tmp/cleanup_stale_logs),防止长期使用后临时目录和日志
+    // 目录无限膨胀。两个清理共用同一个过期窗口——断点续跑只在"中断后很快重跑"时有价值,
+    // 7 天还没复用基本可以确定不会再续。尽力而为,失败不影响启动。
     {
-        let removed = engine::cleanup_stale_tmp(std::time::Duration::from_secs(7 * 24 * 3600));
-        if removed > 0 {
+        let stale = std::time::Duration::from_secs(7 * 24 * 3600);
+        let removed_tmp = engine::cleanup_stale_tmp(stale);
+        let removed_logs = engine::cleanup_stale_logs(stale);
+        let total = removed_tmp + removed_logs;
+        if total > 0 {
             crate::format::push_log(
                 &mut Vec::new(),
-                format!("已清理 {removed} 个过期的临时文件"),
+                format!("已清理 {total} 个过期的临时文件/日志"),
             );
         }
     }

@@ -586,6 +586,41 @@ pub fn cleanup_stale_tmp(older_than: std::time::Duration) -> usize {
     removed
 }
 
+/// 启动时清理 `logs/` 里长期无人复用的每视频日志(`{unique}.log`、`{unique}_ffmpeg.log`、
+/// `{unique}_collapse_error.log`,见本文件 `process_video` 的写日志处)。这些日志只在断点
+/// 续跑时用来恢复 `detected_language`(`recover_detected_language_from_log`),一旦对应的
+/// tmp 中间产物被 `cleanup_stale_tmp` 过期清理,它们同样失去价值——用同一个过期窗口联动
+/// 清理,否则 logs/ 会随处理的视频数无限累积(每个视频一份,几十 KB,一批 20 集就是 1MB+,
+/// 长期使用几百个视频能攒出几百 MB)。识别逻辑按扩展名 `.log` + 排除系统日志文件名
+/// (`app.log`/`crash.log`),新加的每视频日志模式自动被覆盖,不用每种后缀各写一条规则。
+/// 系统日志有自己的轮转机制(`format::rotate_log_file`),绝不在这里误删。返回清理掉的
+/// 文件数;任何一步失败都静默跳过,清理只是维护性动作,不该影响启动。
+pub fn cleanup_stale_logs(older_than: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(paths::logs_dir()) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let is_per_video_log = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("log"))
+            .unwrap_or(false)
+            && file_name != "app.log"
+            && file_name != "crash.log";
+        if is_per_video_log && is_stale(&path, older_than) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// 判断文件最后修改时间是否已早于 `older_than` 之前。纯谓词,方便单测;元数据读不到时
 /// 一律判"不陈旧",绝不因为读不到时间就删掉一个可能还在用的文件。
 pub fn is_stale(path: &Path, older_than: std::time::Duration) -> bool {
@@ -741,6 +776,65 @@ mod tests {
         assert!(unrelated.exists(), "不是 .wav/.srt 的文件不该被清掉");
 
         for p in [stale_wav, stale_srt, fresh_wav, unrelated] {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    /// cleanup_stale_logs 只删 logs/ 里过期的每视频日志(`{unique}.log` 等),系统日志
+    /// (`app.log`/`crash.log`)和新鲜的一律不动——系统日志有自己的轮转机制,绝不能在这里
+    /// 被当成"每视频日志"误删。
+    #[test]
+    fn cleanup_stale_logs_removes_only_expired_per_video_logs() {
+        let dir = paths::logs_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let unique = format!(
+            "cleanup_logs_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let stale_transcribe = dir.join(format!("{unique}.log"));
+        let stale_ffmpeg = dir.join(format!("{unique}_ffmpeg.log"));
+        let stale_collapse = dir.join(format!("{unique}_collapse_error.log"));
+        let fresh_transcribe = dir.join(format!("{unique}_fresh.log"));
+        let system_log = dir.join("app.log");
+        let system_crash = dir.join("crash.log");
+        for p in [
+            &stale_transcribe,
+            &stale_ffmpeg,
+            &stale_collapse,
+            &fresh_transcribe,
+            &system_log,
+            &system_crash,
+        ] {
+            std::fs::write(p, b"log content").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for p in [&stale_transcribe, &stale_ffmpeg, &stale_collapse, &system_log, &system_crash] {
+            // 用带写权限的句柄才能改修改时间(Windows 上只读句柄改 set_modified 会拒绝)。
+            let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(old).unwrap();
+        }
+
+        let removed = cleanup_stale_logs(std::time::Duration::from_secs(300));
+
+        assert!(removed >= 3, "至少应该清掉自己造的三个过期每视频日志: {removed}");
+        assert!(!stale_transcribe.exists(), "过期的 {unique}.log 应该被清掉");
+        assert!(!stale_ffmpeg.exists(), "过期的 _ffmpeg.log 应该被清掉");
+        assert!(!stale_collapse.exists(), "过期的 _collapse_error.log 应该被清掉");
+        assert!(fresh_transcribe.exists(), "新鲜的每视频日志不该被清掉");
+        assert!(system_log.exists(), "app.log 即使过期也不该被清掉(有自己的轮转)");
+        assert!(system_crash.exists(), "crash.log 即使过期也不该被清掉(有自己的轮转)");
+
+        for p in [
+            stale_transcribe,
+            stale_ffmpeg,
+            stale_collapse,
+            fresh_transcribe,
+            system_log,
+            system_crash,
+        ] {
             let _ = std::fs::remove_file(&p);
         }
     }
