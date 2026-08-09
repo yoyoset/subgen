@@ -273,6 +273,149 @@ fn break_long_token(token: &str, max_width: usize) -> Vec<String> {
     pieces
 }
 
+/// 写盘前的排版管线:先对每块折行,再把"又长又久"的极端块拆成两块(二级治理,只处理
+/// 少数块,见 `split_long_block`),拆出的两块也各自折行。块数可能增加,编号由
+/// `write_srt_blocks` 重新枚举,这里不手工编号。`max_width == 0` 表示关闭排版,原样返回。
+pub(crate) fn wrap_and_split_blocks(
+    blocks: Vec<(String, String, String)>,
+    max_width: usize,
+) -> Vec<(String, String, String)> {
+    if max_width == 0 {
+        return blocks;
+    }
+    let mut out = Vec::with_capacity(blocks.len());
+    for (start, end, text) in blocks {
+        if let Some(((s1, e1, t1), (s2, e2, t2))) =
+            split_long_block(&start, &end, &text, max_width)
+        {
+            out.push((s1, e1, wrap_subtitle_text(&t1, max_width)));
+            out.push((s2, e2, wrap_subtitle_text(&t2, max_width)));
+        } else {
+            out.push((start, end, wrap_subtitle_text(&text, max_width)));
+        }
+    }
+    out
+}
+
+/// 折行后仍"又长又久"的块(时长 > 6s 且总宽度 > 2×上限)拆成两块,时间按字符比例分配。
+/// 返回 `None` 表示不拆——**保守优先,宁可漏拆也不拆出半句话**:中文行没有标点切点、
+/// 英文行连词边界都找不到、或拆出的任一块不足 1 秒,都不拆。拆出的两块时间连续、不重叠、
+/// 总跨度与原块完全相等。
+///
+/// 双语块必须同步拆:先用第一行(中文)的标点定出切点比例 `p`(切在中文行正中间附近、
+/// 吸附到最近的标点),第二行(原文)再按同一个 `p` 找最近的标点切点。两种语言各切各的
+/// 标点,保证拆开后每个半块里中文/原文仍然是同一个意思的上下半段。
+///
+/// 中文行必须有标点才拆;英文行没有标点时退到最近的词边界(空格)断开——whisper 的
+/// 长篇无标点叙述在"又长又久"的块里很常见(实测 69 个合格块里 34 个英文行无标点),
+/// 全部放弃会把拆块覆盖率从预期的 ~60 块压到 ~30 块。词边界仍保证不拆出半个词。
+///
+/// 阈值"时长 > 6s"和"总宽度 > 2×上限"来自真实数据分布(`E:\season 11` 四集 3464 块:
+/// "又长又久"——时长 >6s 且英文 >60 字符——占 1.8%≈60 块),把拆分限定在极少数确实
+/// 一口气读不完的块,不给普通块增加无谓的时间轴碎片。
+type SplitBlock = (String, String, String);
+fn split_long_block(
+    start: &str,
+    end: &str,
+    text: &str,
+    max_width: usize,
+) -> Option<(SplitBlock, SplitBlock)> {
+    if max_width == 0 {
+        return None;
+    }
+    let start_ms = parse_timestamp_ms(start)?;
+    let end_ms = parse_timestamp_ms(end)?;
+    let duration_ms = end_ms.checked_sub(start_ms)?;
+    if duration_ms <= 6_000 {
+        return None;
+    }
+
+    // 折行不改变文本的总内容宽度(只插换行),所以"折行后总宽度超限"直接在原始行上算。
+    let lines: Vec<&str> = text.split('\n').map(str::trim).collect();
+    let total_width: usize = lines.iter().map(|l| display_width(l)).sum();
+    if total_width <= 2 * max_width {
+        return None;
+    }
+
+    // 第一行(中文)定切点比例:在整行里找离中点最近的标点。中文翻译几乎都有标点
+    // (实测 69 个合格块里 66 个有),找不到就不拆。
+    let primary = lines.first()?;
+    let primary_chars: Vec<char> = primary.chars().collect();
+    if primary_chars.len() < 2 {
+        return None;
+    }
+    let primary_cut = crate::translate::nearest_split_point(&primary_chars, primary_chars.len() / 2)?;
+    let ratio = primary_cut as f64 / primary_chars.len() as f64;
+
+    // 第二行(双语的原文本行)按同一个比例找切点:优先最近标点,整行都没有标点就退到
+    // 最近的词边界(空格);连空格都没有(单个长词)才放弃。
+    let secondary_chars: Vec<char> = if lines.len() > 1 && !lines[1].is_empty() {
+        lines[1].chars().collect()
+    } else {
+        Vec::new()
+    };
+    let secondary_cut = if secondary_chars.is_empty() {
+        0
+    } else {
+        if secondary_chars.len() < 2 {
+            return None;
+        }
+        let target = (secondary_chars.len() as f64 * ratio).round() as usize;
+        crate::translate::nearest_split_point(&secondary_chars, target)
+            .or_else(|| crate::translate::nearest_space_split_point(&secondary_chars, target))?
+    };
+
+    // 时间按字符比例分配;任一块不足 1 秒就不拆(太短的半块没有存在的意义)。
+    let first_ms = (duration_ms as f64 * ratio).round() as u64;
+    let second_ms = duration_ms - first_ms;
+    if first_ms < 1_000 || second_ms < 1_000 {
+        return None;
+    }
+
+    let first_text: String = primary_chars[..primary_cut].iter().collect();
+    let second_text: String = primary_chars[primary_cut..].iter().collect();
+    let (block1_text, block2_text) = if secondary_chars.is_empty() {
+        (first_text, second_text)
+    } else {
+        let s1: String = secondary_chars[..secondary_cut].iter().collect();
+        let s2: String = secondary_chars[secondary_cut..].iter().collect();
+        (format!("{first_text}\n{s1}"), format!("{second_text}\n{s2}"))
+    };
+
+    let mid = start_ms + first_ms;
+    let (mid_str, start_str, end_str) = (
+        format_timestamp_ms(mid),
+        start.to_string(),
+        end.to_string(),
+    );
+    Some((
+        (start_str, mid_str.clone(), block1_text),
+        (mid_str, end_str, block2_text),
+    ))
+}
+
+/// SRT 时间戳 `HH:MM:SS,mmm` → 毫秒;解析不了返回 None。
+fn parse_timestamp_ms(ts: &str) -> Option<u64> {
+    let (hms, ms) = ts.trim().split_once(',')?;
+    let mut parts = hms.split(':');
+    let h: u64 = parts.next()?.trim().parse().ok()?;
+    let m: u64 = parts.next()?.trim().parse().ok()?;
+    let s: u64 = parts.next()?.trim().parse().ok()?;
+    let ms: u64 = ms.trim().parse().ok()?;
+    Some(h * 3_600_000 + m * 60_000 + s * 1_000 + ms)
+}
+
+/// 毫秒 → SRT 时间戳 `HH:MM:SS,mmm`(不带末尾空格,和 parse_srt_blocks_lines 的 trim 对齐)。
+fn format_timestamp_ms(total_ms: u64) -> String {
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{h:02}:{m:02}:{s:02},{ms:03}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +715,145 @@ mod tests {
 
     fn char_count(s: &str) -> usize {
         s.chars().count()
+    }
+
+    /// 拆块核心不变量:拆出的两块,每种语言的上下半段各自拼回 = 原块该语言的整行;
+    /// 时间轴单调递增、不重叠、总跨度与原块完全相等。用自包含合成数据,不依赖外部文件。
+    #[test]
+    fn split_reconstructs_bilingual_text_and_monotonic_timeline() {
+        // 中文行:20 字,逗号在第 11 个字符后 → 切点比例 p = 11/20 = 0.55
+        // 英文行:34 字符,逗号在第 19 个字符后 → round(0.55*34)=19,恰好在逗号后
+        let zh = "一二三四五六七八九十，二三四五六七八九十";
+        let en = " one two three four, five six seven";
+        let text = format!("{zh}\n{en}");
+        // 时长 8s > 6s;总宽 20*2 + 34 = 74 > 2*20,满足"又长又久"
+        let start = "00:00:10,000";
+        let end = "00:00:18,000";
+
+        let Some(((s1, e1, t1), (s2, e2, t2))) =
+            split_long_block(start, end, &text, 20)
+        else {
+            panic!("这个块应该被拆成两块");
+        };
+
+        // 每种语言的上/下半段各自拼回等于原行(trim 掉英文行前导空格)。
+        let zh1 = t1.lines().next().unwrap();
+        let zh2 = t2.lines().next().unwrap();
+        let en1 = t1.lines().nth(1).unwrap();
+        let en2 = t2.lines().nth(1).unwrap();
+        assert_eq!(format!("{zh1}{zh2}"), zh, "中文两半拼回应等于原行");
+        assert_eq!(
+            format!("{en1}{en2}"),
+            "one two three four, five six seven",
+            "英文两半拼回应等于原行"
+        );
+        // 每块内部仍是"中文\n原文"两行(语言边界不丢)。
+        assert_eq!(t1.lines().count(), 2, "第一块应保留双语两行结构");
+        assert_eq!(t2.lines().count(), 2, "第二块应保留双语两行结构");
+
+        // 时间轴:连续、不重叠、总跨度 = 原块。
+        let (s1_ms, e1_ms) = (parse_timestamp_ms(&s1).unwrap(), parse_timestamp_ms(&e1).unwrap());
+        let (s2_ms, e2_ms) = (parse_timestamp_ms(&s2).unwrap(), parse_timestamp_ms(&e2).unwrap());
+        assert_eq!(s1_ms, 10_000, "第一块应从原块起点开始");
+        assert_eq!(e2_ms, 18_000, "第二块应在原块终点结束");
+        assert_eq!(e1_ms, s2_ms, "两块时间必须连续,不能重叠也不能留缝");
+        assert!(s1_ms < e1_ms && s2_ms < e2_ms, "时间轴必须单调递增");
+        assert!(e1_ms - s1_ms >= 1_000 && e2_ms - s2_ms >= 1_000, "每块至少 1 秒");
+    }
+
+    /// 拆块只对"又长又久"的块生效:时长够但不够宽、或够宽但不够久,都不拆。
+    #[test]
+    fn split_skips_blocks_that_are_not_long_and_wide() {
+        let zh = "一二三四五六七八九十，二三四五六七八九十";
+        let text = format!("{zh}\n one two three four, five six seven");
+        // 时长 3s(< 6s),总宽 74 > 40 → 只因为不够久,不拆。
+        assert!(split_long_block("00:00:01,000", "00:00:04,000", &text, 20).is_none());
+        // 时长 8s,但宽度 74 ≤ 2*42=84 → 只因为不够宽,不拆。
+        assert!(split_long_block("00:00:01,000", "00:00:09,000", &text, 42).is_none());
+    }
+
+    /// 双语块同步拆:中文行(主语言)完全没有标点切点时整块不拆(保守优先,宁可漏也不拆出
+    /// 半句话)。英文行在中文没有标点时不参与兜底——中文才是主阅读语言。
+    #[test]
+    fn split_aborts_when_primary_language_has_no_punctuation() {
+        let zh = "一二三四五六七八九十一二三四五六七八九十"; // 没有任何标点
+        let en = "one two three four five six seven eight ones.";
+        let text = format!("{zh}\n{en}");
+        // 总宽 20*2 + 46 = 86 > 2*20=40,时长 8s,本该拆,但中文行没有标点 → 不拆。
+        assert!(
+            split_long_block("00:00:01,000", "00:00:09,000", &text, 20).is_none(),
+            "中文行没有标点切点,必须整块不拆"
+        );
+    }
+
+    /// 英文行完全没有标点(whisper 长篇无标点叙述)时,退到最近的词边界(空格)断开——
+    /// 不拆出半个词,也不因为英文没有标点就放弃整个块的拆分。
+    #[test]
+    fn split_falls_back_to_word_boundary_when_english_lacks_punctuation() {
+        let zh = "一二三四五六七八九十，二三四五六七八九十";
+        let en = "you see that bandsaw blade going all the way through it it's the dark black in there";
+        let text = format!("{zh}\n{en}");
+        let Some(((_, _, t1), (_, _, t2))) =
+            split_long_block("00:00:01,000", "00:00:09,000", &text, 20)
+        else {
+            panic!("英文无标点时应退到词边界拆开,而不是放弃");
+        };
+        // 英文两半拼回应等于原行;切点按"边界字符留在前一半"的约定(空格跟随前半),
+        // 落在空格之后,不会拆出半个词。
+        let en1 = t1.lines().nth(1).unwrap();
+        let en2 = t2.lines().nth(1).unwrap();
+        assert_eq!(format!("{en1}{en2}"), en, "英文两半在词边界拼回应等于原行");
+        assert!(!en2.starts_with(' '), "第二半不应以空格开头(空格留在前半)");
+    }
+
+    /// 拆出的每块至少 1 秒:切点太靠前(时间被切成不足 1 秒)时整块不拆。
+    #[test]
+    fn split_aborts_when_either_half_would_be_under_one_second() {
+        // 中文行非常长,逗号恰好紧贴开头 → 比例 p 很小,第一块时间不足 1 秒。
+        let zh = "，二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十";
+        let text = zh.to_string();
+        // 时长 8s,总宽远超上限,但切点太靠前 → 不拆。
+        assert!(split_long_block("00:00:01,000", "00:00:09,000", &text, 20).is_none());
+    }
+
+    /// 编排函数:拆出的块也各自折行,块数变化正确,且全流程不丢字。
+    /// 内容不丢要按"每种语言各拼回"验证——拆块把文本重排成 (zh1,en1)+(zh2,en2),
+    /// 全局拼起来是 zh1,en1,zh2,en2 的顺序,和原块 zh1,zh2,en1,en2 不同,但每种语言的
+    /// 两个半段各自拼回必须等于原行。
+    #[test]
+    fn wrap_and_split_blocks_produces_wrapped_halves_and_preserves_content() {
+        let zh = "一二三四五六七八九十，二三四五六七八九十";
+        let en = "one two three four, five six seven";
+        let blocks = vec![("00:00:10,000".to_string(), "00:00:18,000".to_string(), format!("{zh}\n{en}"))];
+        let out = wrap_and_split_blocks(blocks, 20);
+        assert_eq!(out.len(), 2, "长块应该被拆成两块");
+        // 时间连续,第二块起点 = 第一块终点。
+        assert_eq!(out[0].1, out[1].0);
+        // 内容不丢:每种语言的两个半段各自拼回等于原行(去掉空白)。
+        let cjk = |t: &str| {
+            t.lines()
+                .filter(|l| l.chars().any(|c| char_width(c) == 2))
+                .collect::<String>()
+        };
+        let ascii = |t: &str| {
+            t.lines()
+                .filter(|l| !l.is_empty() && l.is_ascii())
+                .flat_map(|l| l.chars())
+                .filter(|c| *c != ' ')
+                .collect::<String>()
+        };
+        assert_eq!(format!("{}{}", cjk(&out[0].2), cjk(&out[1].2)), zh, "中文两半拼回应等于原行");
+        assert_eq!(
+            format!("{}{}", ascii(&out[0].2), ascii(&out[1].2)),
+            en.chars().filter(|c| *c != ' ').collect::<String>(),
+            "英文两半拼回应等于原行"
+        );
+        // 每一显示行都不超上限(拆出来的半块可能仍然需要折行)。
+        for (_, _, t) in &out {
+            for line in t.lines() {
+                assert!(display_width(line) <= 20, "超宽行: {line:?}");
+            }
+        }
     }
 
     #[test]

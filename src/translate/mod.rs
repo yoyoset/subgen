@@ -19,6 +19,7 @@ use crate::engine;
 use crate::paths;
 use prompt::{build_output_blocks, compute_context_tail, translate_batch_with_retry};
 use segment::{group_fragments, merge_group, split_by_weights};
+pub(crate) use segment::{nearest_space_split_point, nearest_split_point};
 pub(crate) use prompt::{looks_untranslated, split_leading_number};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -229,17 +230,12 @@ pub fn translate_srt(
     }
 
     let out_blocks = build_output_blocks(&blocks, &translated, &failed_indices, bilingual);
-    // 排版层折行:双语块文本是 `中文\n原文` 两行一块,wrap_subtitle_text 对每行独立折、
-    // 不会把两种语言混在一起重排。宽度上限 0 表示关闭,原样返回。
-    let wrapped: Vec<(String, String, String)> = out_blocks
-        .into_iter()
-        .map(|(start, end, text)| {
-            let wrapped_text = engine::wrap_subtitle_text(&text, max_subtitle_width);
-            (start, end, wrapped_text)
-        })
-        .collect();
+    // 排版层:先折行(双语块是 `中文\n原文` 两行一块,逐行独立折、不混语言),再把"又长
+    // 又久"的极端块拆成两块。宽度上限 0 表示关闭,原样返回。块数可能增加,编号由
+    // write_srt_blocks 重新枚举。
+    let layout = engine::wrap_and_split_blocks(out_blocks, max_subtitle_width);
 
-    std::fs::write(&target, engine::write_srt_blocks(&wrapped))
+    std::fs::write(&target, engine::write_srt_blocks(&layout))
         .map_err(|e| format!("写入字幕文件失败: {e}"))?;
 
     Ok(TranslateResult::Written { failed_indices })

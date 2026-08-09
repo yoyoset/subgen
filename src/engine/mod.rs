@@ -29,7 +29,7 @@ mod srt;
 mod whisper_log;
 
 pub(crate) use srt::{
-    parse_srt_blocks, parse_srt_blocks_lines, wrap_subtitle_text, write_srt_blocks,
+    parse_srt_blocks, parse_srt_blocks_lines, wrap_and_split_blocks, write_srt_blocks,
     DEFAULT_SUBTITLE_MAX_WIDTH,
 };
 use srt::{collapse_repetitions, count_subtitle_blocks, srt_looks_complete};
@@ -479,16 +479,13 @@ pub fn place_sidecar_srt(
     // 万一多行也别把行边界丢掉),再逐块折行后写出,而不是直接复制临时文件。
     let content = std::fs::read_to_string(generated_srt)
         .map_err(|e| PlaceError::Failed(format!("读取字幕文件失败: {e}")))?;
-    let blocks = parse_srt_blocks_lines(&content);
-    let wrapped: Vec<(String, String, String)> = blocks
+    let blocks: Vec<(String, String, String)> = parse_srt_blocks_lines(&content)
         .into_iter()
-        .map(|(start, end, lines)| {
-            let text = lines.join("\n");
-            (start, end, wrap_subtitle_text(&text, max_subtitle_width))
-        })
+        .map(|(start, end, lines)| (start, end, lines.join("\n")))
         .collect();
+    let layout = wrap_and_split_blocks(blocks, max_subtitle_width);
     let tmp_target = target.with_extension("srt.tmp");
-    std::fs::write(&tmp_target, write_srt_blocks(&wrapped))
+    std::fs::write(&tmp_target, write_srt_blocks(&layout))
         .map_err(|e| PlaceError::Failed(format!("写入字幕文件失败: {e}")))?;
     std::fs::rename(&tmp_target, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_target);

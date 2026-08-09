@@ -79,7 +79,56 @@ pub(super) fn merge_group(lines: &[&str]) -> String {
 }
 
 /// 切点优先吸附到的中文/通用标点——译文是中文,切在标点后读起来才不别扭。
+/// 拆块(engine::srt::split_long_block)复用了这份标点表,两种语言的标点都列上了。
 const SPLIT_ANCHORS: &[char] = &['，', '。', '、', '；', '：', '！', '？', ',', '.', '!', '?'];
+
+/// 在 `[target±4]` 范围内找最近的"标点之后"切点:返回下标 `i` 使得 `chars[i-1]` 是标点
+/// (即切在标点后面)。找不到返回 `None`,由调用方决定是硬切(`split_by_weights`)还是放弃
+/// 拆分。±4 窗口是为"按词数比例切回碎片"设计的——那个场景比例比较可靠,窗口小一点防止
+/// 吸附到太远的标点。
+pub(crate) fn snap_split_point(chars: &[char], target: usize) -> Option<usize> {
+    for off in 0..=4usize {
+        for cand in [target.checked_sub(off), target.checked_add(off)].into_iter().flatten() {
+            if cand > 0 && cand < chars.len() && SPLIT_ANCHORS.contains(&chars[cand - 1]) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// 在整个行内找离 `target` 最近的"标点之后"切点。与 `snap_split_point` 的 ±4 窗口不同,
+/// 拆块场景的英文行标点少且分布散,±4 会漏掉绝大多数本可拆的块(实测 `E:\season 11`
+/// 四集里 40/69 个合格块因此被放弃拆分),所以这里搜索整行,只要行里有标点就能找到。
+pub(crate) fn nearest_split_point(chars: &[char], target: usize) -> Option<usize> {
+    nearest_boundary(chars, target, |c| SPLIT_ANCHORS.contains(c))
+}
+
+/// 整个行内离 `target` 最近的空格(词边界)——英文行完全没有任何标点时(whisper 的长篇
+/// 无标点叙述很常见,实测 69 个"又长又久"块里 34 个英文行无标点)退到词边界断开,
+/// 至少不会拆出半个词。行里没有空格返回 None。
+pub(crate) fn nearest_space_split_point(chars: &[char], target: usize) -> Option<usize> {
+    nearest_boundary(chars, target, |c| *c == ' ')
+}
+
+/// 找"切点下标 `i`(i 在 1..len 内)使得 `chars[i-1]` 命中 `is_boundary`"里离 `target`
+/// 最近的一个。距离相同取更靠前的(下标更小的)。
+fn nearest_boundary(
+    chars: &[char],
+    target: usize,
+    is_boundary: impl Fn(&char) -> bool,
+) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for i in 1..chars.len() {
+        if is_boundary(&chars[i - 1]) {
+            let d = i.abs_diff(target);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, i));
+            }
+        }
+    }
+    best.map(|(_, i)| i)
+}
 
 /// 把合并翻译回来的一句话,按 `weights`(通常是各原文行的词数)的比例切回原来的条数。
 /// 切点先按比例算出大致位置,再在前后各 4 个字符内找最近的标点吸附,找不到就用比例位置
@@ -104,15 +153,7 @@ pub(super) fn split_by_weights(translated: &str, weights: &[usize]) -> Vec<Strin
         let target = ((n * acc) as f64 / total_weight as f64).round() as usize;
         let target = target.min(n);
 
-        let mut best = target;
-        'search: for off in 0..=4usize {
-            for cand in [target.checked_sub(off), target.checked_add(off)].into_iter().flatten() {
-                if cand > 0 && cand < n && SPLIT_ANCHORS.contains(&chars[cand - 1]) {
-                    best = cand;
-                    break 'search;
-                }
-            }
-        }
+        let best = snap_split_point(&chars, target).unwrap_or(target);
 
         // 切点必须不小于上一个切点,否则会产生反向切片——真实数据里权重都是正数、acc
         // 单调递增,理论上不会发生,这里是防止标点吸附把切点拉到前一个切点之前的兜底。
