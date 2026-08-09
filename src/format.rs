@@ -227,22 +227,32 @@ pub fn model_status_line(status: &crate::models::ModelStatus) -> (String, eframe
     }
 }
 
-/// 把 ISO 639-1 语言代码翻成用户能看懂的中文名,覆盖 `ui/settings.rs` 语言下拉框的选项列表
-/// (auto/en/zh/ja/ko/fr/de/es)。没覆盖到的代码原样返回而不是显示"未知"——保留原始信息
-/// 总比丢掉信息更安全,万一以后 whisper 检测出一个列表之外的语言代码,用户至少还能看到
-/// 那串代码去查。
+/// 应用认识并提供给用户的源语言列表:存进 config.toml 的 ISO 码 + 界面显示的中文名。
+/// `ui/settings.rs` 语言下拉框的选项、以及 `lang_display` 的中文名映射,都只读这一份
+/// 常量——加/删语言只改这一处,不会再出现"下拉框多了一项、lang_display 却原样显示 ISO
+/// 码"这种两边各自维护悄悄漂移的情况。注意 whisper-cli 本身认识的语言远多于这个列表
+/// (如 it/ru/pt 等),但手动指定语言的下拉框只列常用项;列表之外的码由 `lang_display`
+/// 原样透传,不丢信息。
+pub const LANGUAGES: &[(&str, &str)] = &[
+    ("auto", "自动检测"),
+    ("en", "英语"),
+    ("zh", "中文"),
+    ("ja", "日语"),
+    ("ko", "韩语"),
+    ("fr", "法语"),
+    ("de", "德语"),
+    ("es", "西班牙语"),
+];
+
+/// 把 ISO 639-1 语言代码翻成用户能看懂的中文名。没覆盖到的代码原样返回而不是显示
+/// "未知"——保留原始信息总比丢掉信息更安全,万一以后 whisper 检测出一个列表之外的语言
+/// 代码,用户至少还能看到那串代码去查。
 pub fn lang_display(code: &str) -> &str {
-    match code {
-        "auto" => "自动检测",
-        "en" => "英语",
-        "zh" => "中文",
-        "ja" => "日语",
-        "ko" => "韩语",
-        "fr" => "法语",
-        "de" => "德语",
-        "es" => "西班牙语",
-        other => other,
-    }
+    LANGUAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| *name)
+        .unwrap_or(code)
 }
 
 /// 把一次成功处理的 JobReport 拼成"完成"后面跟着的补充信息,比如
@@ -753,6 +763,19 @@ mod tests {
         assert_eq!(lang_display("ja"), "日语");
         assert_eq!(lang_display("auto"), "自动检测");
         assert_eq!(lang_display("xx"), "xx", "没覆盖到的代码应该原样返回,而不是丢掉信息");
+    }
+
+    /// LANGUAGES 是下拉框选项和 lang_display 映射的唯一事实来源,必须保持自身一致:
+    /// 没有重复的码、且每个码都有和它不一样的中文名(否则"翻译了等于没翻译",说明写错)。
+    /// 加语言时只改 LANGUAGES 一处,这个测试保证不会出现"下拉框有、映射没跟上"的漂移。
+    #[test]
+    fn languages_list_has_no_duplicates_and_every_code_maps_to_a_real_name() {
+        let mut seen = std::collections::HashSet::new();
+        for (code, name) in LANGUAGES {
+            assert!(seen.insert(*code), "LANGUAGES 里出现重复的语言码: {code}");
+            assert_ne!(lang_display(code), *code, "语言码 {code} 的显示名不该等于它自己");
+            assert_eq!(lang_display(code), *name, "lang_display({code}) 应该返回 LANGUAGES 里的名字");
+        }
     }
 
     #[test]

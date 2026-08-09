@@ -113,9 +113,10 @@ fn render_editable_form(app: &mut SubgenApp, ui: &mut egui::Ui) {
         egui::ComboBox::from_id_salt("lang")
             .selected_text(lang_display(&app.config.language))
             .show_ui(ui, |ui| {
-                for lang in ["auto", "en", "zh", "ja", "ko", "fr", "de", "es"] {
+                // 选项列表和中文名都来自 format::LANGUAGES 这一份常量,加/删语言只改那里。
+                for (lang, name) in LANGUAGES {
                     if ui
-                        .selectable_label(app.config.language == lang, lang_display(lang))
+                        .selectable_label(app.config.language == *lang, *name)
                         .clicked()
                     {
                         app.config.language = lang.to_string();
