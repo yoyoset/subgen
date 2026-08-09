@@ -113,6 +113,166 @@ pub(crate) fn write_srt_blocks(blocks: &[(String, String, String)]) -> String {
     out
 }
 
+/// 字幕折行的显示宽度上限(列)。CJK/全角字符计 2 列、其余计 1 列,所以 42 列 ≈ 中文 21 字。
+/// 数值来自真实数据分布(`E:\season 11` 四集 3464 个块:中文 p90=20 字、英文 p90=59 字符),
+/// 配合"允许超 2 行"的兜底能装下绝大多数块;0 表示关闭折行(见 `wrap_subtitle_text`)。
+pub(crate) const DEFAULT_SUBTITLE_MAX_WIDTH: usize = 42;
+
+/// 折行的断点优先级:空格 > 在这些标点之后 > 硬断。空格断点覆盖英文(词边界);中文没有
+/// 空格,只能靠这些标点之后断开。
+const WRAP_PUNCT: &[char] = &['，', '。', '、', '；', '：', '！', '？', ',', '.', '!', '?'];
+
+/// 字符的显示宽度:CJK/全角字符算 2 列,其余算 1 列。
+/// 覆盖的"算 2 列"码点区间:
+/// - U+1100–U+115F 谚文声母
+/// - U+2E80–U+303F CJK 部首 / 康熙部首 / CJK 符号标点
+/// - U+3041–U+33FF 平假名 / 片假名 / 注音 / CJK 笔画等
+/// - U+3400–U+4DBF、U+4E00–U+9FFF CJK 统一表意文字(扩展 A / 基本区)
+/// - U+A000–U+A4CF 彝文
+/// - U+F900–U+FAFF CJK 兼容表意文字
+/// - U+FE30–U+FE4F CJK 兼容形式
+/// - U+FF00–U+FF60 全角形式
+///
+/// 明确按 1 列算、没覆盖的:组合附加符(U+0300 区)、零宽字符(U+200B 等)——字幕文本里
+/// 几乎不出现;就算出现按 1 列算也只是可能比实际渲染少 1 列,不会造成超宽。
+pub(crate) fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    if matches!(cp,
+        0x1100..=0x115F
+        | 0x2E80..=0x303F
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 整段文本的显示宽度(所有字符宽度之和)。
+pub(crate) fn display_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+/// 把整块字幕文本按显示宽度折行。**只插入 `\n`,不增删改任何非空白字符**——把结果和
+/// 输入的所有 `\n`/空格归一化后必须逐字符一致(有单测锁死)。`\n` 分隔的每一行独立折:
+/// 双语块是 `中文\n原文` 两行一块(见 `translate::build_output_blocks`),两种语言不能混
+/// 在一起重排,否则行边界就丢了。
+/// 每行首尾空白先 trim 掉:whisper 输出的 srt 文本行真实样本里带前导空格(如
+/// `" My name is..."`),不 trim 的话空格占的 1 列会把可用宽度吃掉、诱发不必要的折行。
+/// `max_width == 0` 表示关闭折行,原样返回。
+pub(crate) fn wrap_subtitle_text(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return text.to_string();
+    }
+    let mut out_lines = Vec::new();
+    for line in text.split('\n') {
+        out_lines.extend(wrap_line(line, max_width));
+    }
+    out_lines.join("\n")
+}
+
+/// 单行折行,返回折好的若干行(不含内部 `\n`)。行首尾空白被 trim 掉;整行纯空白返回空。
+fn wrap_line(line: &str, max_width: usize) -> Vec<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Vec::new();
+    }
+    if display_width(line) <= max_width {
+        return vec![line.to_string()];
+    }
+    let tokens: Vec<&str> = line.split(' ').filter(|t| !t.is_empty()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for token in tokens {
+        let token_width = display_width(token);
+        if token_width <= max_width {
+            // 单词本身装得下:优先塞进当前行(空格是最高优先级断点),塞不下才另起一行。
+            let sep = if current.is_empty() { 0 } else { 1 };
+            if current_width + sep + token_width <= max_width {
+                if sep > 0 {
+                    current.push(' ');
+                }
+                current.push_str(token);
+                current_width += sep + token_width;
+            } else {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+                current.push_str(token);
+                current_width = token_width;
+            }
+        } else {
+            // 单个词(中文整行没有空格,整行就相当于一个"词")长于上限:先结清当前行,
+            // 再把这个词按"标点之后 > 硬断"切成若干片。最后一片留在 current 里,好让
+            // 紧随的词有机会并上来(词间补回空格,内容不丢)。
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            let pieces = break_long_token(token, max_width);
+            let last = pieces.len() - 1;
+            for (i, piece) in pieces.into_iter().enumerate() {
+                if i < last {
+                    out.push(piece);
+                } else {
+                    current = piece;
+                    current_width = display_width(&current);
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// 把一个不含空格的长词(通常是整行中文)切成宽度不超过 `max_width` 的若干片,每片拼回
+/// 来等于原词(不丢字)。断点优先"标点之后":在装得下的范围内找最后一个可断的标点,切在
+/// 它后面;找不到标点就在装得下的最远处硬切——硬切只对"单个词本身长于上限"的极少数情况
+/// 生效(比如一个超长的单词),正常内容的词都装得下,不会从词中间断。
+/// 标点断点要求切在 start+2 之后(即每片至少 2 个字符),避免把紧贴上一片开头、本该跟着
+/// 上一片走的标点单独切出来成一行孤标点。
+fn break_long_token(token: &str, max_width: usize) -> Vec<String> {
+    let chars: Vec<char> = token.chars().collect();
+    let mut pieces = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        // 从 start 起最多能装到哪(严格 <= max_width)。
+        let mut w = 0usize;
+        let mut max_end = start;
+        while max_end < chars.len() && w + char_width(chars[max_end]) <= max_width {
+            w += char_width(chars[max_end]);
+            max_end += 1;
+        }
+        if max_end == start {
+            // 单个字符就超上限(max_width >= 2 时理论上不会发生),强制推进避免死循环。
+            max_end = start + 1;
+        }
+        // 还没到末尾才需要找标点断点;已经装完整个 token 就直接收尾,不必再切。
+        if max_end < chars.len() {
+            let mut punct_end = None;
+            for i in (start + 2)..max_end {
+                if WRAP_PUNCT.contains(&chars[i - 1]) {
+                    punct_end = Some(i);
+                }
+            }
+            if let Some(p) = punct_end {
+                max_end = p;
+            }
+        }
+        pieces.push(chars[start..max_end].iter().collect());
+        start = max_end;
+    }
+    pieces
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +427,151 @@ mod tests {
         // parse_srt_blocks 本身的拼接行为必须逐字节保持不变(既有测试/调用方都依赖这个)。
         let joined = parse_srt_blocks(content);
         assert_eq!(joined[0].2, "你好。 Hello there.");
+    }
+
+    /// 折行的核心不变量:结果和输入把所有 `\n`/空格归一化后必须逐字符一致——折行只插入
+    /// 换行、不增删改任何非空白字符。纯英文超宽/纯中文超宽/双语/含前导空格/需要 3 行/
+    /// 单词超长这些形态都跑一遍,任何一条违反都说明折行丢字了。
+    #[test]
+    fn wrap_preserves_characters_after_normalizing_whitespace() {
+        let cases = [
+            "This is a fairly long English sentence that will wrap onto several lines.",
+            "我们见过达姆斯克图案从最简单到最复杂",
+            "我们见过达姆斯克图案，从最简单到最复杂。\nThis is a fairly long English sentence that will wrap.",
+            " My name is Bob.",
+            "短",
+            "onewordthatisverylongindeed beyond the limit",
+            "",
+        ];
+        for text in cases {
+            let out = wrap_subtitle_text(text, 20);
+            let norm =
+                |s: &str| s.chars().filter(|c| *c != '\n' && *c != ' ').collect::<String>();
+            assert_eq!(
+                norm(&out),
+                norm(text),
+                "折行改变了非空白字符: input={text:?} out={out:?}"
+            );
+        }
+    }
+
+    /// 折行后每一显示行都不超过上限(除了"单个字符本身超上限"这种理论上不会出现的病理)。
+    /// 上限默认 42 列,这里用 20 列把所有折行路径都触发一遍。
+    #[test]
+    fn wrap_never_exceeds_max_width_per_line() {
+        let cases = [
+            "This is a fairly long English sentence that will wrap onto several lines.",
+            "我们见过达姆斯克图案，从最简单到最复杂。",
+            "onewordthatisverylongindeed beyond the limit",
+            "我们见过达姆斯克图案从最简单到最复杂\nThis is a fairly long English sentence that will wrap.",
+        ];
+        for text in cases {
+            let out = wrap_subtitle_text(text, 20);
+            for line in out.lines() {
+                assert!(
+                    display_width(line) <= 20,
+                    "折行后出现超宽行: {line:?} (out={out:?})"
+                );
+            }
+        }
+    }
+
+    /// 恰好等于上限的文本原样返回,不折、不改。42 列 = 中文 21 字。
+    #[test]
+    fn wrap_leaves_text_at_limit_unchanged() {
+        let exactly_21_zh = "一二三四五六七八九十一二三四五六七八九十一";
+        assert_eq!(
+            char_count(exactly_21_zh),
+            21,
+            "测试数据应该有 21 个汉字(42 列)"
+        );
+        assert_eq!(
+            wrap_subtitle_text(exactly_21_zh, DEFAULT_SUBTITLE_MAX_WIDTH),
+            exactly_21_zh,
+            "恰好 42 列不该被折行"
+        );
+        // 多 1 个字就该折成两行,且每行都不超 21 字。
+        let over_21_zh = format!("{exactly_21_zh}二");
+        let out = wrap_subtitle_text(&over_21_zh, DEFAULT_SUBTITLE_MAX_WIDTH);
+        assert!(out.contains('\n'), "超过上限必须折行: {out:?}");
+        for line in out.lines() {
+            assert!(display_width(line) <= DEFAULT_SUBTITLE_MAX_WIDTH);
+        }
+    }
+
+    /// whisper 输出的 srt 文本行带前导空格(真实样本: `" My name is..."`),折行前要
+    /// trim 掉,否则空格占的 1 列会诱发不必要的折行;短文本也不该保留这个前导空格。
+    #[test]
+    fn wrap_trims_leading_and_trailing_whitespace_per_line() {
+        assert_eq!(
+            wrap_subtitle_text(" My name is Bob. ", 20),
+            "My name is Bob."
+        );
+        // 双语块第一行(中文)也可能带空白,同样要 trim。
+        assert_eq!(
+            wrap_subtitle_text(" 我们见过的达姆斯克图案 \n Here in the forge, we've seen Damascus patterns",
+                100),
+            "我们见过的达姆斯克图案\nHere in the forge, we've seen Damascus patterns"
+        );
+    }
+
+    /// 双语块是 `中文\n原文` 两行一块,折行后两种语言不能混进同一行——各自独立折,
+    /// 语言边界保留。
+    #[test]
+    fn wrap_keeps_bilingual_language_lines_separate() {
+        let zh = "一二三四五六七八九十一二三四五六七八九十一二三";
+        let en = "This is a fairly long English sentence.";
+        let text = format!("{zh}\n{en}");
+        let out = wrap_subtitle_text(&text, 20);
+        assert!(out.contains('\n'), "中英文各自都超了 20 列,必然要折行: {out:?}");
+        for line in out.lines() {
+            let has_cjk = line.chars().any(|c| char_width(c) == 2);
+            let has_ascii = line.chars().any(|c| c.is_ascii());
+            assert!(
+                !(has_cjk && has_ascii),
+                "中英文被混进同一行,语言边界丢了: {line:?} (out={out:?})"
+            );
+        }
+    }
+
+    /// 超长文本允许超过 2 行(绝不丢字),一直折到每行都装得下为止。
+    #[test]
+    fn wrap_allows_third_line_instead_of_dropping_text() {
+        let en = "This is a fairly long English sentence that will wrap onto several lines.";
+        let out = wrap_subtitle_text(en, 20);
+        assert!(out.lines().count() >= 3, "这段英文在 20 列下应该需要 3 行以上: {out:?}");
+        for line in out.lines() {
+            assert!(display_width(line) <= 20);
+        }
+    }
+
+    /// 单个词本身长于上限时的最后手段:硬断(从词中间切),前提是没有任何标点可断。
+    /// 每片拼回 = 原词,不丢字。这是"英文不得从单词中间断开"唯一允许的例外。
+    #[test]
+    fn wrap_hard_breaks_overlong_single_word() {
+        let out = wrap_subtitle_text("antidisestablishmentarianism", 10);
+        assert_eq!(out, "antidisest\nablishment\narianism");
+        let norm = |s: &str| s.chars().filter(|c| *c != '\n').collect::<String>();
+        assert_eq!(norm(&out), "antidisestablishmentarianism");
+    }
+
+    /// 中文没有空格,超长整行按"标点之后"优先断,而不是硬切。
+    #[test]
+    fn wrap_breaks_chinese_after_punctuation_not_mid_sentence() {
+        // 断点应落在"，"后面,而不是把词从中切开。
+        let text = "我们见过的达姆斯克图案，从最简单到最复杂的各种形式。";
+        let out = wrap_subtitle_text(text, 12);
+        assert!(out.contains('\n'));
+        // 若"标点之后"断生效,某一行应以"，"结尾;不该有任何行从中间把"最复杂"这种词切开
+        // (这里没有空格,硬切会落在任意字符间,而标点断会优先)。
+        assert!(
+            out.lines().any(|l| l.ends_with('，') || l.ends_with('。')),
+            "应该优先断在标点之后: {out:?}"
+        );
+    }
+
+    fn char_count(s: &str) -> usize {
+        s.chars().count()
     }
 
     #[test]
