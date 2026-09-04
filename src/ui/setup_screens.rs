@@ -201,6 +201,50 @@ pub(crate) fn render_needs_download(app: &mut SubgenApp, ui: &mut egui::Ui, miss
         ui.separator();
         ui.add_space(theme::SECTION_SPACING);
 
+        // 下载前的硬件预检:这台机器有没有 NVIDIA 驱动,决定识别/翻译预计走 GPU 还是 CPU。
+        // 用 OS 层面的廉价探测(见 gpu.rs,不依赖任何已下载组件),别让用户下完几 GB 才发现
+        // 自己的机器只能慢速 CPU 跑。
+        match crate::gpu::has_nvidia_driver() {
+            Some(true) => {
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme::SUCCESS, "✓ 检测到 NVIDIA 显卡驱动");
+                    ui.weak("识别与翻译将使用 GPU 加速(速度更快)");
+                });
+            }
+            Some(false) => {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        theme::WARN,
+                        "⚠ 未检测到 NVIDIA 显卡驱动",
+                    );
+                    ui.weak("识别与翻译将使用 CPU 运行(较慢,耗时可能明显更长)");
+                });
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.weak("显卡状态未知,下载完成后会自动确认 GPU/CPU 模式");
+                });
+            }
+        }
+
+        // "跑错了副本"的提示:有配置文件(这个目录被当作安装目录用过)却三个可执行组件全缺
+        // ——真实踩过的坑(2026-09-04):用户从 build 目录(target/release)启动同一个 exe,
+        // 组件其实装在 dist/ 那套完整安装里,这个副本却要求重新下载十几 GB。给个排查方向,
+        // 别让用户以为组件丢了、白白重复下载。
+        if setup::looks_like_bare_copy() {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    theme::WARN,
+                    "⚠ 本目录没有组件但存在配置文件",
+                );
+                ui.weak(
+                    "如果之前安装过,请确认运行的是完整安装目录(含 engine/ffmpeg/translator \
+                     子目录)里的 subgen.exe,而不是从构建目录或单独拷出来的 exe;在这里继续 \
+                     下载则会下载到当前 exe 所在目录",
+                );
+            });
+        }
+
         // 这句话也是这个软件最大的卖点,之前只写在 README 里,首次见面就该让用户知道:
         // 视频和字幕不会离开这台电脑。
         ui.horizontal(|ui| {

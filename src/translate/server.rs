@@ -161,6 +161,13 @@ impl Drop for LlamaServer {
 /// "进程能不能枚举到设备"这个更底层的事实,不锚定某一条具体日志字符串的措辞,不会随
 /// llama-server 版本更新就失效。
 fn probe_gpu_available(exe: &Path, dll_dir: Option<&Path>) -> bool {
+    probe_gpu_mem(exe, dll_dir).is_some()
+}
+
+/// 探测并返回第一台 GPU 设备的总/空闲显存,探测不到返回 `None`。
+/// 比 `probe_gpu_available`(只要 bool)多解析出显存数字,给"组件与存放位置"窗口做
+/// 翻译模型显存适配提示用——探测逻辑本身是同一次 `--list-devices` 调用。
+fn probe_gpu_mem(exe: &Path, dll_dir: Option<&Path>) -> Option<GpuMemInfo> {
     let mut cmd = Command::new(exe);
     cmd.arg("--list-devices");
     if let Some(dir) = dll_dir {
@@ -170,29 +177,106 @@ fn probe_gpu_available(exe: &Path, dll_dir: Option<&Path>) -> bool {
     #[cfg(windows)]
     cmd.creation_flags(engine::CREATE_NO_WINDOW);
     let Ok(output) = cmd.output() else {
-        return false;
+        return None;
     };
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    parse_device_list(&combined)
+    parse_gpu_mem(&combined)
 }
 
-/// 判断 `--list-devices` 的输出里是否列出了至少一个设备。设备行形如
-/// "  CUDA0: NVIDIA GeForce RTX 3060 (12287 MiB, 11255 MiB free)"——去掉首尾空白后,
-/// 冒号前是一段不含空白的设备名;没有设备时只有标题行 "Available devices:"。不锚定
-/// "CUDA" 这个具体后端名字,是因为同一套预编译包理论上也可能报告 Vulkan/SYCL 等其它
-/// 后端的设备,解析逻辑不该绑定某一个后端。
-fn parse_device_list(output: &str) -> bool {
-    output.lines().any(|line| {
+/// 进程级缓存:组件窗口每帧渲染时不该每次都 spawn 一次 `--list-devices`(那要拉起一个
+/// 子进程),但显存占用会随翻译引擎/其它进程变化,也不能永久缓存。做法:探测一次就缓存
+/// 住、当次运行内有效(翻译引擎装没装/显存够不够在单次会话里变化不大),安装翻译引擎后
+/// 由 `invalidate_gpu_mem_cache` 清除缓存、下次自动重探。
+static GPU_MEM_CACHE: std::sync::Mutex<Option<Option<GpuMemInfo>>> = std::sync::Mutex::new(None);
+
+/// 读取缓存的 GPU 显存信息。`None` = 还没探测过或缓存已失效(调用方此时可触发一次探测,
+/// 见 `probe_gpu_mem_cached`)。外层 `Some` 里再套一层 `Option`:内层 `None` 表示探测过但
+/// 没找到 GPU,和"还没探测"区分开,避免每次渲染都重跑子进程。
+pub fn cached_gpu_mem() -> Option<Option<GpuMemInfo>> {
+    GPU_MEM_CACHE.lock().ok().and_then(|g| g.clone())
+}
+
+/// 探测一次 GPU 显存并写入缓存,供组件窗口展示。幂等:缓存已有效时直接返回缓存值,
+/// 不会重复拉起子进程。返回探测结果(内层 `None` = 没有 GPU)。
+pub fn probe_gpu_mem_cached() -> Option<Option<GpuMemInfo>> {
+    if let Some(cached) = cached_gpu_mem() {
+        return Some(cached);
+    }
+    let exe = paths::llama_server_exe()?;
+    let dll_dir = paths::whisper_cli_exe().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+    let info = probe_gpu_mem(&exe, dll_dir.as_deref());
+    if let Ok(mut g) = GPU_MEM_CACHE.lock() {
+        *g = Some(info.clone());
+    }
+    Some(info)
+}
+
+/// 清除 GPU 显存缓存,下次 `probe_gpu_mem_cached` 会重新探测。安装翻译引擎后调用——
+/// 之前探测时引擎可能还没装(返回 None),装完就该重新探测。
+pub fn invalidate_gpu_mem_cache() {
+    if let Ok(mut g) = GPU_MEM_CACHE.lock() {
+        *g = None;
+    }
+}
+
+/// `--list-devices` 输出里解析出的 GPU 显存信息,给"组件与存放位置"窗口展示用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuMemInfo {
+    /// 设备名,如 "NVIDIA GeForce RTX 3060"。
+    pub name: String,
+    /// 总显存(MiB),解析不出来是 `None`。
+    pub total_mib: Option<u64>,
+    /// 空闲显存(MiB),解析不出来是 `None`。
+    pub free_mib: Option<u64>,
+}
+
+/// 从 `--list-devices` 输出里解析第一台设备的总/空闲显存。设备行形如
+/// "  CUDA0: NVIDIA GeForce RTX 3060 (12287 MiB, 11255 MiB free)"——冒号后、左括号前是
+/// 设备名,括号里是 "总 MiB, 空闲 MiB free"。没有设备行时返回 `None`。
+/// 空闲显存是给"翻译模型能不能装进显存"的预判用的:14B 模型约 9GB,显存不够的话
+/// 与其等翻译阶段 llama-server 启动失败,不如在组件窗口提前看到。
+fn parse_gpu_mem(output: &str) -> Option<GpuMemInfo> {
+    output.lines().find_map(|line| {
         let trimmed = line.trim();
-        match trimmed.split_once(':') {
-            Some((name, _)) => !name.is_empty() && !name.contains(char::is_whitespace),
-            None => false,
+        let (name, rest) = trimmed.split_once(':')?;
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return None;
         }
+        let rest = rest.trim();
+        let (device_name, paren) = match rest.split_once('(') {
+            Some((n, p)) => (n.trim(), p.trim().trim_end_matches(')')),
+            None => return None,
+        };
+        let (total, free) = parse_mem_paren(paren);
+        Some(GpuMemInfo {
+            name: device_name.to_string(),
+            total_mib: total,
+            free_mib: free,
+        })
     })
+}
+
+/// 解析 `"12287 MiB, 11255 MiB free)"` 这种括号内容,返回 (总 MiB, 空闲 MiB)。
+fn parse_mem_paren(paren: &str) -> (Option<u64>, Option<u64>) {
+    let mut total = None;
+    let mut free = None;
+    for part in paren.split(',') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_suffix(" MiB") {
+            if let Ok(v) = rest.parse::<u64>() {
+                total = Some(v);
+            }
+        } else if let Some(rest) = part.strip_suffix(" MiB free")
+            && let Ok(v) = rest.parse::<u64>()
+        {
+            free = Some(v);
+        }
+    }
+    (total, free)
 }
 
 #[cfg(test)]
@@ -202,30 +286,48 @@ mod tests {
     /// 输出格式来自真机(RTX 3060)实测的 `llama-server.exe --list-devices`(见
     /// probe_gpu_available 文档注释),不是猜测的。
     #[test]
-    fn parse_device_list_detects_cuda_device() {
+    fn parse_gpu_mem_detects_cuda_device_with_memory() {
         let output = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 3060 (12287 MiB, 11255 MiB free)\n";
-        assert!(parse_device_list(output));
+        let info = parse_gpu_mem(output).expect("应该解析出 GPU 信息");
+        assert_eq!(info.name, "NVIDIA GeForce RTX 3060");
+        assert_eq!(info.total_mib, Some(12287));
+        assert_eq!(info.free_mib, Some(11255));
     }
 
-
     #[test]
-    fn parse_device_list_no_devices_returns_false() {
+    fn parse_gpu_mem_no_devices_returns_none() {
         // 真机实测:PATH 里没有 CUDA DLL 时,输出只有光秃秃的标题行,没有设备行。
         let output = "Available devices:\n";
-        assert!(!parse_device_list(output));
+        assert_eq!(parse_gpu_mem(output), None);
     }
 
-
     #[test]
-    fn parse_device_list_empty_output_returns_false() {
-        assert!(!parse_device_list(""));
+    fn parse_gpu_mem_empty_output_returns_none() {
+        assert_eq!(parse_gpu_mem(""), None);
     }
 
-
     #[test]
-    fn parse_device_list_does_not_match_title_line_itself() {
+    fn parse_gpu_mem_does_not_match_title_line_itself() {
         // "Available devices:" 本身也含冒号,但冒号前是"Available devices"(含空格),
         // 不该被误判成一个设备名。
-        assert!(!parse_device_list("Available devices:"));
+        assert_eq!(parse_gpu_mem("Available devices:"), None);
+    }
+
+    #[test]
+    fn parse_mem_paren_extracts_total_and_free() {
+        let (total, free) = parse_mem_paren("12287 MiB, 11255 MiB free");
+        assert_eq!(total, Some(12287));
+        assert_eq!(free, Some(11255));
+    }
+
+    #[test]
+    fn parse_mem_paren_tolerates_missing_parts() {
+        // 有的驱动/后端可能只输出总显存不输出空闲,或者字段顺序不同——解析不该崩。
+        let (total, free) = parse_mem_paren("4096 MiB");
+        assert_eq!(total, Some(4096));
+        assert_eq!(free, None);
+        let (total, free) = parse_mem_paren("unexpected format");
+        assert_eq!(total, None);
+        assert_eq!(free, None);
     }
 }

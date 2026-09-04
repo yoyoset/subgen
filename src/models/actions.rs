@@ -175,6 +175,9 @@ impl SubgenApp {
         }
         if let Some(result) = finished {
             let label = self.inline_install.take().map(|i| i.label).unwrap_or_default();
+            // 内联装的是翻译引擎时,清掉 GPU 显存缓存,让组件窗口下次打开时重新探测
+            // (之前可能因为引擎没装、探测返回 None 被缓存住)。
+            crate::translate::invalidate_gpu_mem_cache();
             self.transient_notice = Some((
                 match &result {
                     Ok(()) => format!("{label} 安装完成"),

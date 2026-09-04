@@ -141,6 +141,27 @@ fn format_failed_lines_warning(failed_indices: &[usize]) -> String {
     )
 }
 
+/// 已有原文字幕(`existing_reason` 非空)时,这一条任务该怎么处理。抽成纯函数:这是
+/// known-issues-2026-08-09 第 1 条的修复决策——"已有原文 + 开翻译"不该整任务跳过,而该
+/// 拿已有原文直接跑翻译。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExistingSrtDecision {
+    /// 整任务跳过(原文已经有了,又没有翻译要做),`reason` 是给用户的跳过文案。
+    Skip(String),
+    /// 用已有原文字幕直接当翻译输入,不重新识别视频。
+    UseExisting,
+    /// 走正常流水线(没有已有原文字幕,或允许覆盖)。
+    Process,
+}
+
+fn decide_existing_srt(existing_reason: Option<String>, translate: bool) -> ExistingSrtDecision {
+    match existing_reason {
+        Some(reason) if translate => ExistingSrtDecision::UseExisting,
+        Some(reason) => ExistingSrtDecision::Skip(reason),
+        None => ExistingSrtDecision::Process,
+    }
+}
+
 /// worker 线程内部 panic 时,把这一批里还没走到终态的任务标记为失败——否则界面会永远
 /// 卡在"处理中"(BatchDone 收不到),或者显示着"等待中/正在识别"这种和真实情况不符的
 /// 状态,属于"后台实际失败但界面看起来成功"。`finished` 是已经收到过终态更新的任务
@@ -219,16 +240,29 @@ pub fn run_batch(
                 let force = *force;
                 // 用户点"重新处理"就是要覆盖旧结果,不该再被"已存在同名字幕,跳过"挡住。
                 let effective_overwrite = overwrite || force;
-                // 预检:目标 .srt 已存在且不覆盖时,整个任务直接跳过,不启动 ffmpeg/whisper。
-                // 否则用户会白等几分钟(提取音轨+识别全跑完),最后才在 place_sidecar_srt
-                // 那里被告知"已有同名字幕,跳过"——跳过本身不该花这么长时间。
-                if let Some(reason) = crate::format::existing_srt_skip_reason(video_path, effective_overwrite) {
-                    finished.insert(index);
-                    let _ = tx.send(WorkerEvent::JobUpdate {
-                        index,
-                        status: JobStatus::Skipped(reason),
-                    });
-                    continue;
+                // 预检:目标 .srt 已存在且不覆盖时——
+                // - 没开翻译:整个任务直接跳过,不启动 ffmpeg/whisper。否则用户会白等几分钟
+                //   (提取音轨+识别全跑完),最后才在 place_sidecar_srt 那里被告知"已有同名字幕,
+                //   跳过"——跳过本身不该花这么长时间。
+                // - 开了翻译:不跳过,而是直接拿已存在的原文字幕当翻译输入、产出 Video.zh.srt。
+                //   用户勾了"翻译成中文"却已有原文字幕,意图是"把已有的字幕翻译成中文",不是
+                //   重新识别视频。这是 known-issues-2026-08-09 第 1 条的修复:此前整任务跳过
+                //   导致翻译也不做,用户拿不到中文字幕还找不到原因。
+                let existing_reason =
+                    crate::format::existing_srt_skip_reason(video_path, effective_overwrite);
+                let existing_srt_decision = decide_existing_srt(existing_reason, translate);
+                let existing_srt_used =
+                    matches!(existing_srt_decision, ExistingSrtDecision::UseExisting);
+                match existing_srt_decision {
+                    ExistingSrtDecision::Skip(reason) => {
+                        finished.insert(index);
+                        let _ = tx.send(WorkerEvent::JobUpdate {
+                            index,
+                            status: JobStatus::Skipped(reason),
+                        });
+                        continue;
+                    }
+                    ExistingSrtDecision::UseExisting | ExistingSrtDecision::Process => {}
                 }
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     finished.insert(index);
@@ -239,73 +273,96 @@ pub fn run_batch(
                     continue;
                 }
 
-                let tx_progress = tx.clone();
-                let outcome = crate::engine::process_video(
-                    video_path,
-                    &model,
-                    &language,
-                    force,
-                    &cancel,
-                    move |stage, text, pct| {
-                        let _ = tx_progress.send(WorkerEvent::JobUpdate {
-                            index,
-                            status: JobStatus::Running(stage, text, pct),
-                        });
-                    },
-                );
+                // 决定这一条的原文来源与放置路径:已有原文字幕 + 开翻译时直接用它(不重新识别),
+                // 否则走 ffmpeg+whisper 正常流水线。`placed` 是后续翻译阶段的输入路径,
+                // `result` 承载报告所需的状态字段(语言/条数/复用标记等)。`existing_srt_used`
+                // 供后面的语言警告挑选措辞(没跑 whisper 导致语言未知,和跑了但没识别出来,
+                // 该提示用户的原因不一样)。
+                let (placed, result) = if existing_srt_used {
+                    let existing = crate::paths::sidecar_srt_path(video_path);
+                    // 没有真实跑 whisper:语言未知(翻译分支会如实警告)、GPU 不参与检测;
+                    // 字幕条数从已有文件数出来,让"空字幕"这类提示照常工作。reused_srt=true
+                    // 表示"没有重新识别",完成态后缀会显示"(复用了上次的识别结果)"。
+                    let synthetic = crate::engine::EngineOutcome {
+                        srt_path: existing.clone(),
+                        used_gpu: None,
+                        repetition_at: None,
+                        detected_language: None,
+                        reused_srt: true,
+                        subtitle_count: crate::engine::count_subtitle_blocks(&existing),
+                    };
+                    (existing, synthetic)
+                } else {
+                    let tx_progress = tx.clone();
+                    let outcome = crate::engine::process_video(
+                        video_path,
+                        &model,
+                        &language,
+                        force,
+                        &cancel,
+                        move |stage, text, pct| {
+                            let _ = tx_progress.send(WorkerEvent::JobUpdate {
+                                index,
+                                status: JobStatus::Running(stage, text, pct),
+                            });
+                        },
+                    );
 
-                let result = match outcome {
-                    Ok(r) => r,
-                    Err((_, e, _)) if e == "已取消" => {
-                        finished.insert(index);
-                        let _ = tx.send(WorkerEvent::JobUpdate {
-                            index,
-                            status: JobStatus::Cancelled,
-                        });
-                        continue;
-                    }
-                    Err((stage, e, log_path)) => {
-                        finished.insert(index);
-                        let _ = tx.send(WorkerEvent::JobUpdate {
-                            index,
-                            status: JobStatus::Failed(stage, e, log_path),
-                        });
-                        continue;
-                    }
+                    let result = match outcome {
+                        Ok(r) => r,
+                        Err((_, e, _)) if e == "已取消" => {
+                            finished.insert(index);
+                            let _ = tx.send(WorkerEvent::JobUpdate {
+                                index,
+                                status: JobStatus::Cancelled,
+                            });
+                            continue;
+                        }
+                        Err((stage, e, log_path)) => {
+                            finished.insert(index);
+                            let _ = tx.send(WorkerEvent::JobUpdate {
+                                index,
+                                status: JobStatus::Failed(stage, e, log_path),
+                            });
+                            continue;
+                        }
+                    };
+
+                    let placed = match crate::engine::place_sidecar_srt(
+                        video_path,
+                        &result.srt_path,
+                        effective_overwrite,
+                        max_subtitle_width,
+                    ) {
+                        Ok(p) => p,
+                        Err(crate::engine::PlaceError::Skipped(e)) => {
+                            finished.insert(index);
+                            let _ = tx.send(WorkerEvent::JobUpdate {
+                                index,
+                                status: JobStatus::Skipped(e),
+                            });
+                            continue;
+                        }
+                        Err(crate::engine::PlaceError::Failed(e)) => {
+                            // 文件系统操作(把生成的 srt 从 tmp/ 挪到视频同目录)失败,不涉及子进程,
+                            // 没有对应的日志文件。
+                            finished.insert(index);
+                            let _ = tx.send(WorkerEvent::JobUpdate {
+                                index,
+                                status: JobStatus::Failed(Stage::Transcribe, e, None),
+                            });
+                            continue;
+                        }
+                    };
+                    (placed, result)
                 };
 
-                // used_gpu 是 Option<bool>:None 表示这次复用了之前已经识别好的结果、没有真实
-                // 观测(见 engine.rs 的断点续跑逻辑),这种情况不该被当成"没用上 GPU"报警告。
+                // used_gpu 是 Option<bool>:None 表示这次复用了已有结果、没有真实观测
+                // (断点续跑 / 已有原文字幕直接翻译的分支),这种情况不该被当成"没用上 GPU"
+                // 报警告。只有正常走完 process_video 且明确检测到没上 GPU 时才提示。
                 if result.used_gpu == Some(false) {
                     let _ = tx.send(WorkerEvent::GpuMissing(Stage::Transcribe));
                 }
-
-                let placed = match crate::engine::place_sidecar_srt(
-                    video_path,
-                    &result.srt_path,
-                    effective_overwrite,
-                    max_subtitle_width,
-                ) {
-                    Ok(p) => p,
-                    Err(crate::engine::PlaceError::Skipped(e)) => {
-                        finished.insert(index);
-                        let _ = tx.send(WorkerEvent::JobUpdate {
-                            index,
-                            status: JobStatus::Skipped(e),
-                        });
-                        continue;
-                    }
-                    Err(crate::engine::PlaceError::Failed(e)) => {
-                        // 文件系统操作(把生成的 srt 从 tmp/ 挪到视频同目录)失败,不涉及子进程,
-                        // 没有对应的日志文件。
-                        finished.insert(index);
-                        let _ = tx.send(WorkerEvent::JobUpdate {
-                            index,
-                            status: JobStatus::Failed(Stage::Transcribe, e, None),
-                        });
-                        continue;
-                    }
-                };
 
                 let mut warning: Option<String> = None;
                 let append_warning = |current: &mut Option<String>, msg: String| {
@@ -344,14 +401,19 @@ pub fn run_batch(
                         continue;
                     }
 
-                    // 语言检测不确定(比如断点续跑复用了旧结果、但找不到对应的旧日志来恢复语言)
-                    // 会导致下面 pick_model 落到通用兜底模型,而不是真正匹配源语言的专用模型
-                    // (比如日语本该走 Sakura)。这个事实要让用户知道,不然翻译质量下降却完全
-                    // 找不到原因。
+                    // 语言检测不确定(比如断点续跑复用了旧结果、但找不到对应的旧日志来恢复语言;或者
+                    // 直接用已有原文字幕翻译、压根没跑 whisper)会导致下面 pick_model 落到通用
+                    // 兜底模型,而不是真正匹配源语言的专用模型(比如日语本该走 Sakura)。这个
+                    // 事实要让用户知道,不然翻译质量下降却完全找不到原因。
                     if result.detected_language.is_none() {
                         append_warning(
                             &mut warning,
-                            "未能确定源语言,已使用通用翻译模型;如果源语言是日语,建议手动指定语言后重新处理".to_string(),
+                            if existing_srt_used {
+                                "未重新识别视频,无法确定源语言,已使用通用翻译模型;\
+                                 如果源语言是日语,建议手动指定语言后重新处理".to_string()
+                            } else {
+                                "未能确定源语言,已使用通用翻译模型;如果源语言是日语,建议手动指定语言后重新处理".to_string()
+                            },
                         );
                     }
 
@@ -601,5 +663,26 @@ mod tests {
             Ok(WorkerEvent::BatchDone) => {}
             other => panic!("空批次也应收到 BatchDone,实际: {other:?}"),
         }
+    }
+
+    /// known-issues-2026-08-09 第 1 条的修复决策:已有原文字幕时——
+    /// - 没开翻译:整个任务跳过(原文已经有了,没有要做的)。
+    /// - 开了翻译:不跳过,用已有原文直接翻译。
+    #[test]
+    fn decide_existing_srt_routes_translate_to_use_existing() {
+        let reason = "已有同名字幕,未覆盖(Video.srt)".to_string();
+        // 开翻译:已有原文不该跳过,该拿它当翻译输入。
+        assert_eq!(
+            decide_existing_srt(Some(reason.clone()), true),
+            ExistingSrtDecision::UseExisting
+        );
+        // 没开翻译:整个跳过,原因原样保留给用户看。
+        assert_eq!(
+            decide_existing_srt(Some(reason.clone()), false),
+            ExistingSrtDecision::Skip(reason)
+        );
+        // 没有已有原文字幕:正常流水线。
+        assert_eq!(decide_existing_srt(None, true), ExistingSrtDecision::Process);
+        assert_eq!(decide_existing_srt(None, false), ExistingSrtDecision::Process);
     }
 }

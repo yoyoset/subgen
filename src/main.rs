@@ -6,6 +6,7 @@ mod app;
 mod config;
 mod engine;
 mod format;
+mod gpu;
 mod job;
 mod job_guard;
 mod models;
@@ -31,7 +32,24 @@ fn main() -> eframe::Result<()> {
     }
     install_panic_logger();
     job_guard::init_child_job_object();
-    let (config, config_warning) = Config::load();
+    let (mut config, mut config_warning) = Config::load();
+    // 翻译模型升级迁移:配置里存了已下线的旧 key(比如 Qwen3-4B 换成 Qwen3-14B 前的
+    // `translate_model = "qwen3-4b"`)。`model_by_key` 虽然能兼容解析旧值,但磁盘上的配置
+    // 值不该一直停留在旧 key 上——在这里一次性迁移成新 key 并落盘,下次读到的就是现行值,
+    // 不依赖兼容解析永远兜底。迁移是用户可见的设置变化(他的模型选择被替换了),用启动横幅
+    // 告知,不能静默改。
+    if let Some(new_key) = crate::translate::supersede_translate_model(&config.translate_model) {
+        let old_key = config.translate_model.clone();
+        config.translate_model = new_key.to_string();
+        config.save();
+        let msg = format!(
+            "翻译模型 {old_key} 已下线,已自动改用 {new_key}(可在“设置”里手动调整)"
+        );
+        config_warning = Some(match config_warning {
+            Some(existing) => format!("{existing} {msg}"),
+            None => msg,
+        });
+    }
     // 模型目录覆盖值是进程级状态(见 paths.rs),用配置里读到的值设置一次;用户在界面里
     // 改存放位置时会再调用一次,让后续路径解析立刻用上新值。
     paths::set_models_dir_override(config.models_dir_override.clone().map(PathBuf::from));
@@ -52,7 +70,10 @@ fn main() -> eframe::Result<()> {
         let stale = std::time::Duration::from_secs(7 * 24 * 3600);
         let removed_tmp = engine::cleanup_stale_tmp(stale);
         let removed_logs = engine::cleanup_stale_logs(stale);
-        let total = removed_tmp + removed_logs;
+        // zip 组件的临时压缩包下载在 app_dir 下(见 setup::download_and_extract_zip),
+        // 中断会残留大文件,和 tmp/ 同一套过期窗口一起清。
+        let removed_zip_parts = setup::cleanup_stale_zip_parts(stale);
+        let total = removed_tmp + removed_logs + removed_zip_parts;
         if total > 0 {
             crate::format::push_log(
                 &mut Vec::new(),

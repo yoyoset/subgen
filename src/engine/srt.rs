@@ -1,7 +1,9 @@
 use std::path::Path;
 
 /// 数一份 srt 里有多少条字幕块,读不到就当 0(不该因为这个附加信息让整个任务失败)。
-pub(super) fn count_subtitle_blocks(srt_path: &Path) -> usize {
+/// `pub(crate)` 而不是 `pub(super)`:job.rs 的"已有原文字幕直接翻译"分支(job::run_batch)
+/// 也要用它填 JobReport 的字幕条数——那个分支没有跑 process_video,拿不到现成的计数。
+pub(crate) fn count_subtitle_blocks(srt_path: &Path) -> usize {
     std::fs::read_to_string(srt_path)
         .map(|content| parse_srt_blocks(&content).len())
         .unwrap_or(0)

@@ -39,6 +39,58 @@ pub(crate) fn render_components_window(app: &mut SubgenApp, ctx: &egui::Context)
                         .spawn();
                 }
             });
+            // GPU 状态 + 翻译模型显存适配提示:探测(缓存)一次 `--list-devices`,把总/空闲
+            // 显存和当前要跑的翻译模型摆在一起,让"翻译会很慢/启动失败"这类问题在开工前
+            // 就能看到,而不是等翻译阶段才暴露。翻译引擎还没装时探测不出结果,显示占位文案
+            // 并在装好后自动重探(见 translate::server::invalidate_gpu_mem_cache)。
+            match crate::translate::probe_gpu_mem_cached() {
+                Some(Some(info)) => {
+                    let mem = match (info.total_mib, info.free_mib) {
+                        (Some(t), Some(f)) => format!(
+                            "{} MB / {} MB",
+                            crate::format::format_download_size(f * 1024 * 1024),
+                            crate::format::format_download_size(t * 1024 * 1024)
+                        ),
+                        _ => "显存信息未知".to_string(),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.colored_label(crate::ui::theme::SUCCESS, "✓ GPU");
+                        ui.weak(format!("{} · {}", info.name, mem));
+                    });
+                    // 翻译模型的文件大小和空闲显存对比:文件装进显存后的占用只会比文件本身大
+                    // (权重 + KV cache + 临时缓冲),所以"空闲 < 文件大小"基本可以断定放不下,
+                    // 给出明确建议而不是等翻译阶段 llama-server 启动失败。
+                    if app.config.translate {
+                        for tm in crate::translate::MODELS {
+                            let needed = tm.size_bytes as f64;
+                            if let Some(free_mib) = info.free_mib {
+                                let free_bytes = free_mib as f64 * 1024.0 * 1024.0;
+                                if needed > free_bytes {
+                                    ui.colored_label(
+                                        crate::ui::theme::WARN,
+                                        format!(
+                                            "⚠ {} 约 {} ,当前空闲显存约 {} ,可能放不下,\
+                                             翻译会变慢或启动失败;可换更小的模型或关闭翻译",
+                                            tm.label,
+                                            crate::format::format_download_size(tm.size_bytes),
+                                            crate::format::format_download_size(free_bytes as u64),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(None) => {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(crate::ui::theme::WARN, "⚠ 未检测到可用 GPU");
+                        ui.weak("识别与翻译将使用 CPU(较慢)");
+                    });
+                }
+                None => {
+                    ui.weak("GPU 状态:待翻译引擎安装后检测…");
+                }
+            }
             if let Some(e) = &app.models_dir_error {
                 ui.colored_label(crate::ui::theme::ERROR, e);
             }

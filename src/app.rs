@@ -760,6 +760,9 @@ impl SubgenApp {
             self.apply_model_bound(key, path);
         }
         if done {
+            // 组件装完了,之前探测的 GPU 显存缓存可能过期(翻译引擎刚装好、还没探测过),
+            // 清掉让组件窗口下次打开时重新探测。
+            crate::translate::invalidate_gpu_mem_cache();
             self.setup_phase = SetupPhase::Ready;
             self.setup_rx = None;
             self.last_setup_title = None;

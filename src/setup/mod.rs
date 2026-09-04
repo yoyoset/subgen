@@ -108,6 +108,20 @@ pub fn is_present(key: ComponentKey, model: &str) -> bool {
     }
 }
 
+/// 首次下载页的"是不是跑错了副本"提示信号。真实踩过的坑(2026-09-04 用户事故):同一个
+/// exe 被从 `dist/` 和 `target/release/` 各跑一次,会各自生成独立的 config.toml、各自判断
+/// 组件缺失——用户从 build 目录启动,明明 `dist/` 那边全都装好了,这个副本却要求重新下载
+/// 十几 GB。这里做一次廉价的三重判断:配置文件存在(= 这个目录被当作安装目录使用过)但
+/// 三个可执行组件(识别引擎/ffmpeg/翻译引擎)全都不在(= 没有下载记录可循)。正常情况组件
+/// 是 exe 同目录的 `engine/`/`ffmpeg/`/`translator/` 子目录,新装没下过会全缺、但那时也不该
+/// 有 config.toml;有 config 却全缺,大概率是把 exe 单独拷出来/从 build 目录启动的裸副本。
+pub fn looks_like_bare_copy() -> bool {
+    paths::config_path().is_file()
+        && paths::whisper_cli_exe().is_none()
+        && paths::ffmpeg_exe().is_none()
+        && paths::llama_server_exe().is_none()
+}
+
 /// `ModelStatus` 版本的 `is_present`,给"单文件模型"三种组件用(Engine/Ffmpeg/Translator
 /// 是解压出的可执行文件,不是单个已知大小的文件,不适用这套)。`None` 表示传入的模型 key
 /// 在注册表里查不到(比如配置文件里存了个过期/拼错的值)——这种情况不该被判定为"已就绪",
@@ -215,6 +229,35 @@ pub fn missing_components(
     keys.into_iter()
         .filter(|k| !is_present(*k, whisper_model))
         .collect()
+}
+
+/// 启动时尽力而为地清理 app_dir 下残留的 `_dl_*.zip.part`(zip 组件下载的临时压缩包)。
+/// 见 download_and_extract_zip 的写法——正常完成会 rename 成正式文件并删除 .part,只有
+/// 下载中断/取消/崩溃时才会残留。体积不小(ffmpeg 109MB、引擎 677MB、翻译引擎 249MB),
+/// 长期不清理会在 exe 目录堆积几个 GB。7 天没被复用基本可以确定不会再续传(和
+/// cleanup_stale_tmp 同一过期窗口)。返回清理掉的文件数;任何一步失败都静默跳过。
+pub fn cleanup_stale_zip_parts(older_than: std::time::Duration) -> usize {
+    cleanup_stale_zip_parts_in(&paths::app_dir(), older_than)
+}
+
+/// `cleanup_stale_zip_parts` 的目录参数化版本,方便单测不碰真实的 app_dir。
+fn cleanup_stale_zip_parts_in(dir: &Path, older_than: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_zip_part = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("_dl_") && n.ends_with(".zip.part"))
+            .unwrap_or(false);
+        if is_zip_part && crate::engine::is_stale(&path, older_than) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// 下载并安装一个组件。cancel 标志在下载中会被周期性检查,置位后会中止并清理临时文件。
@@ -474,6 +517,30 @@ mod tests {
             Some(estimated_size_bytes(ComponentKey::Model, "large-v3")),
             "只缺语音模型时,需要的空间应该等于该模型的估算大小"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_stale_zip_parts_removes_only_expired_zip_parts() {
+        let dir = temp_subdir("cleanup_zip_parts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("_dl_ffmpeg.zip.part");
+        let fresh = dir.join("_dl_engine.zip.part");
+        let unrelated = dir.join("config.toml");
+        std::fs::write(&stale, b"a").unwrap();
+        std::fs::write(&fresh, b"b").unwrap();
+        std::fs::write(&unrelated, b"c").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let f = std::fs::OpenOptions::new().write(true).open(&stale).unwrap();
+        f.set_modified(old).unwrap();
+
+        let removed = cleanup_stale_zip_parts_in(&dir, std::time::Duration::from_secs(300));
+
+        assert_eq!(removed, 1, "应该只清掉过期的 _dl_*.zip.part: {removed}");
+        assert!(!stale.exists(), "过期的 zip.part 应该被清掉");
+        assert!(fresh.exists(), "新鲜的 zip.part 不该被清掉");
+        assert!(unrelated.exists(), "非 _dl_*.zip.part 的文件不该被清掉");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
