@@ -595,7 +595,14 @@ fn wait_child_with_cancel(
 /// 新鲜的绝不碰——单线程串行处理,启动时本来也没有正在跑的任务,不会误删进行中的产物。
 /// 返回清理掉的文件数;任何一步失败都静默跳过,清理只是维护性动作,不该影响启动。
 pub fn cleanup_stale_tmp(older_than: std::time::Duration) -> usize {
-    let Ok(entries) = std::fs::read_dir(paths::tmp_dir()) else {
+    cleanup_stale_tmp_in(&paths::tmp_dir(), older_than)
+}
+
+/// `cleanup_stale_tmp` 的目录参数化版本。抽出来是让测试跑在独立临时目录里,不碰测试进程
+/// 共享的 `paths::tmp_dir()`——多个测试并行写同一个目录会互相干扰(真实踩过:和别的测试
+/// 并行时,这边断言"新鲜文件还在"偶尔会失败,因为另一个测试正在删/建同一目录下的文件)。
+pub fn cleanup_stale_tmp_in(dir: &Path, older_than: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     let mut removed = 0;
@@ -623,7 +630,14 @@ pub fn cleanup_stale_tmp(older_than: std::time::Duration) -> usize {
 /// 系统日志有自己的轮转机制(`format::rotate_log_file`),绝不在这里误删。返回清理掉的
 /// 文件数;任何一步失败都静默跳过,清理只是维护性动作,不该影响启动。
 pub fn cleanup_stale_logs(older_than: std::time::Duration) -> usize {
-    let Ok(entries) = std::fs::read_dir(paths::logs_dir()) else {
+    cleanup_stale_logs_in(&paths::logs_dir(), older_than)
+}
+
+/// `cleanup_stale_logs` 的目录参数化版本。和 `cleanup_stale_tmp_in` 同一个原因:测试要跑在
+/// 独立临时目录,避免和 `panic_logger` 这类也写 `paths::logs_dir()`(`crash.log`)的测试并行
+/// 时互相踩文件(真实 flake:并行时偶尔把"系统日志不该被清"的断言打挂)。
+pub fn cleanup_stale_logs_in(dir: &Path, older_than: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     let mut removed = 0;
@@ -813,9 +827,17 @@ mod tests {
 
     /// cleanup_stale_tmp 只删超过期限的 .wav/.srt,新鲜的和其他扩展名一律不动。
     /// 用 set_modified 把文件修改时间拨回一小时前,模拟"很久以前留下的中间产物"。
+    /// 跑在独立临时目录里(`cleanup_stale_tmp_in`),不碰共享的 `paths::tmp_dir()`——
+    /// 并行测试写同一个目录会互相干扰。
     #[test]
     fn cleanup_stale_tmp_removes_only_expired_wav_and_srt() {
-        let dir = paths::tmp_dir();
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_cleanup_tmp_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let unique = format!(
             "cleanup_{:x}",
@@ -839,7 +861,7 @@ mod tests {
             f.set_modified(old).unwrap();
         }
 
-        let removed = cleanup_stale_tmp(std::time::Duration::from_secs(300));
+        let removed = cleanup_stale_tmp_in(&dir, std::time::Duration::from_secs(300));
 
         assert!(removed >= 2, "至少应该清掉自己造的两个过期产物: {removed}");
         assert!(!stale_wav.exists(), "过期的 wav 应该被清掉");
@@ -847,9 +869,7 @@ mod tests {
         assert!(fresh_wav.exists(), "新鲜的中间产物不该被清掉");
         assert!(unrelated.exists(), "不是 .wav/.srt 的文件不该被清掉");
 
-        for p in [stale_wav, stale_srt, fresh_wav, unrelated] {
-            let _ = std::fs::remove_file(&p);
-        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// cleanup_stale_logs 只删 logs/ 里过期的每视频日志(`{unique}.log` 等),系统日志
@@ -857,7 +877,15 @@ mod tests {
     /// 被当成"每视频日志"误删。
     #[test]
     fn cleanup_stale_logs_removes_only_expired_per_video_logs() {
-        let dir = paths::logs_dir();
+        // 跑在独立临时目录里(`cleanup_stale_logs_in`),不碰共享的 `paths::logs_dir()`——
+        // `panic_logger` 测试会写同一个目录里的 `crash.log`,并行时互相破坏导致偶发失败。
+        let dir = std::env::temp_dir().join(format!(
+            "subgen_test_cleanup_logs_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let unique = format!(
             "cleanup_logs_{:x}",
@@ -889,7 +917,7 @@ mod tests {
             f.set_modified(old).unwrap();
         }
 
-        let removed = cleanup_stale_logs(std::time::Duration::from_secs(300));
+        let removed = cleanup_stale_logs_in(&dir, std::time::Duration::from_secs(300));
 
         assert!(removed >= 3, "至少应该清掉自己造的三个过期每视频日志: {removed}");
         assert!(!stale_transcribe.exists(), "过期的 {unique}.log 应该被清掉");
@@ -899,15 +927,6 @@ mod tests {
         assert!(system_log.exists(), "app.log 即使过期也不该被清掉(有自己的轮转)");
         assert!(system_crash.exists(), "crash.log 即使过期也不该被清掉(有自己的轮转)");
 
-        for p in [
-            stale_transcribe,
-            stale_ffmpeg,
-            stale_collapse,
-            fresh_transcribe,
-            system_log,
-            system_crash,
-        ] {
-            let _ = std::fs::remove_file(&p);
-        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
