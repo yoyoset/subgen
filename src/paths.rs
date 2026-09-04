@@ -360,7 +360,7 @@ mod tests {
         // find_file_recursive 会直接返回 None,正确退回平铺路径)
         assert_eq!(model_path("large-v3"), custom.join("ggml-large-v3.bin"));
         assert_eq!(vad_model_path(), custom.join("ggml-silero-v5.1.2.bin"));
-        assert_eq!(trans_model_path("qwen3-4b", "qwen3.gguf"), custom.join("qwen3.gguf"));
+        assert_eq!(trans_model_path("qwen3-14b", "Qwen3-14B-Q4_K_M.gguf"), custom.join("Qwen3-14B-Q4_K_M.gguf"));
         // resolve_in_store/store_path 是上面几个函数拆出来的两块——目录不存在时,
         // resolve_in_store 该老实返回 None(不是"猜"出一个路径),store_path 只管算写入
         // 目标、不检查存在与否。
@@ -409,8 +409,8 @@ mod tests {
             "resolve_in_store 应该能直接在嵌套目录里找到文件"
         );
         assert_eq!(
-            trans_model_path("qwen3-4b", "qwen3-not-downloaded-yet.gguf"),
-            nested_root.join("qwen3-not-downloaded-yet.gguf"),
+            trans_model_path("qwen3-14b", "Qwen3-14B-not-downloaded-yet.gguf"),
+            nested_root.join("Qwen3-14B-not-downloaded-yet.gguf"),
             "找不到时应该退回平铺路径(下载新模型要用这个当写入目标),而不是 panic"
         );
 

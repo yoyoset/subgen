@@ -246,7 +246,7 @@ fn translate_batch_once(
         .as_str()
         .ok_or("翻译响应格式异常(缺少 choices[0].message.content 字段)")?;
 
-    parse_numbered_response(content, texts.len())
+    parse_numbered_response(&strip_think_block(content), texts.len())
 }
 
 /// 提示词按模型的 PromptKind 区分:
@@ -294,11 +294,31 @@ fn build_prompt(model: &TransModel, numbered: &str, context: &[(String, String)]
              严格保留原有的“编号.”格式,每行只输出一条译文,不要合并或拆分行,不要添加编号之外的\
              任何解释、注释或原文。字幕原文经常是被截断的半句话,即使某一行看起来意思不完整,\
              也只翻译这一行本身给出的文字,不要把它的内容并入上一行或下一行、也不要为了让译文\
-             通顺而擅自补全整句。"
+             通顺而擅自补全整句。/no_think"
                 .to_string(),
             format!("{context_block}{numbered}"),
         ),
     }
+}
+
+/// 剥掉混合思考模型可能漏出的 `<think>...</think>` 块。
+///
+/// Qwen3-14B 是混合思考/非思考模型,build_prompt 里的 `/no_think` 是软开关、不保证
+/// 100% 生效(llama-server 内嵌 Jinja 模板解析措辞变化就可能失灵);这里兜底把推理过程
+/// 从内容里过滤掉,避免它被 parse_numbered_response 当成正文、或原样混进译文。标签是
+/// 固定字面量而非可嵌套结构,不需要引入 regex 依赖,循环剥离即可。
+fn strip_think_block(content: &str) -> String {
+    let mut s = content;
+    let mut out = String::new();
+    while let Some(start) = s.find("<think>") {
+        out.push_str(&s[..start]);
+        match s[start..].find("</think>") {
+            Some(end_rel) => s = &s[start + end_rel + "</think>".len()..],
+            None => return out.trim().to_string(),
+        }
+    }
+    out.push_str(s);
+    out.trim().to_string()
 }
 
 /// 解析模型输出里的编号行(如 "3. 译文" / "3、译文" / "3) 译文"),返回 编号→译文 映射。
@@ -348,7 +368,7 @@ pub(crate) fn split_leading_number(line: &str) -> Option<(usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{QWEN3_4B, SAKURA_7B};
+    use super::super::{QWEN3_14B, SAKURA_7B};
 
     #[test]
     fn compute_context_tail_takes_last_two_successful_pairs() {
@@ -397,7 +417,7 @@ mod tests {
 
     #[test]
     fn build_prompt_without_context_has_no_reference_block() {
-        let (_, user) = build_prompt(&QWEN3_4B, "1. Hello", &[]);
+        let (_, user) = build_prompt(&QWEN3_14B, "1. Hello", &[]);
         assert_eq!(user, "1. Hello", "没有上下文时正文不该被额外包装");
         assert!(!user.contains("紧接在前的上文"));
     }
@@ -406,7 +426,7 @@ mod tests {
     #[test]
     fn build_prompt_with_context_prepends_reference_block_before_body() {
         let context = vec![("Hello there.".to_string(), "你好。".to_string())];
-        let (_, user) = build_prompt(&QWEN3_4B, "1. World", &context);
+        let (_, user) = build_prompt(&QWEN3_14B, "1. World", &context);
         assert!(user.contains("紧接在前的上文"), "应该包含上下文说明: {user}");
         assert!(user.contains("Hello there. → 你好。"), "应该包含具体的上文内容: {user}");
         let context_pos = user.find("Hello there.").unwrap();
@@ -455,6 +475,29 @@ mod tests {
         assert_eq!(zh_only[0].2, "你好");
     }
 
+
+    #[test]
+    fn strip_think_block_removes_reasoning_and_keeps_answer() {
+        assert_eq!(strip_think_block("<think>分析一下</think>1. 你好"), "1. 你好");
+    }
+
+    #[test]
+    fn strip_think_block_handles_multiline_reasoning() {
+        let raw = "<think>\n想想措辞\n再想想\n</think>\n1. 早安。";
+        assert_eq!(strip_think_block(raw), "1. 早安。");
+    }
+
+    #[test]
+    fn strip_think_block_no_tag_passes_through_unchanged() {
+        assert_eq!(strip_think_block("1. 你好"), "1. 你好");
+    }
+
+    #[test]
+    fn strip_think_block_unterminated_tag_drops_rest() {
+        // /no_think 完全失灵的极端情况:模型只输出了思考、还没来得及闭合标签就被截断
+        // (max_tokens 打断),没有正文可用,不该把半截推理文本当成译文往下解析。
+        assert_eq!(strip_think_block("前言<think>还在想"), "前言");
+    }
 
     #[test]
     fn parses_well_formed_numbered_response() {

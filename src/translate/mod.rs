@@ -4,7 +4,7 @@
 //! 模型选择策略(关键事实,写代码时核实过,不是猜测):
 //! - SakuraLLM 系列模型**只训练了日→中方向**,是专门用海量日中轻小说平行语料微调的,译文风格、
 //!   人名/术语处理明显强于同规模通用模型;但喂英文等其他语言效果很差(不在其训练分布内)。
-//! - 所以采用"语言 → 模型"映射表:日语走 Sakura,其余语言走通用指令模型(Qwen3-4B-Instruct)。
+//! - 所以采用"语言 → 模型"映射表:日语走 Sakura,其余语言走通用指令模型(Qwen3-14B)。
 //!   `langs` 里用 `"*"` 表示兜底模型,匹配不到具体语言时用它。
 //! - 与 engine.rs 里 whisper-cli 的子进程调用方式(便携二进制、子进程、CREATE_NO_WINDOW)保持
 //!   一致,不引入 FFI/CUDA 编译依赖。
@@ -13,7 +13,7 @@ mod prompt;
 mod segment;
 mod server;
 
-pub use server::LlamaServer;
+pub use server::{invalidate_gpu_mem_cache, probe_gpu_mem_cached, LlamaServer};
 
 use crate::engine;
 use crate::paths;
@@ -95,26 +95,58 @@ pub const SAKURA_7B: TransModel = TransModel {
     prompt_kind: PromptKind::Sakura,
 };
 
-pub const QWEN3_4B: TransModel = TransModel {
-    key: "qwen3-4b",
-    label: "Qwen3 4B(通用,多语言→中)",
-    file_name: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-    url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-    sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
-    size_bytes: 2_497_281_120,
+// Qwen3 没有官方 -Instruct-2507 纯指令刷新版本(那一波只出了 4B/30B-A3B/235B-A22B),
+// 14B 只有原始混合思考/非思考版,靠 prompt.rs::build_prompt 的 General 分支追加 /no_think
+// 关闭思考模式,并在 translate_batch_once 里兜底剥掉可能漏出的 <think> 块。
+pub const QWEN3_14B: TransModel = TransModel {
+    key: "qwen3-14b",
+    label: "Qwen3 14B(通用,多语言→中)",
+    file_name: "Qwen3-14B-Q4_K_M.gguf",
+    url: "https://huggingface.co/unsloth/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q4_K_M.gguf",
+    sha256: "5eaa0870bd81ed3b58a630a271234cfa604e43ffb3a19cd68e54a80dd9d52a66",
+    size_bytes: 9_001_753_984,
     langs: &["*"],
     prompt_kind: PromptKind::General,
 };
 
-pub const MODELS: &[TransModel] = &[SAKURA_7B, QWEN3_4B];
+pub const MODELS: &[TransModel] = &[SAKURA_7B, QWEN3_14B];
+
+/// 已下线的旧翻译模型 key → 取代它的新 key。注册表(`MODELS`)只保留现行模型,但用户的
+/// 配置文件里可能存着升级前手动选的旧 key(比如 8/20 把 Qwen3-4B 换成 Qwen3-14B 前的
+/// `translate_model = "qwen3-4b"`)。`model_by_key` 在注册表查不到时用这张表解析到新模型,
+/// 而不是静默退回兜底模型——那会让 `missing_components` 按"auto"只要求兜底模型、或让用户
+/// 明明选了"通用模型"却在日语视频上落到 Sakura,两种情况都和用户的选择对不上号。
+///
+/// 新增/替换模型时:把被替换的旧 key 记在这里(旧 key → 新 key),`supersede_translate_model`
+/// 会在启动时把配置里的旧值迁移成新值,同时 `model_by_key` 兼容解析旧值,迁移完成前不会
+/// 出现"配置里存了旧 key 就行为走样"的窗口期。
+pub const SUPERSEDED_MODELS: &[(&str, &str)] = &[("qwen3-4b", "qwen3-14b")];
 
 pub fn model_by_key(key: &str) -> Option<&'static TransModel> {
-    MODELS.iter().find(|m| m.key == key)
+    MODELS.iter().find(|m| m.key == key).or_else(|| {
+        SUPERSEDED_MODELS
+            .iter()
+            .find(|(old, _)| *old == key)
+            .and_then(|(_, new_key)| model_by_key(new_key))
+    })
+}
+
+/// 判断 `key` 是不是已下线的旧模型 key,是则返回应改用的新 key。启动时用它在配置文件里做
+/// 一次性的值迁移(见 main.rs),让磁盘上的 config.toml 也尽快变回现行 key,不依赖
+/// `model_by_key` 的兼容解析永远兜底。
+pub fn supersede_translate_model(key: &str) -> Option<&'static str> {
+    if MODELS.iter().any(|m| m.key == key) {
+        return None;
+    }
+    SUPERSEDED_MODELS
+        .iter()
+        .find(|(old, _)| *old == key)
+        .map(|(_, new_key)| *new_key)
 }
 
 /// 挑选翻译模型:`selected` 不是 "auto" 时尊重用户手动指定;否则按 `source_lang`
 /// 精确匹配某个模型的 `langs`,匹配不到就落到 `langs` 含 `"*"` 的兜底模型。
-/// 兜底/通用翻译模型(`langs` 含 `"*"` 的那个,目前是 Qwen3-4B)。除了 `pick_model` 自己用,
+/// 兜底/通用翻译模型(`langs` 含 `"*"` 的那个,目前是 Qwen3-14B)。除了 `pick_model` 自己用,
 /// `setup::missing_components` 也用它——"auto" 策略下不该强制要求所有翻译模型都在(见那边
 /// 的说明),只有这一个是必须的。
 pub fn fallback_model() -> &'static TransModel {
@@ -266,10 +298,10 @@ mod tests {
     }
 
     #[test]
-    fn fallback_model_is_qwen3_4b() {
+    fn fallback_model_is_qwen3_14b() {
         // setup::missing_components 依赖这个返回值来决定"auto"策略下只要求哪一个翻译模型
         // 齐全,固定断言具体是哪个,避免以后改注册表顺序时这个假设悄悄漂移。
-        assert_eq!(fallback_model().key, "qwen3-4b");
+        assert_eq!(fallback_model().key, "qwen3-14b");
     }
 
     #[test]
@@ -282,13 +314,33 @@ mod tests {
     #[test]
     fn pick_model_falls_back_to_catchall_for_other_languages() {
         let m = pick_model("en", "auto");
-        assert_eq!(m.key, "qwen3-4b");
+        assert_eq!(m.key, "qwen3-14b");
     }
 
 
     #[test]
     fn pick_model_respects_manual_selection() {
-        let m = pick_model("ja", "qwen3-4b");
-        assert_eq!(m.key, "qwen3-4b");
+        let m = pick_model("ja", "qwen3-14b");
+        assert_eq!(m.key, "qwen3-14b");
+    }
+
+    #[test]
+    fn model_by_key_resolves_superseded_legacy_key() {
+        // 8/20 把 Qwen3-4B 换成 Qwen3-14B 前,用户配置里可能存着 "qwen3-4b"——这个 key
+        // 已不在 MODELS 注册表里,但 model_by_key 要通过 SUPERSEDED_MODELS 映射解析到新的
+        // 14B,而不是返回 None。否则 missing_components 会把它当"auto"处理,只要求兜底
+        // 模型,和用户明确选了某个翻译模型的意图不符。
+        assert_eq!(model_by_key("qwen3-4b").map(|m| m.key), Some("qwen3-14b"));
+        assert_eq!(model_by_key("qwen3-14b").map(|m| m.key), Some("qwen3-14b"));
+        assert_eq!(model_by_key("does-not-exist").map(|m| m.key), None);
+    }
+
+    #[test]
+    fn supersede_translate_model_returns_new_key_for_legacy() {
+        assert_eq!(supersede_translate_model("qwen3-4b"), Some("qwen3-14b"));
+        assert_eq!(supersede_translate_model("qwen3-14b"), None);
+        assert_eq!(supersede_translate_model("sakura-7b"), None);
+        assert_eq!(supersede_translate_model("auto"), None);
+        assert_eq!(supersede_translate_model("garbage"), None);
     }
 }

@@ -102,7 +102,8 @@ pub enum FileKind {
 /// `ggml-silero-v5.1.2.bin` 的前 4 字节都是这个值,hexdump 核对过,不是凭记忆写的字节序)。
 const GGML_MAGIC: [u8; 4] = [0x6c, 0x6d, 0x67, 0x67];
 /// GGUF 格式的魔数就是 ASCII "GGUF" 四个字符,同样用真实文件核实过
-/// (`Qwen3-4B-Instruct-2507-Q4_K_M.gguf` 和 `sakura-7b-qwen2.5-v1.0-iq4xs.gguf` 都是)。
+/// (`sakura-7b-qwen2.5-v1.0-iq4xs.gguf` 是;这是 GGUF 容器格式本身固定的头 4 字节,
+/// 不是某个具体模型专属的)。
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 
 /// 纯函数:看前 4 个字节判断文件类型,两种已知魔数之外的一律返回 `None`(不认识,不猜测)。
@@ -230,8 +231,8 @@ mod tests {
 
     #[test]
     fn sniff_kind_recognizes_real_gguf_magic_from_hexdump() {
-        // 真实核实过的字节:Qwen3-4B-Instruct-2507-Q4_K_M.gguf 和
-        // sakura-7b-qwen2.5-v1.0-iq4xs.gguf 的前 4 字节都是 47 47 55 46("GGUF")。
+        // 真实核实过的字节:sakura-7b-qwen2.5-v1.0-iq4xs.gguf 的前 4 字节是
+        // 47 47 55 46("GGUF")——GGUF 容器格式固定头,不是某个具体模型专属的。
         assert_eq!(sniff_kind([0x47, 0x47, 0x55, 0x46]), Some(FileKind::Gguf));
     }
 
@@ -273,7 +274,7 @@ mod tests {
         assert!(is_known_model_file_name("ggml-large-v3.bin"));
         assert!(is_known_model_file_name(VAD_FILE_NAME));
         assert!(is_known_model_file_name("sakura-7b-qwen2.5-v1.0-iq4xs.gguf"));
-        assert!(is_known_model_file_name("Qwen3-4B-Instruct-2507-Q4_K_M.gguf"));
+        assert!(is_known_model_file_name("Qwen3-14B-Q4_K_M.gguf"));
     }
 
     #[test]

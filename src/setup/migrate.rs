@@ -391,11 +391,11 @@ mod tests {
         let new_dir = PathBuf::from(r"D:\new\models");
         let mut bindings = std::collections::BTreeMap::new();
         let elsewhere = PathBuf::from(r"E:\somewhere\else\qwen.gguf").to_string_lossy().to_string();
-        bindings.insert("trans:qwen3-4b".to_string(), elsewhere.clone());
+        bindings.insert("trans:sakura-7b".to_string(), elsewhere.clone());
         let present = std::collections::HashSet::new();
 
         let rewritten = rewrite_bindings_after_migration(&bindings, &old_dir, &new_dir, &present);
-        assert_eq!(rewritten.get("trans:qwen3-4b"), Some(&elsewhere));
+        assert_eq!(rewritten.get("trans:sakura-7b"), Some(&elsewhere));
     }
 
     #[test]

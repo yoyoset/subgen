@@ -27,7 +27,7 @@
 | VAD 模型 | [Hugging Face](https://huggingface.co/ggml-org/whisper-vad) | 约 1MB(体积很小,预先下好备用;当前默认识别流程不使用,见下文 VAD 的坑) | 总是 |
 | llama.cpp(本地翻译引擎)| [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) 官方 Release,Windows CUDA 预编译版 | 约 240MB | 勾选翻译后 |
 | Sakura 7B(日→中翻译模型)| [SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF](https://huggingface.co/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF) | 约 4.25GB | 勾选翻译且选了 Sakura 或"自动" |
-| Qwen3 4B(通用翻译模型)| [unsloth/Qwen3-4B-Instruct-2507-GGUF](https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF) | 约 2.4GB | 勾选翻译且选了 Qwen3 或"自动" |
+| Qwen3 14B(通用翻译模型)| [unsloth/Qwen3-14B-GGUF](https://huggingface.co/unsloth/Qwen3-14B-GGUF) | 约 8.4GB | 勾选翻译且选了 Qwen3 或"自动" |
 
 **下载支持断点续传**:大文件(几个 GB)在家用网络上中途断开是首次安装最常见的失败原因,不用担心从零重来——网络中断或程序被关掉后重新下载同一个组件,会自动从上次的进度接着下,不会浪费已经下载的部分(内部原理:边下载边把已收到的内容写进 `.part` 临时文件,重启后先读取这部分内容补算哈希,再用 HTTP Range 请求续传;目标服务器不支持续传时会自动退化成从头下载)。单次连接中途断开也会在原地自动重试几次,不会一遇到网络抖动就整个失败。
 
@@ -68,6 +68,12 @@ cargo build --release
 ```
 
 产物在 `target/release/subgen.exe`,单文件,把它拷到任何地方运行都行(首次运行还是会自动下载组件到它所在目录)。
+
+**`dist/subgen.exe` 是手动维护的部署副本,不会跟着 `cargo build` 自动更新**——没有像
+comic-gen 那样的打包脚本自动就地换件,改完 `src/translate/` 这类影响运行行为的代码后,
+记得手动 `cp target/release/subgen.exe dist/subgen.exe` 重新覆盖一份,否则 `dist/` 下跑的
+还是旧代码(comic-gen 的 `dist\comicgen\comicgen-ui.exe` 也有完全同类的坑,见那边 README
+的「常见问题」)。
 
 **交付门槛**:改完代码用一条命令验证所有门槛——`powershell -File scripts/verify.ps1`(release 构建零警告 + `cargo test` 全绿 + `cargo clippy --all-targets -- -D warnings` 零警告 + `app.rs` 行数预算),全过才算可以交付/提交。CI(.github/workflows/ci.yml)跑的是同一套检查。
 
@@ -127,7 +133,7 @@ src/
 - **`--vad` 默认关闭,不是开启**(踩过坑,方向和最初设计相反)。实测拿同一段真实纪录片音频对比:开 `--vad` 会导致输出全部丢失大小写和标点(比如 "Jeremy Wade, explorer" 变成 "jeremy wade explorer"),不开 VAD 则完全正常、且没有观察到幻听/回退重试(fallbacks=0)。VAD 的防幻听收益只在纯音调/长静音场景验证过("(phone ringing)" 这种无中生有的内容),对持续对白类内容(纪录片、剧集)VAD 弊大于利,所以 v1 默认不开
 - **GUI 主程序用 `windows_subsystem = "windows"` 关掉了自身的控制台窗口**(release 构建才生效,debug 构建保留控制台方便看日志),但这引出一个连带问题:**子进程(ffmpeg / whisper-cli)如果不显式处理,Windows 会单独给它们弹一个新控制台窗口**(实测确认过,主程序一关控制台,点"开始处理"就弹出一个 ffmpeg/whisper-cli 的黑窗口)。用户如果手滑关掉那个弹出的控制台窗口,等于给子进程发了 SIGTERM,会导致"音频提取失败"之类的误导性报错(看着像文件损坏,其实只是窗口被关了)。修复:两个 `Command`(ffmpeg、whisper-cli)都加 `creation_flags(CREATE_NO_WINDOW)`(`0x0800_0000`),子进程不再弹窗,stdout/stderr 依然通过管道正常捕获,不影响进度解析
 - **whisper.cpp 长文件"复读机"故障 —— 根因已定位并修复**:实测在一个约 44 分钟的真实文件上遇到过解码卡死循环,同一句字幕原样重复了 983 次,后面的内容全部丢失。第一次只加了后处理安全网(`collapse_repetitions`,检测连续 ≥4 条完全相同的字幕并折叠成 1 条),用户重新处理同一文件后**在完全相同的位置(00:08:06)再次触发**——说明问题是确定性的,不是随机的,安全网只是把垃圾行折叠好看了,但丢失的 32 分钟内容并没有找回来,必须治根因。根因:whisper 默认把前一个 30 秒窗口识别出的文本作为下一个窗口解码的上下文("condition on previous text"),一旦某句话重复进入上下文,就会自我强化、越来越确信"接下来还是这句",从而卡死到文件结束——这也解释了为什么单独截出来的 4 分钟/15 分钟短片段(上下文是干净的)怎么都无法复现。修复:加 `-mc 0`(`--max-context 0`)禁止跨窗口携带文本上下文。已在同一份真实故障音频上验证:加参数后重复计数从 983 降到 0,fallbacks 从 5 降到 0,全片 44 分钟内容完整识别。代价很小,只在全片末尾约 68 秒观察到大小写丢失,规模远小于此前的复读故障,暂未处理。`collapse_repetitions` 安全网继续保留,作为纵深防御
-- **SakuraLLM 只训练了日→中方向**,拿它翻英文等其他语言效果很差(不在训练分布内),所以 `src/translate/mod.rs` 里用"语言→模型"注册表(`translate::MODELS`)按 whisper 检测出的源语言选模型:日语走 Sakura,其余语言走通用的 Qwen3-4B-Instruct,而不是无脑一个模型翻所有语言
+- **SakuraLLM 只训练了日→中方向**,拿它翻英文等其他语言效果很差(不在训练分布内),所以 `src/translate/mod.rs` 里用"语言→模型"注册表(`translate::MODELS`)按 whisper 检测出的源语言选模型:日语走 Sakura,其余语言走通用的 Qwen3-14B(混合思考/非思考模型,提示词里追加 `/no_think` 关闭思考模式,并对响应内容兜底剥离可能漏出的 `<think>` 块,见 `translate/prompt.rs`),而不是无脑一个模型翻所有语言
 - **翻译走批量 + 编号对齐,不是逐行请求**:整集字幕逐行发 HTTP 请求太慢(一集可能几百条),所以每批 15 行一起发给模型,提示词里显式给每行编号、要求模型保留编号原样输出,回复按编号解析对齐;行数对不上(模型漏译/多译/合并了某几行)就对半拆开重试,缩小出错范围,最终还是对不齐的单行原样保留原文、不阻断整个任务(`translate::translate_batch_with_retry`)。这也是为什么 Sakura 用的提示词和官方文档给的单段落格式不完全一样——官方格式没有编号,是拿吞吐量换来的妥协,如果实测发现批量编号格式明显拉低 Sakura 翻译质量,后续可以把 `BATCH_SIZE` 调小
 - **llama-server 复用 whisper 引擎目录里的 CUDA 12.4 运行库 DLL**,不单独下载一份约 400MB 的 cudart 运行库包:两者都是 CUDA 12.4 构建,`translate::LlamaServer::start` 把 whisper 引擎所在目录塞进子进程 PATH 前部,Windows 动态链接器就能找到 `cudart64_12.dll`/`cublas64_12.dll`/`cublasLt64_12.dll`,免掉重复下载
 - **批次内 llama-server 常驻、按需重启**:一个视频转写完立刻用同一个 `llama-server` 翻译,启动一次要把几 GB 模型加载进显存,不可能每个文件都重启;只有当这批文件里下一个视频需要的翻译模型和当前跑着的不一样时(比如"自动"策略下前一个是日语用 Sakura、下一个是英语要切到 Qwen3)才 kill 掉重启。批次处理完 / 被取消时显式 stop,`Drop for LlamaServer` 兜底 kill,避免异常退出路径下留下孤儿进程占着显存

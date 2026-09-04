@@ -14,7 +14,7 @@ pub struct Config {
     /// 是否在转写后额外用本地模型生成中文翻译字幕(Video.zh.srt)
     pub translate: bool,
     /// 翻译模型选择:"auto"(按源语言自动选,见 translate::pick_model)或具体模型 key
-    /// (如 "sakura-7b" / "qwen3-4b",见 translate::MODELS)
+    /// (如 "sakura-7b" / "qwen3-14b",见 translate::MODELS)
     pub translate_model: String,
     /// 中文翻译字幕是否双语(中文在上、原文在下);false = 仅中文
     pub bilingual: bool,
@@ -142,7 +142,7 @@ mod tests {
             language = "en"
             overwrite_existing = true
             translate = true
-            translate_model = "qwen3-4b"
+            translate_model = "qwen3-14b"
             bilingual = false
             window_w = 800.0
             window_h = 600.0
@@ -150,7 +150,7 @@ mod tests {
         let (config, warning) = Config::parse_or_recover(text);
         assert!(warning.is_none());
         assert_eq!(config.model, "medium");
-        assert_eq!(config.translate_model, "qwen3-4b");
+        assert_eq!(config.translate_model, "qwen3-14b");
         assert!(!config.bilingual);
     }
 
