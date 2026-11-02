@@ -229,3 +229,9 @@ src/
 | Qwen3-14B(通用翻译) | Apache-2.0 | |
 | whisper.cpp / llama.cpp 引擎 | MIT | GitHub 仓库元数据 |
 | FFmpeg(gyan.dev essentials 构建) | 以其发布页为准 | 本项目未核实其具体许可,分发前请自行确认 |
+
+## 赞助
+
+如果这个项目帮你省了时间，欢迎赞助一点 Token（算力）。你的支持会直接变成下一轮的推理与测试成本，让它持续维护。
+
+<table><tr><td align="center"><img src="docs/donate/donate_alipay.png" width="160" alt="支付宝"><br>支付宝</td><td align="center"><img src="docs/donate/donate_wechat.png" width="160" alt="微信支付"><br>微信支付</td><td align="center"><img src="docs/donate/donate_paypal.png" width="160" alt="PayPal"><br>PayPal</td></tr></table>
