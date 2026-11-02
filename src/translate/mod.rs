@@ -84,13 +84,18 @@ pub struct TransModel {
     pub prompt_kind: PromptKind,
 }
 
-pub const SAKURA_7B: TransModel = TransModel {
-    key: "sakura-7b",
-    label: "Sakura 7B(日→中,轻小说风格)",
-    file_name: "sakura-7b-qwen2.5-v1.0-iq4xs.gguf",
-    url: "https://huggingface.co/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF/resolve/main/sakura-7b-qwen2.5-v1.0-iq4xs.gguf",
-    sha256: "30e82ca13bc1e321f4f7b77459d533d483d46200522dc5c31eef9d2f2a6335d6",
-    size_bytes: 4_250_298_208,
+// 2026-11-02 从 Sakura-7B-Qwen2.5-v1.0 换成 Sakura-14B-Qwen3-v1.5(同一作者线,2026-01 发布)。
+// 16 句日语台词 + 批量对齐实测(RTX 3060,iq4xs,同一 llama-server 与官方提示词):7B 把单数
+// 「おい、何してんだ」译成"你们"、批量 16 句只回 14 行(对不上号);14B 都对。样本很小,
+// 详见 LAN_Resources/ai_models_review_20261102.md。提示词沿用 v1.0 官方格式(实测可用)。
+// 许可证 cc-by-nc-sa-4.0(非商用)。sha256 与 HuggingFace LFS oid 核对一致。
+pub const SAKURA_14B: TransModel = TransModel {
+    key: "sakura-14b",
+    label: "Sakura 14B(日→中,轻小说风格)",
+    file_name: "sakura-14b-qwen3-v1.5-iq4xs.gguf",
+    url: "https://huggingface.co/SakuraLLM/Sakura-14B-Qwen3-v1.5-GGUF/resolve/main/sakura-14b-qwen3-v1.5-iq4xs.gguf",
+    sha256: "cd1a129b19c711fb67f232e7feadc3cf0b2183e9408d47ac222f14123dae5436",
+    size_bytes: 8_180_361_440,
     langs: &["ja"],
     prompt_kind: PromptKind::Sakura,
 };
@@ -109,7 +114,7 @@ pub const QWEN3_14B: TransModel = TransModel {
     prompt_kind: PromptKind::General,
 };
 
-pub const MODELS: &[TransModel] = &[SAKURA_7B, QWEN3_14B];
+pub const MODELS: &[TransModel] = &[SAKURA_14B, QWEN3_14B];
 
 /// 已下线的旧翻译模型 key → 取代它的新 key。注册表(`MODELS`)只保留现行模型,但用户的
 /// 配置文件里可能存着升级前手动选的旧 key(比如 8/20 把 Qwen3-4B 换成 Qwen3-14B 前的
@@ -120,7 +125,7 @@ pub const MODELS: &[TransModel] = &[SAKURA_7B, QWEN3_14B];
 /// 新增/替换模型时:把被替换的旧 key 记在这里(旧 key → 新 key),`supersede_translate_model`
 /// 会在启动时把配置里的旧值迁移成新值,同时 `model_by_key` 兼容解析旧值,迁移完成前不会
 /// 出现"配置里存了旧 key 就行为走样"的窗口期。
-pub const SUPERSEDED_MODELS: &[(&str, &str)] = &[("qwen3-4b", "qwen3-14b")];
+pub const SUPERSEDED_MODELS: &[(&str, &str)] = &[("qwen3-4b", "qwen3-14b"), ("sakura-7b", "sakura-14b")];
 
 pub fn model_by_key(key: &str) -> Option<&'static TransModel> {
     MODELS.iter().find(|m| m.key == key).or_else(|| {
@@ -307,7 +312,7 @@ mod tests {
     #[test]
     fn pick_model_matches_japanese_to_sakura() {
         let m = pick_model("ja", "auto");
-        assert_eq!(m.key, "sakura-7b");
+        assert_eq!(m.key, "sakura-14b");
     }
 
 
@@ -332,6 +337,7 @@ mod tests {
         // 模型,和用户明确选了某个翻译模型的意图不符。
         assert_eq!(model_by_key("qwen3-4b").map(|m| m.key), Some("qwen3-14b"));
         assert_eq!(model_by_key("qwen3-14b").map(|m| m.key), Some("qwen3-14b"));
+        assert_eq!(model_by_key("sakura-7b").map(|m| m.key), Some("sakura-14b"));
         assert_eq!(model_by_key("does-not-exist").map(|m| m.key), None);
     }
 
@@ -339,7 +345,8 @@ mod tests {
     fn supersede_translate_model_returns_new_key_for_legacy() {
         assert_eq!(supersede_translate_model("qwen3-4b"), Some("qwen3-14b"));
         assert_eq!(supersede_translate_model("qwen3-14b"), None);
-        assert_eq!(supersede_translate_model("sakura-7b"), None);
+        assert_eq!(supersede_translate_model("sakura-7b"), Some("sakura-14b"));
+        assert_eq!(supersede_translate_model("sakura-14b"), None);
         assert_eq!(supersede_translate_model("auto"), None);
         assert_eq!(supersede_translate_model("garbage"), None);
     }

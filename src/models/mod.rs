@@ -273,7 +273,7 @@ mod tests {
     fn is_known_model_file_name_recognizes_all_three_registries() {
         assert!(is_known_model_file_name("ggml-large-v3.bin"));
         assert!(is_known_model_file_name(VAD_FILE_NAME));
-        assert!(is_known_model_file_name("sakura-7b-qwen2.5-v1.0-iq4xs.gguf"));
+        assert!(is_known_model_file_name("sakura-14b-qwen3-v1.5-iq4xs.gguf"));
         assert!(is_known_model_file_name("Qwen3-14B-Q4_K_M.gguf"));
     }
 

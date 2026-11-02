@@ -368,7 +368,7 @@ pub(crate) fn split_leading_number(line: &str) -> Option<(usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{QWEN3_14B, SAKURA_7B};
+    use super::super::{QWEN3_14B, SAKURA_14B};
 
     #[test]
     fn compute_context_tail_takes_last_two_successful_pairs() {
@@ -440,7 +440,7 @@ mod tests {
         // Sakura 和 General 是两套不同的提示词模板,上下文注入要对两边都生效,不能只改
         // 其中一个分支就当作做完了。
         let context = vec![("こんにちは".to_string(), "你好".to_string())];
-        let (system, user) = build_prompt(&SAKURA_7B, "1. さようなら", &context);
+        let (system, user) = build_prompt(&SAKURA_14B, "1. さようなら", &context);
         assert!(user.contains("こんにちは → 你好"));
         assert!(user.contains("将下面的日文字幕文本翻译成中文"));
         assert!(system.contains("轻小说"));

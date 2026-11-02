@@ -26,7 +26,7 @@
 | large-v3 语音模型 | [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp) | 约 2.9GB | 总是 |
 | VAD 模型 | [Hugging Face](https://huggingface.co/ggml-org/whisper-vad) | 约 1MB(体积很小,预先下好备用;当前默认识别流程不使用,见下文 VAD 的坑) | 总是 |
 | llama.cpp(本地翻译引擎)| [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) 官方 Release,Windows CUDA 预编译版 | 约 240MB | 勾选翻译后 |
-| Sakura 7B(日→中翻译模型)| [SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF](https://huggingface.co/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF) | 约 4.25GB | 勾选翻译且选了 Sakura 或"自动" |
+| Sakura 14B(日→中翻译模型)| [SakuraLLM/Sakura-14B-Qwen3-v1.5-GGUF](https://huggingface.co/SakuraLLM/Sakura-14B-Qwen3-v1.5-GGUF) | 约 8.18GB | 勾选翻译且选了 Sakura 或"自动" |
 | Qwen3 14B(通用翻译模型)| [unsloth/Qwen3-14B-GGUF](https://huggingface.co/unsloth/Qwen3-14B-GGUF) | 约 8.4GB | 勾选翻译且选了 Qwen3 或"自动" |
 
 **下载支持断点续传**:大文件(几个 GB)在家用网络上中途断开是首次安装最常见的失败原因,不用担心从零重来——网络中断或程序被关掉后重新下载同一个组件,会自动从上次的进度接着下,不会浪费已经下载的部分(内部原理:边下载边把已收到的内容写进 `.part` 临时文件,重启后先读取这部分内容补算哈希,再用 HTTP Range 请求续传;目标服务器不支持续传时会自动退化成从头下载)。单次连接中途断开也会在原地自动重试几次,不会一遇到网络抖动就整个失败。
