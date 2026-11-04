@@ -156,7 +156,7 @@ enum ExistingSrtDecision {
 
 fn decide_existing_srt(existing_reason: Option<String>, translate: bool) -> ExistingSrtDecision {
     match existing_reason {
-        Some(reason) if translate => ExistingSrtDecision::UseExisting,
+        Some(_) if translate => ExistingSrtDecision::UseExisting,
         Some(reason) => ExistingSrtDecision::Skip(reason),
         None => ExistingSrtDecision::Process,
     }
