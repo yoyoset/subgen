@@ -24,7 +24,7 @@ subgen 是一个 Rust（egui）写的 Windows 桌面工具：拖进视频，生�
 程序只有一个 exe。引擎、ffmpeg 和模型在首次运行时下载，支持哈希校验、断点续传和镜像回退。
 
 - 仓库 `yoyoset/subgen`：public。有 GitHub Actions CI（`.github/workflows/ci.yml`），跑的检查和 `scripts/verify.ps1` 一样。
-- **v0.1.0 已发 Release（2026-11-05）**：https://github.com/yoyoset/subgen/releases/tag/v0.1.0 ，`subgen-0.1.0-win-x64.zip` 6,122,165 B（只有 `subgen.exe` + README + LICENSE），sha256 `5d4687c49e36ecfacbd2153797803c4660e129fdf08c1bd8d9133fdf47f8f769`；下回来核过哈希。解压到全新目录启动直接进首次下载界面（PrintWindow 截图确认），**完整首次下载流程这次没重跑**（几 GB）。下载页上架由 SUBLOG 的一次性定时任务 11-06 10:00 执行。
+- **v0.1.1 是当前 Release（2026-11-05）**：https://github.com/yoyoset/subgen/releases/tag/v0.1.1 ，`subgen-0.1.1-win-x64.zip` 6,125,882 B，sha256 `9062576b72ae8b2cff978e3f03fc4372f5450d747d72055c14b0db18b3b351d8`，下回来核过。同一天先发的 v0.1.0 有首次下载页布局 bug（见 §4 坑 8），已标成"被 0.1.1 取代"，没删。下载页上架由 SUBLOG 的一次性定时任务 11-06 10:00 执行。完整首次下载流程（几 GB）没在发布前重跑过，下载代码这轮没改。
 - 最近一次实质改动在 11-02：日译中模型从 Sakura-7B 换成了 14B，补了模型许可表，新增了 SETUP_FOR_AI.md 和赞助区。
 - 11-04 有一个修 clippy unused variable 的提交（`678822e`）。CI 连续 4 次因为它变红，这个提交 11-05 已经推上去了。
 - 工作区里有两份 08-09 的未跟踪文档（`docs/handover-2026-08-09-…`、`docs/review-2026-08-09-…`），不清楚是不是有意不入库。我没动，你也先别动，先问用户。
@@ -66,6 +66,8 @@ cargo test
 5. **SRT 文件开头的 UTF-8 BOM**（用记事本另存为 UTF-8 时会写入）会让第一块字幕被跳过。已修。
 6. **PowerShell 5.1 下 `$ErrorActionPreference='Stop'` 和原生命令的 stderr 冲突**，会把 cargo 的进度输出当成错误。`verify.ps1` 改成显式检查 `$LASTEXITCODE`。
 7. **CI 变红了 4 次没人看**：本地 clippy 用的命令和 CI 不一样，unused variable 漏到了 CI。以后推送前跑 `verify.ps1`，它和 CI 跑的是同一套检查。
+8. **首次下载页只显示一行标题**（v0.1.0，11-05 用户在全新目录启动时发现）：`centered_card` 和主界面空状态用 `ui.centered_and_justified` 包 Frame，卡片里第一个控件被撑满整块区域，后面的清单和按钮全被挤出窗口。开发机日常副本组件早装齐、从不进这一页，所以一直没发现。改成共用 `theme::card_page`（可滚动、水平居中、卡片内 top_down）。**教训：发布前必须在全新空目录里启动一次，并截图看首屏**——截图要用 DPI aware 的 PrintWindow（脚本思路：`SetProcessDPIAware` → `GetWindowRect` → `PrintWindow(hwnd, dc, 2)`），不 DPI aware 的话截出来只有窗口左上一角，会误以为界面没问题。
+9. **✓ ⚠ ▶ ⚙ 等符号显示成方块**：雅黑没有这些字形。已加 Segoe UI Symbol 作为回退字体（`main.rs::setup_chinese_fonts`）。界面里新增符号前，用 fontTools 查一下 cmap。
 
 ## 5. 已知但还没处理的问题（详见 `docs/known-issues-2026-08-09.md` 和 README 的 TODO）
 
