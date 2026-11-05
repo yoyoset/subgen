@@ -24,7 +24,7 @@ subgen 是一个 Rust（egui）写的 Windows 桌面工具：拖进视频，生�
 程序只有一个 exe。引擎、ffmpeg 和模型在首次运行时下载，支持哈希校验、断点续传和镜像回退。
 
 - 仓库 `yoyoset/subgen`：public。有 GitHub Actions CI（`.github/workflows/ci.yml`），跑的检查和 `scripts/verify.ps1` 一样。
-- **还没有发过 Release。** 排期是 **11-06（五）上架 squareuncle.com 下载页**，博客 08-10 已经发了。上架和博客都在 SUBLOG 仓库，排期表在 `F:\my_ai\SUBLOG\video\weekly\2026-11-博客与产品排期.md`。
+- **v0.1.0 已发 Release（2026-11-05）**：https://github.com/yoyoset/subgen/releases/tag/v0.1.0 ，`subgen-0.1.0-win-x64.zip` 6,122,165 B（只有 `subgen.exe` + README + LICENSE），sha256 `5d4687c49e36ecfacbd2153797803c4660e129fdf08c1bd8d9133fdf47f8f769`；下回来核过哈希。解压到全新目录启动直接进首次下载界面（PrintWindow 截图确认），**完整首次下载流程这次没重跑**（几 GB）。下载页上架由 SUBLOG 的一次性定时任务 11-06 10:00 执行。
 - 最近一次实质改动在 11-02：日译中模型从 Sakura-7B 换成了 14B，补了模型许可表，新增了 SETUP_FOR_AI.md 和赞助区。
 - 11-04 有一个修 clippy unused variable 的提交（`678822e`）。CI 连续 4 次因为它变红，这个提交 11-05 已经推上去了。
 - 工作区里有两份 08-09 的未跟踪文档（`docs/handover-2026-08-09-…`、`docs/review-2026-08-09-…`），不清楚是不是有意不入库。我没动，你也先别动，先问用户。
@@ -41,9 +41,9 @@ cargo test
 - `dist\subgen.exe` 是**手动维护的本机部署副本**，用户平时用的就是它。`cargo build` 不会更新它，改了影响运行行为的代码以后，要手动执行 `cp target\release\subgen.exe dist\subgen.exe`。subgen 正在运行时覆盖会失败。
 - 真实测试素材在 **E 盘**（例如 `E:\River Monsters S08\`、`E:\season 11`），不在项目目录里。找素材用 PowerShell 的 `Get-ChildItem -Path E:\ -Filter "*关键词*" -Recurse`，git bash 的 `find` 跨盘很慢。
 
-**11-06 发布要做的（排期表里写定的）：**
+**发布步骤（v0.1.0 就是这么做的）：**
 1. `verify.ps1` 全绿。
-2. 包里**只放 `subgen.exe` 和 `README.md`**，引擎和模型首次运行时下载。
+2. 包里**只放 `targetelease\subgen.exe`、`README.md`、`LICENSE`**，放在 `subgen/` 目录里，用 `%SystemRoot%\System32	ar.exe -a -c -f subgen-<ver>-win-x64.zip subgen` 打包（bsdtar，别用 Git 的 GNU tar）。引擎和模型首次运行时下载。
 3. **`dist\` 里的东西一律不放进包**：`logs/`、`tmp/`、`config.toml`（里面记着用户上次打开的目录）、`subgen.exe.bak-*`、`subgen.lock`、`models/`、`engine/`、`ffmpeg/`、`translator/`。从 `target\release` 取全新的 exe。
 4. 先解压到一个空目录跑一遍首次下载流程，再上传：`& "C:\Program Files\GitHub CLI\gh.exe" release create ...`（gh 要写全路径，账号 yoyoset 已登录）。上传后把文件下回来核对 sha256。
 5. 发布打包没有脚本。可以参考 comicgen 的 `scripts/build_release.py`：发现用户数据就拒绝出包。
