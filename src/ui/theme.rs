@@ -39,6 +39,45 @@ pub fn primary_button(label: impl Into<egui::WidgetText>) -> egui::Button<'stati
         .stroke(egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.6)))
 }
 
+/// 居中卡片页:首次下载/下载进度/搬迁/错误页和主界面空状态共用的外框。
+///
+/// 坑(2026-11-05 实测):之前这几处都是 `ui.centered_and_justified(|ui| Frame::show(..))`。
+/// centered_and_justified 是给"单个控件撑满并居中"用的,卡片里的子 ui 继承了这个布局,
+/// 于是第一个控件(标题)被拉伸占满整块区域、居中显示,后面的说明、组件清单、"更改..."、
+/// "开始下载"全被挤出窗口——用户在全新目录首次启动,看到的是一张只有一行标题的空卡片,
+/// 无从下手。开发机上的日常副本组件早就装齐、永远进不到这个页面,所以一直没被发现。
+/// 现在:外层可滚动(窗口最小 560x420,首次下载页内容更高)、水平居中,卡片内部显式
+/// 重置为自上而下、左对齐的布局。
+pub fn card_page<R>(
+    ui: &mut egui::Ui,
+    max_width: f32,
+    fill: egui::Color32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    const MARGIN: i8 = 18;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                // 内容短时不贴着顶边,长时也只占一点点高度。
+                ui.add_space((ui.available_height() * 0.08).clamp(12.0, 48.0));
+                let outer = max_width.min(ui.available_width() - 16.0).max(240.0);
+                egui::Frame::default()
+                    .inner_margin(egui::Margin::same(MARGIN))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .fill(fill)
+                    .show(ui, |ui| {
+                        ui.set_width(outer - 2.0 * f32::from(MARGIN));
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), add_contents)
+                            .inner
+                    })
+                    .inner
+            })
+            .inner
+        })
+        .inner
+}
+
 /// 程序启动时调用一次:应用统一的深色视觉风格。
 ///
 /// 固定深色主题、不跟随系统亮/暗设置——界面语义色(成功/警告/进行中/完成)是围绕深色

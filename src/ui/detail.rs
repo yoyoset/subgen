@@ -266,27 +266,23 @@ pub(crate) fn render_detail_pane(app: &mut SubgenApp, ui: &mut egui::Ui) {
 /// 这里给一个明确的操作入口(选择视频文件)和一句最重要的说明(本地运行、不上传)。
 fn render_empty_detail(app: &mut SubgenApp, ui: &mut egui::Ui) {
     let mut pick_requested = false;
-    ui.centered_and_justified(|ui| {
-        egui::Frame::default()
-            .inner_margin(egui::Margin::symmetric(24, 20))
-            .corner_radius(egui::CornerRadius::same(8))
-            .fill(ui.visuals().faint_bg_color)
-            .show(ui, |ui| {
-                ui.set_max_width(360.0);
-                ui.heading("给视频生成字幕");
-                ui.add_space(6.0);
-                ui.label("把视频文件拖进窗口,或点下面的按钮选择文件。");
-                ui.label("可以一次添加多个文件,程序会逐个处理。");
-                ui.add_space(14.0);
-                if ui.add(crate::ui::theme::primary_button("选择视频文件...")).clicked() {
-                    pick_requested = true;
-                }
-                ui.add_space(14.0);
-                ui.colored_label(
-                    crate::ui::theme::TEXT_SECONDARY,
-                    "所有处理都在本机完成,视频和字幕不会上传到任何服务器。",
-                );
-            });
+    // 外框和首次下载页共用 theme::card_page:原来的 centered_and_justified 会把标题撑满
+    // 整块区域、把按钮挤出去(见 card_page 的注释)。
+    let fill = ui.visuals().faint_bg_color;
+    crate::ui::theme::card_page(ui, 400.0, fill, |ui| {
+        ui.heading("给视频生成字幕");
+        ui.add_space(6.0);
+        ui.label("把视频文件拖进窗口,或点下面的按钮选择文件。");
+        ui.label("可以一次添加多个文件,程序会逐个处理。");
+        ui.add_space(14.0);
+        if ui.add(crate::ui::theme::primary_button("选择视频文件...")).clicked() {
+            pick_requested = true;
+        }
+        ui.add_space(14.0);
+        ui.colored_label(
+            crate::ui::theme::TEXT_SECONDARY,
+            "所有处理都在本机完成,视频和字幕不会上传到任何服务器。",
+        );
     });
     if pick_requested {
         let mut dialog = rfd::FileDialog::new()

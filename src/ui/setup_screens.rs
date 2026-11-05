@@ -114,22 +114,15 @@ pub(crate) fn render_phase(app: &mut SubgenApp, ui: &mut egui::Ui) {
 /// 临时页面;这次是用户第一次见到这个软件,必须是一个观感一致的流程。
 fn centered_card(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::CentralPanel::default().show(ui, |ui| {
-        ui.centered_and_justified(|ui| {
-            egui::Frame::default()
-                .inner_margin(egui::Margin::same(18))
-                .corner_radius(egui::CornerRadius::same(8))
-                .fill(ui.visuals().extreme_bg_color)
-                .show(ui, |ui| {
-                    ui.set_max_width(480.0);
-                    ui.heading(title);
-                    ui.add_space(theme::SECTION_SPACING);
-                    ui.separator();
-                    ui.add_space(theme::SECTION_SPACING);
-                    add_contents(ui)
-                });
+        let fill = ui.visuals().extreme_bg_color;
+        theme::card_page(ui, 480.0, fill, |ui| {
+            ui.heading(title);
+            ui.add_space(theme::SECTION_SPACING);
+            ui.separator();
+            ui.add_space(theme::SECTION_SPACING);
+            add_contents(ui)
         });
-    })
-    .inner
+    });
 }
 
 pub(crate) fn render_checking(ui: &mut egui::Ui) {
@@ -198,6 +191,19 @@ pub(crate) fn render_needs_download(app: &mut SubgenApp, ui: &mut egui::Ui, miss
         ui.strong(format!("共需下载约 {}", format_download_size(total_bytes)));
         ui.label("只需下载这一次。");
         ui.add_space(theme::SECTION_SPACING);
+
+        // "存到哪"和"开始下载"紧跟在清单后面:这两样是这一页要用户做的全部决定。之前排在
+        // 显卡/本地运行等说明之后,默认窗口(760x560)里要滚动才看得到按钮。
+        render_models_location(app, ui, missing);
+        ui.add_space(theme::SECTION_SPACING);
+        if ui
+            .add(theme::primary_button("开始下载"))
+            .clicked()
+        {
+            app.start_downloading();
+        }
+
+        ui.add_space(theme::SECTION_SPACING);
         ui.separator();
         ui.add_space(theme::SECTION_SPACING);
 
@@ -252,40 +258,38 @@ pub(crate) fn render_needs_download(app: &mut SubgenApp, ui: &mut egui::Ui, miss
             ui.weak("视频和字幕不会上传到任何服务器。");
         });
 
-        ui.add_space(theme::SECTION_SPACING);
-        ui.separator();
-        ui.add_space(theme::SECTION_SPACING);
+    });
+}
 
-        ui.label(format!("模型将保存到: {}", paths::models_dir().display()));
+/// 首次下载页的"模型存放位置"一行:路径 + 更改按钮 + 出错/磁盘空间提示。
+/// 引擎/ffmpeg/翻译引擎(合计 1GB 以内)固定在 exe 旁边,只有模型(3–20GB)能换位置,
+/// 所以文案写"模型保存到"而不是"组件保存到"。
+fn render_models_location(app: &mut SubgenApp, ui: &mut egui::Ui, missing: &[ComponentKey]) {
+    ui.horizontal(|ui| {
+        ui.label("模型保存到:");
         if ui.button("更改...").clicked() {
             app.begin_change_models_dir();
         }
-        if let Some(e) = &app.models_dir_error {
-            ui.colored_label(theme::ERROR, e);
-        }
-        if let Some((needed, avail)) =
-            setup::check_disk_space(missing, &app.config.model, &paths::models_dir())
-            && avail < needed
-        {
-            ui.colored_label(
-                theme::WARN,
-                format!(
-                    "⚠ 目标磁盘剩余空间可能不够:预计需要约 {:.1} GB,当前剩余约 {:.1} GB。\
-                     可以点上面的“更改...”换一个空间更充足的位置。",
-                    needed as f64 / 1_073_741_824.0,
-                    avail as f64 / 1_073_741_824.0,
-                ),
-            );
-        }
-
-        ui.add_space(12.0);
-        if ui
-            .add(theme::primary_button("开始下载"))
-            .clicked()
-        {
-            app.start_downloading();
-        }
     });
+    ui.weak(paths::models_dir().display().to_string());
+    ui.weak("识别引擎、FFmpeg 等程序组件(约 1 GB)固定放在 subgen.exe 所在目录。");
+    if let Some(e) = &app.models_dir_error {
+        ui.colored_label(theme::ERROR, e);
+    }
+    if let Some((needed, avail)) =
+        setup::check_disk_space(missing, &app.config.model, &paths::models_dir())
+        && avail < needed
+    {
+        ui.colored_label(
+            theme::WARN,
+            format!(
+                "⚠ 目标磁盘剩余空间可能不够:预计需要约 {:.1} GB,当前剩余约 {:.1} GB。\
+                 可以点上面的“更改...”换一个空间更充足的位置。",
+                needed as f64 / 1_073_741_824.0,
+                avail as f64 / 1_073_741_824.0,
+            ),
+        );
+    }
 }
 
 fn render_progress_screen(
