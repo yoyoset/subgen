@@ -235,6 +235,23 @@ fn setup_chinese_fonts(ctx: &egui::Context) {
             break;
         }
     }
+    // 符号兜底字体。界面里用了 ✓ ⚠ ♪ ▶ ⏹ ⚙ ✗ ▸ 等 13 个符号,雅黑只有其中 3 个(→ ● ○),
+    // egui 自带字体也不全,缺字形的显示成方块——2026-11-05 首次下载页的"✓ 本地运行"就是个
+    // 方块。Segoe UI Symbol 是 Win7 起系统自带,13 个全有(fontTools 查过 cmap)。放在
+    // 回退链最后,只补缺的字形,不改变中英文用哪套字体。
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguisym.ttf") {
+        fonts.font_data.insert(
+            "symbols".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("symbols".to_owned());
+        }
+    }
     ctx.set_fonts(fonts);
 }
 #[cfg(test)]
