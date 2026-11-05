@@ -43,7 +43,7 @@ cargo test
 
 **发布步骤（v0.1.0 就是这么做的）：**
 1. `verify.ps1` 全绿。
-2. 包里**只放 `targetelease\subgen.exe`、`README.md`、`LICENSE`**，放在 `subgen/` 目录里，用 `%SystemRoot%\System32	ar.exe -a -c -f subgen-<ver>-win-x64.zip subgen` 打包（bsdtar，别用 Git 的 GNU tar）。引擎和模型首次运行时下载。
+2. 包里**只放 `target\release\subgen.exe`、`README.md`、`LICENSE`**，放在 `subgen/` 目录里，用 `%SystemRoot%\System32\tar.exe -a -c -f subgen-<ver>-win-x64.zip subgen` 打包（bsdtar，别用 Git 的 GNU tar）。引擎和模型首次运行时下载。
 3. **`dist\` 里的东西一律不放进包**：`logs/`、`tmp/`、`config.toml`（里面记着用户上次打开的目录）、`subgen.exe.bak-*`、`subgen.lock`、`models/`、`engine/`、`ffmpeg/`、`translator/`。从 `target\release` 取全新的 exe。
 4. 先解压到一个空目录跑一遍首次下载流程，再上传：`& "C:\Program Files\GitHub CLI\gh.exe" release create ...`（gh 要写全路径，账号 yoyoset 已登录）。上传后把文件下回来核对 sha256。
 5. 发布打包没有脚本。可以参考 comicgen 的 `scripts/build_release.py`：发现用户数据就拒绝出包。
